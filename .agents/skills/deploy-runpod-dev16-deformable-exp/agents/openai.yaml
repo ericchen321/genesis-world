@@ -1,0 +1,4 @@
+interface:
+  display_name: "Deploy Runpod Dev16 Deformable"
+  short_description: "Runpod Dev16 deformables deployment workflow"
+  default_prompt: "Use $deploy-runpod-dev16-deformable-exp to deploy the HAG4R Dev16-deformables experiment on this Runpod machine."

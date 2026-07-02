@@ -1,0 +1,4 @@
+interface:
+  display_name: "Deploy NHR@FAU Dev32"
+  short_description: "Autonomously deploy MV2-Dev32 on Alex"
+  default_prompt: "Use $deploy-nhr-fau-dev32-exp to deploy the MV2-Dev32 experiment on Alex: run the smoke test, use $squeeze-a-bug by default to repair smoke failures, then launch the full batch once smoke passes."

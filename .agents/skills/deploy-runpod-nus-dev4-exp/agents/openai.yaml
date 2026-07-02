@@ -1,0 +1,4 @@
+interface:
+  display_name: "Deploy Runpod NUS Dev4"
+  short_description: "Runpod NUS Dev4 deployment workflow"
+  default_prompt: "Use $deploy-runpod-nus-dev4-exp to deploy the HAG4R NUS Dev4 experiment on this Runpod machine."

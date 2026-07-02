@@ -1,0 +1,4 @@
+interface:
+  display_name: "Acid-Wash Recovery"
+  short_description: "Restore HAG4R Runpod after OS reset"
+  default_prompt: "Use $acid-wash-recovery to restore HAG4R and RealSim on a fresh Ubuntu 24.04 Runpod while preserving /workspace."

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Deploy Runpod Dev32"
+  short_description: "Runpod Dev32 deployment workflow"
+  default_prompt: "Use $deploy-runpod-dev32-exp to deploy the HAG4R Dev32 experiment on this Runpod machine."

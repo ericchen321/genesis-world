@@ -1,0 +1,4 @@
+interface:
+  display_name: "Build Genesis World"
+  short_description: "Install Genesis World in conda"
+  default_prompt: "Use $build-genesis-world to install Genesis World in editable mode for this machine."

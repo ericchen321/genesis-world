@@ -1,0 +1,4 @@
+interface:
+  display_name: "Analyze Diagnostic Context"
+  short_description: "Summarize HAG4R diagnostics trace context growth."
+  default_prompt: "Analyze HAG4R diagnostics traces for text, image, tool-result, and reasoning-token context growth."
