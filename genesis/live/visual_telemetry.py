@@ -100,12 +100,7 @@ def _triptych_camera_pose(label: str, bbox_min: np.ndarray, bbox_max: np.ndarray
     }
 
 
-def _overlay_box_values(record: dict[str, Any]) -> np.ndarray:
-    box = record.get("env_local_box")
-    if box is None:
-        box = record.get("source_box")
-    if box is None:
-        raise ValueError(f"RGB triptych overlay {record.get('kind')!r} is missing box bounds")
+def _validate_overlay_box(box: Any) -> np.ndarray:
     box = np.asarray(box, dtype=np.float32)
     if box.shape != (6,):
         raise ValueError(f"RGB triptych overlay box must have shape (6,); got {box.shape}")
@@ -116,18 +111,56 @@ def _overlay_box_values(record: dict[str, Any]) -> np.ndarray:
     return box
 
 
+def _overlay_source_box_values(record: dict[str, Any]) -> np.ndarray:
+    box = record.get("env_local_box")
+    if box is None:
+        box = record.get("source_box")
+    if box is None:
+        raise ValueError(f"RGB triptych overlay {record.get('kind')!r} is missing box bounds")
+    return _validate_overlay_box(box)
+
+
+def _overlay_displacement(record: dict[str, Any]) -> np.ndarray:
+    displacement = np.asarray(record.get("displacement", [0.0, 0.0, 0.0]), dtype=np.float32)
+    if displacement.shape != (3,):
+        raise ValueError(f"RGB triptych live controller displacement must have shape (3,); got {displacement.shape}")
+    if not np.all(np.isfinite(displacement)):
+        raise ValueError("RGB triptych live controller displacement must be finite")
+    return displacement
+
+
+def _overlay_render_box_values(record: dict[str, Any]) -> np.ndarray:
+    if record.get("rendered_env_local_box") is not None:
+        return _validate_overlay_box(record["rendered_env_local_box"])
+
+    box = _overlay_source_box_values(record)
+    if record.get("kind") == "live_box_controller":
+        displacement = _overlay_displacement(record)
+        box = box + np.concatenate((displacement, displacement))
+    return _validate_overlay_box(box)
+
+
+def _render_overlay_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    rendered_records = []
+    for record in records:
+        data = dict(record)
+        data["rendered_env_local_box"] = _overlay_render_box_values(record).tolist()
+        rendered_records.append(data)
+    return rendered_records
+
+
 def _boxes_from_overlays(records: list[dict[str, Any]]) -> list[np.ndarray]:
     boxes = []
     for record in records:
         kind = record.get("kind")
         if kind not in {"static_anchor", "live_box_controller"}:
             raise ValueError(f"Unsupported RGB triptych overlay kind: {kind!r}")
-        boxes.append(_overlay_box_values(record))
+        boxes.append(_overlay_render_box_values(record))
     return boxes
 
 
 def _overlay_box_bounds(record: dict[str, Any]) -> np.ndarray:
-    box = _overlay_box_values(record)
+    box = _overlay_render_box_values(record)
     return np.stack((box[:3], box[3:])).astype(np.float32)
 
 
@@ -271,7 +304,13 @@ class VisualTelemetry:
                 {
                     "index": int(index),
                     "kind": record.get("kind"),
+                    "controller_id": record.get("controller_id"),
                     "bounds": bounds.tolist(),
+                    "rendered_env_local_box": record.get("rendered_env_local_box", bounds.reshape(6).tolist()),
+                    "env_local_box": record.get("env_local_box"),
+                    "displacement": record.get("displacement"),
+                    "moved_distance": record.get("moved_distance"),
+                    "motion_active": record.get("motion_active"),
                     "color": list(color),
                     "wireframe": True,
                     "wireframe_radius": DEBUG_BOX_WIREFRAME_RADIUS,
@@ -284,7 +323,7 @@ class VisualTelemetry:
             frame_index = int(session.current_step)
         anchor_records = anchor_overlay_records(session.anchor_records)
         controller_records = controller_overlay_records(session.controllers)
-        overlays = anchor_records + controller_records
+        overlays = _render_overlay_records(anchor_records + controller_records)
         boxes = _boxes_from_overlays(overlays)
         bbox_min, bbox_max = _triptych_world_bounds(session, boxes)
 

@@ -421,6 +421,26 @@ class BoxEndEffectorController:
             motion_active=True,
             optional=self._state.optional,
         )
+        return self._state
+
+    def move_positive_y_immediate(
+        self,
+        *,
+        distance_scale: float,
+        duration_frames: int,
+        speed: float = DEFAULT_BOX_EE_SPEED,
+        max_distance_scale: float = DEFAULT_MAX_DISTANCE_SCALE,
+        dt: float | None = None,
+    ) -> BoxEndEffectorState:
+        state = self.move_positive_y(
+            distance_scale=distance_scale,
+            duration_frames=duration_frames,
+            speed=speed,
+            max_distance_scale=max_distance_scale,
+            dt=dt,
+        )
+        if state.selected_vertex_count == 0:
+            return state
         return self.advance_motion(frames=int(duration_frames), dt=dt)
 
     def advance_motion(self, *, frames: int = 1, dt: float | None = None) -> BoxEndEffectorState:

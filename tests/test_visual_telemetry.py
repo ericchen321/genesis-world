@@ -152,6 +152,24 @@ def test_rgb_triptych_writes_panels_stitched_metadata_and_visible_overlays(tmp_p
     markers_by_kind = {record["kind"]: record for record in metadata["debug_markers"]}
     assert markers_by_kind["static_anchor"]["color"] == list(ANCHOR_DEBUG_BOX_COLOR)
     assert markers_by_kind["live_box_controller"]["color"] == list(CONTROLLER_DEBUG_BOX_COLOR)
+    live_overlay = next(
+        record
+        for record in metadata["overlays"]
+        if record.get("kind") == "live_box_controller" and record.get("controller_id") == "diag_box"
+    )
+    source_box = np.asarray(live_overlay["env_local_box"], dtype=np.float32)
+    displacement = np.asarray(live_overlay["displacement"], dtype=np.float32)
+    expected_rendered_box = source_box + np.concatenate((displacement, displacement))
+    np.testing.assert_allclose(live_overlay["rendered_env_local_box"], expected_rendered_box, atol=1e-6)
+    assert float(live_overlay["moved_distance"]) > 0.0
+    assert bool(live_overlay["motion_active"])
+    np.testing.assert_allclose(
+        np.asarray(markers_by_kind["live_box_controller"]["bounds"], dtype=np.float32),
+        np.stack((expected_rendered_box[:3], expected_rendered_box[3:])),
+        atol=1e-6,
+    )
+    static_overlay = next(record for record in metadata["overlays"] if record.get("kind") == "static_anchor")
+    np.testing.assert_allclose(static_overlay["rendered_env_local_box"], static_overlay["env_local_box"], atol=1e-6)
     for marker in metadata["debug_markers"]:
         assert np.asarray(marker["bounds"], dtype=np.float32).shape == (2, 3)
         assert marker["wireframe"] is True

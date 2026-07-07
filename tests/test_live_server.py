@@ -125,7 +125,11 @@ def test_live_session_lifecycle_and_box_action(tmp_path):
         },
     )
     assert action["probe"]["selected_vertex_count"] == 1
-    assert action["probe"]["controller_state"]["speed"] == pytest.approx(0.6)
+    action_state = action["probe"]["controller_state"]
+    assert action_state["speed"] == pytest.approx(0.6)
+    assert action_state["motion_active"] is True
+    assert action_state["moved_distance"] == pytest.approx(0.0)
+    assert action_state["displacement"] == pytest.approx([0.0, 0.0, 0.0])
 
     visual = session.dispatch("sim.resume", {"steps": 10, "diagnostic_visual": {"mode": "rgb_triptych"}})[
         "visual_telemetry"
@@ -146,6 +150,22 @@ def test_live_session_lifecycle_and_box_action(tmp_path):
         assert record["camera"]["debug"] is True
     for record in visual["frame_metadata"]:
         _assert_png_record(record)
+    live_overlay = next(
+        record
+        for record in visual["overlays"]
+        if record.get("kind") == "live_box_controller" and record.get("controller_id") == "diag_box"
+    )
+    assert live_overlay["motion_active"] is True
+    assert live_overlay["moved_distance"] > 0.0
+    assert live_overlay["displacement"][1] == pytest.approx(live_overlay["moved_distance"])
+    assert live_overlay["rendered_env_local_box"][1] > live_overlay["env_local_box"][1]
+    live_marker = next(
+        record
+        for record in visual["debug_markers"]
+        if record.get("kind") == "live_box_controller" and record.get("controller_id") == "diag_box"
+    )
+    assert live_marker["bounds"][0][1] == pytest.approx(live_overlay["rendered_env_local_box"][1])
+    assert live_marker["bounds"][1][1] == pytest.approx(live_overlay["rendered_env_local_box"][4])
     assert session.dispatch("command.status", {})["last_rendered_frame_index"] == visual["stitched"]["frame_index"]
     assert visual["frames"][0]["stitched"]["frame_index"] == visual["stitched"]["frame_index"]
 
