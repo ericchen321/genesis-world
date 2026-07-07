@@ -82,12 +82,12 @@ class BoxEndEffectorState:
     selected_vertices: np.ndarray
     target_positions: np.ndarray
     displacement: np.ndarray = field(default_factory=lambda: np.zeros(3, dtype=_float_dtype()))
-    duration_frames: int = 0
+    duration_steps: int = 0
     speed: float = DEFAULT_BOX_EE_SPEED
     distance_scale: float = 0.0
     distance: float = 0.0
     moved_distance: float = 0.0
-    estimated_motion_frames: int = 0
+    estimated_motion_steps: int = 0
     active: bool = False
     motion_active: bool = False
     optional: bool = False
@@ -106,12 +106,12 @@ class BoxEndEffectorState:
             "selected_vertex_count": self.selected_vertex_count,
             "target_positions": self.target_positions.tolist(),
             "displacement": self.displacement.tolist(),
-            "duration_frames": int(self.duration_frames),
+            "duration_steps": int(self.duration_steps),
             "speed": float(self.speed),
             "distance_scale": float(self.distance_scale),
             "distance": float(self.distance),
             "moved_distance": float(self.moved_distance),
-            "estimated_motion_frames": int(self.estimated_motion_frames),
+            "estimated_motion_steps": int(self.estimated_motion_steps),
             "active": bool(self.active),
             "motion_active": bool(self.motion_active),
             "optional": bool(self.optional),
@@ -133,11 +133,11 @@ def _constraint_env_idx(entity, env_idx: int) -> int:
     return env_idx
 
 
-def _estimate_motion_frames(distance: float, speed: float, dt: float) -> int:
-    per_frame = speed * dt
-    if not np.isfinite(per_frame) or per_frame <= 0.0:
+def _estimate_motion_steps(distance: float, speed: float, dt: float) -> int:
+    per_step = speed * dt
+    if not np.isfinite(per_step) or per_step <= 0.0:
         gs.raise_exception("BoxEE motion requires positive finite speed * dt.")
-    return max(1, int(np.ceil(distance / per_frame)))
+    return max(1, int(np.ceil(distance / per_step)))
 
 
 def apply_static_box_anchors(
@@ -233,7 +233,7 @@ class BoxEndEffectorController:
         self._motion_distance = 0.0
         self._motion_moved_distance = 0.0
         self._motion_speed = DEFAULT_BOX_EE_SPEED
-        self._motion_estimated_frames = 0
+        self._motion_estimated_steps = 0
 
     @property
     def state(self) -> BoxEndEffectorState:
@@ -275,7 +275,7 @@ class BoxEndEffectorController:
         self._motion_distance = 0.0
         self._motion_moved_distance = 0.0
         self._motion_speed = DEFAULT_BOX_EE_SPEED
-        self._motion_estimated_frames = 0
+        self._motion_estimated_steps = 0
 
     def _restore_preexisting_constraints(self, selected_vertices: np.ndarray) -> None:
         if self._preexisting_constraint_mask.size == 0 or not np.any(self._preexisting_constraint_mask):
@@ -373,7 +373,7 @@ class BoxEndEffectorController:
         self,
         *,
         distance_scale: float,
-        duration_frames: int,
+        duration_steps: int,
         speed: float = DEFAULT_BOX_EE_SPEED,
         max_distance_scale: float = DEFAULT_MAX_DISTANCE_SCALE,
         dt: float | None = None,
@@ -388,8 +388,8 @@ class BoxEndEffectorController:
             )
         if not np.isfinite(speed) or speed <= 0.0:
             gs.raise_exception(f"speed must be positive, got {speed}.")
-        if int(duration_frames) <= 0:
-            gs.raise_exception(f"duration_frames must be positive, got {duration_frames}.")
+        if int(duration_steps) <= 0:
+            gs.raise_exception(f"duration_steps must be positive, got {duration_steps}.")
 
         dt = self._scene_dt(dt)
         mins, maxs = su.aabb_bounds(self._state.env_local_box)
@@ -402,7 +402,7 @@ class BoxEndEffectorController:
         self._motion_distance = distance
         self._motion_moved_distance = 0.0
         self._motion_speed = float(speed)
-        self._motion_estimated_frames = _estimate_motion_frames(distance, speed, dt)
+        self._motion_estimated_steps = _estimate_motion_steps(distance, speed, dt)
         self._state = BoxEndEffectorState(
             controller_id=self.controller_id,
             frame=self._state.frame,
@@ -411,12 +411,12 @@ class BoxEndEffectorController:
             selected_vertices=_copy_int_array(self._state.selected_vertices),
             target_positions=_copy_float_array(self._state.target_positions),
             displacement=np.zeros(3, dtype=_float_dtype()),
-            duration_frames=int(duration_frames),
+            duration_steps=int(duration_steps),
             speed=float(speed),
             distance_scale=float(distance_scale),
             distance=distance,
             moved_distance=0.0,
-            estimated_motion_frames=self._motion_estimated_frames,
+            estimated_motion_steps=self._motion_estimated_steps,
             active=True,
             motion_active=True,
             optional=self._state.optional,
@@ -427,34 +427,34 @@ class BoxEndEffectorController:
         self,
         *,
         distance_scale: float,
-        duration_frames: int,
+        duration_steps: int,
         speed: float = DEFAULT_BOX_EE_SPEED,
         max_distance_scale: float = DEFAULT_MAX_DISTANCE_SCALE,
         dt: float | None = None,
     ) -> BoxEndEffectorState:
         state = self.move_positive_y(
             distance_scale=distance_scale,
-            duration_frames=duration_frames,
+            duration_steps=duration_steps,
             speed=speed,
             max_distance_scale=max_distance_scale,
             dt=dt,
         )
         if state.selected_vertex_count == 0:
             return state
-        return self.advance_motion(frames=int(duration_frames), dt=dt)
+        return self.advance_motion(steps=int(duration_steps), dt=dt)
 
-    def advance_motion(self, *, frames: int = 1, dt: float | None = None) -> BoxEndEffectorState:
+    def advance_motion(self, *, steps: int = 1, dt: float | None = None) -> BoxEndEffectorState:
         if not self._state.active or not self._state.motion_active:
             return self._state
-        if int(frames) < 0:
-            gs.raise_exception(f"frames must be non-negative, got {frames}.")
-        if int(frames) == 0:
+        if int(steps) < 0:
+            gs.raise_exception(f"steps must be non-negative, got {steps}.")
+        if int(steps) == 0:
             return self._state
 
         dt = self._scene_dt(dt)
         self._motion_moved_distance = min(
             self._motion_distance,
-            self._motion_moved_distance + self._motion_speed * dt * int(frames),
+            self._motion_moved_distance + self._motion_speed * dt * int(steps),
         )
         displacement = self._motion_direction * self._motion_moved_distance
         targets = self._motion_start_targets + displacement.reshape((1, 3))
@@ -472,12 +472,12 @@ class BoxEndEffectorController:
             selected_vertices=_copy_int_array(self._state.selected_vertices),
             target_positions=_copy_float_array(targets),
             displacement=displacement,
-            duration_frames=int(self._state.duration_frames),
+            duration_steps=int(self._state.duration_steps),
             speed=float(self._motion_speed),
             distance_scale=float(self._state.distance_scale),
             distance=float(self._motion_distance),
             moved_distance=float(self._motion_moved_distance),
-            estimated_motion_frames=int(self._motion_estimated_frames),
+            estimated_motion_steps=int(self._motion_estimated_steps),
             active=True,
             motion_active=self._motion_moved_distance < self._motion_distance,
             optional=self._state.optional,
@@ -492,7 +492,7 @@ class BoxEndEffectorController:
         *,
         frame: str = "env_local",
         distance_scale: float,
-        duration_frames: int,
+        duration_steps: int,
         speed: float = DEFAULT_BOX_EE_SPEED,
         max_distance_scale: float = DEFAULT_MAX_DISTANCE_SCALE,
         optional: bool = False,
@@ -502,7 +502,7 @@ class BoxEndEffectorController:
             return state
         return self.move_positive_y(
             distance_scale=distance_scale,
-            duration_frames=duration_frames,
+            duration_steps=duration_steps,
             speed=speed,
             max_distance_scale=max_distance_scale,
         )
@@ -530,7 +530,7 @@ class BoxEndEffectorController:
             selected_vertices=np.empty((0,), dtype=gs.np_int if gs._initialized else np.int32),
             target_positions=_empty_targets(),
             displacement=_copy_float_array(self._state.displacement),
-            duration_frames=self._state.duration_frames,
+            duration_steps=self._state.duration_steps,
             speed=self._state.speed,
             distance_scale=self._state.distance_scale,
             active=False,

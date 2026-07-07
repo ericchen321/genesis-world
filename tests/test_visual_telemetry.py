@@ -75,7 +75,7 @@ def test_rgb_triptych_writes_panels_stitched_metadata_and_visible_overlays(tmp_p
             "action_id": "diag_box_action",
             "action": "box_ee_grasp_and_move",
             "entity": "body",
-            "duration_frames": 1,
+            "duration_steps": 1,
             "controllers": [
                 {
                     "controller_id": "diag_box",

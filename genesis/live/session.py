@@ -228,7 +228,7 @@ class GenesisLiveSession:
         raise GenesisLiveError("unknown_method", f"unknown live method: {method}")
 
     def resume(self, params: dict[str, Any]) -> dict[str, Any]:
-        steps = int(params.get("steps", params.get("duration_frames", 1)))
+        steps = int(params.get("steps", params.get("duration_steps", 1)))
         if steps <= 0:
             raise GenesisLiveError("invalid_resume", "sim.resume steps must be positive")
         visual = params.get("diagnostic_visual")
@@ -241,7 +241,7 @@ class GenesisLiveSession:
         try:
             for local_step_index in range(steps):
                 for controller in list(self.controllers.values()):
-                    controller.advance_motion(frames=1)
+                    controller.advance_motion(steps=1)
                 self.scene.step()
                 self.current_step += 1
                 self._validate_fem_state(checked_at="after_step")

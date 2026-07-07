@@ -120,19 +120,19 @@ def test_box_ee_move_updates_constraint_targets_deterministically(tmp_path):
     controller = BoxEndEffectorController(entity)
     controller.grasp([-0.05, -0.05, 0.95, 0.05, 0.05, 1.05])
 
-    state = controller.move_positive_y(distance_scale=0.5, duration_frames=12, speed=0.6)
+    state = controller.move_positive_y(distance_scale=0.5, duration_steps=12, speed=0.6)
 
     np.testing.assert_array_equal(state.selected_vertices, np.array([3], dtype=gs.np_int))
     np.testing.assert_allclose(state.displacement, np.array([0.0, 0.0, 0.0], dtype=gs.np_float), atol=1e-6)
     np.testing.assert_allclose(_constraint_target(scene, entity, 3), np.array([0.0, 0.0, 1.0]), atol=1e-6)
-    assert state.duration_frames == 12
+    assert state.duration_steps == 12
     assert state.speed == pytest.approx(0.6)
     assert state.distance == pytest.approx(0.05)
     assert state.moved_distance == pytest.approx(0.0)
-    assert state.estimated_motion_frames == 9
+    assert state.estimated_motion_steps == 9
     assert state.motion_active
 
-    state = controller.advance_motion(frames=12)
+    state = controller.advance_motion(steps=12)
 
     np.testing.assert_allclose(state.displacement, np.array([0.0, 0.05, 0.0], dtype=gs.np_float), atol=1e-6)
     np.testing.assert_allclose(_constraint_target(scene, entity, 3), np.array([0.0, 0.05, 1.0]), atol=1e-6)
@@ -140,30 +140,30 @@ def test_box_ee_move_updates_constraint_targets_deterministically(tmp_path):
     assert not state.motion_active
 
 
-def test_box_ee_motion_uses_speed_and_duration_frames(tmp_path):
+def test_box_ee_motion_uses_speed_and_duration_steps(tmp_path):
     scene, entity = _build_two_tet_scene(tmp_path)
     controller = BoxEndEffectorController(entity)
     controller.grasp([-0.05, -0.05, -0.05, 1.05, 0.05, 0.05])
 
-    state = controller.move_positive_y(distance_scale=0.5, duration_frames=2, speed=0.5)
+    state = controller.move_positive_y(distance_scale=0.5, duration_steps=2, speed=0.5)
 
     expected_distance = 0.55
     expected_moved = 0.5 * scene.dt * 2
     assert state.distance == pytest.approx(expected_distance)
     assert state.moved_distance == pytest.approx(0.0)
-    assert state.estimated_motion_frames == 110
+    assert state.estimated_motion_steps == 110
     assert state.motion_active
     np.testing.assert_allclose(_constraint_target(scene, entity, 0), np.array([0.0, 0.0, 0.0]), atol=1e-6)
     np.testing.assert_allclose(_constraint_target(scene, entity, 1), np.array([1.0, 0.0, 0.0]), atol=1e-6)
 
-    state = controller.advance_motion(frames=2)
+    state = controller.advance_motion(steps=2)
 
     assert state.moved_distance == pytest.approx(expected_moved)
     assert state.motion_active
     np.testing.assert_allclose(_constraint_target(scene, entity, 0), np.array([0.0, expected_moved, 0.0]), atol=1e-6)
     np.testing.assert_allclose(_constraint_target(scene, entity, 1), np.array([1.0, expected_moved, 0.0]), atol=1e-6)
 
-    state = controller.advance_motion(frames=200)
+    state = controller.advance_motion(steps=200)
 
     assert state.moved_distance == pytest.approx(expected_distance)
     assert not state.motion_active
@@ -195,7 +195,7 @@ def test_box_ee_release_restores_overlapping_static_anchor(tmp_path):
     original_target = _constraint_target(scene, entity, 3).copy()
     controller = BoxEndEffectorController(entity)
     controller.grasp([-0.05, -0.05, 0.95, 0.05, 0.05, 1.05])
-    controller.move_positive_y(distance_scale=0.5, duration_frames=12)
+    controller.move_positive_y(distance_scale=0.5, duration_steps=12)
 
     controller.release()
 
@@ -222,6 +222,6 @@ def test_box_ee_rejects_out_of_range_distance_scale(tmp_path):
     controller.grasp([-0.05, -0.05, 0.95, 0.05, 0.05, 1.05])
 
     with pytest.raises(gs.GenesisException, match="distance_scale"):
-        controller.move_positive_y(distance_scale=1.5, duration_frames=1)
+        controller.move_positive_y(distance_scale=1.5, duration_steps=1)
     with pytest.raises(gs.GenesisException, match="distance_scale"):
-        controller.move_positive_y(distance_scale=0.0, duration_frames=1)
+        controller.move_positive_y(distance_scale=0.0, duration_steps=1)

@@ -60,7 +60,7 @@ def apply_probe_action(session, params: dict[str, Any]) -> dict[str, Any]:
         distance_scale = controller_spec.get("distance_scale")
         if distance_scale is None:
             raise GenesisLiveError("invalid_controller_request", "box controller requires distance_scale")
-        duration_frames = int(params.get("duration_frames", controller_spec.get("duration_frames", 1)))
+        duration_steps = int(params.get("duration_steps", controller_spec.get("duration_steps", 1)))
 
         controller = BoxEndEffectorController(entity, controller_id=controller_id)
         frame = aabb_box.get("frame", "env_local") if isinstance(aabb_box, dict) else "env_local"
@@ -68,7 +68,7 @@ def apply_probe_action(session, params: dict[str, Any]) -> dict[str, Any]:
             aabb_box,
             frame=frame,
             distance_scale=float(distance_scale),
-            duration_frames=duration_frames,
+            duration_steps=duration_steps,
         )
         session.controllers[controller_id] = controller
         return {

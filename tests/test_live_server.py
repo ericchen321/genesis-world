@@ -114,7 +114,7 @@ def test_live_session_lifecycle_and_box_action(tmp_path):
         {
             "action": "box_ee_grasp_and_move",
             "entity": "body",
-            "duration_frames": 12,
+            "duration_steps": 12,
             "controllers": [
                 {
                     "controller_id": "diag_box",
