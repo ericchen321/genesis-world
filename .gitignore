@@ -152,8 +152,17 @@ dmypy.json
 .pyre/
 uv.lock
 
-# alarm.yml outputs
+# outputs
 outputs/
 
 # Local benchmark archive (not versioned)
 /benchmarks/
+
+# for Codex
+.claude/
+.agents/*
+!.agents/skills/
+!.agents/skills/**
+
+# conda envs
+.conda/

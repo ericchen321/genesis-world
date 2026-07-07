@@ -41,6 +41,7 @@ XACRO_FORMAT = ".xacro"
 MJCF_FORMAT = ".xml"
 GLTF_FORMATS = (".glb", ".gltf")
 MESH_FORMATS = (".obj", ".stl", ".dae", *GLTF_FORMATS)
+TET_MESH_FORMAT = ".mesh"
 USD_FORMATS = (".usd", ".usda", ".usdc", ".usdz")
 
 
@@ -841,6 +842,20 @@ class Mesh(FileMorph, TetGenMixin):
             self.file_meshes_are_zup = True
 
         return self
+
+
+class TetMesh(FileMorph):
+    """
+    Morph loaded from a pre-tetrahedralized volumetric mesh file.
+
+    This FEM morph imports vertices, tetrahedra, and optional surface triangles from ``.mesh`` directly, without
+    TetGen options or re-tetrahedralization.
+    """
+
+    def model_post_init(self, context: Any) -> None:
+        super().model_post_init(context)
+        if not self.is_format(TET_MESH_FORMAT):
+            gs.raise_exception(f"Expected `{TET_MESH_FORMAT}` extension for volumetric mesh file: {self.file}")
 
 
 class MeshSet(Mesh):

@@ -5,6 +5,7 @@ from pydantic import Field, PrivateAttr, StrictBool
 
 import genesis as gs
 from genesis.typing import NonNegativeFloat, PositiveFloat, StrictInt, ValidFloat
+from genesis.utils.heterogeneous_materials import HeterogeneousMaterial
 
 from ..base import Material
 
@@ -47,6 +48,7 @@ class Base(Material["FEMEntity"]):
     friction_mu: NonNegativeFloat = 0.1
     contact_resistance: PositiveFloat | None = None
     hessian_invariant: StrictBool = False
+    heterogeneous: HeterogeneousMaterial | None = None
 
     # Dispatch fields — set by subclass model_post_init, not user-specified.
     build: Any = Field(default=None, exclude=True, repr=False)

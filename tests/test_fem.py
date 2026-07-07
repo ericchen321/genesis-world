@@ -123,6 +123,63 @@ def test_interior_tetrahedralized_vertex(cube_verts_and_faces, box_obj_path, sho
 
 
 @pytest.mark.required
+@pytest.mark.parametrize("smooth", [True, False])
+def test_fem_rasterizer_update_uses_surface_vertex_map(box_obj_path, show_viewer, monkeypatch, smooth):
+    scene = gs.Scene(
+        show_viewer=show_viewer,
+    )
+    fem = scene.add_entity(
+        morph=gs.morphs.Mesh(
+            file=box_obj_path,
+            nobisect=False,
+            minratio=1.5,
+            verbose=1,
+            maxvolume=0.01,
+        ),
+        material=gs.materials.FEM.Muscle(),
+        surface=gs.surfaces.Default(smooth=smooth),
+    )
+    scene.build()
+
+    surf_idx = np.unique(fem.surface_triangles)
+    assert surf_idx.size == fem.n_surface_vertices
+    assert surf_idx.size < fem.n_vertices
+    assert not np.array_equal(surf_idx, np.arange(surf_idx.size))
+
+    context = scene.visualizer.context
+    node_key = (0, fem.uid)
+    np.testing.assert_array_equal(context._fem_surface_vertex_indices[node_key], surf_idx)
+
+    base_pos = tensor_to_array(fem.get_state().pos[0])
+    offsets = np.zeros_like(base_pos)
+    offsets[:, 0] = np.arange(fem.n_vertices) * 1e-4
+    offsets[:, 1] = (np.arange(fem.n_vertices) % 11) * 2e-4
+    fem.set_position(base_pos + offsets)
+
+    captured = []
+    monkeypatch.setattr(context.jit, "update_normal", lambda node, update_data: None)
+    monkeypatch.setattr(
+        context.jit,
+        "update_buffer",
+        lambda buffer_id, data: captured.append(np.array(data, copy=True)),
+    )
+    context.update_fem()
+
+    vertices_qd, _, _ = scene.sim.fem_solver.get_state_render(scene.sim.cur_substep_local)
+    vertices_all = vertices_qd.to_numpy(dtype=gs.np_float)
+    expected_compact = vertices_all[fem.v_start : fem.v_start + fem.n_vertices, 0][surf_idx]
+    node = context.static_nodes[node_key]
+    expected_uploaded = context._scene.reorder_vertices(node, expected_compact)
+
+    assert captured
+    assert captured[0].shape == node.mesh.primitives[0].positions.shape
+    assert_allclose(captured[0], expected_uploaded, tol=1e-6)
+
+    context.destroy()
+    assert context._fem_surface_vertex_indices == {}
+
+
+@pytest.mark.required
 def test_maxvolume(box_obj_path, show_viewer):
     """Test that imposing a maximum element volume constraint produces a finer mesh (i.e., more elements)."""
     scene = gs.Scene(

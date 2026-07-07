@@ -139,6 +139,7 @@ usd = [
 
 [project.scripts]
 gs = "genesis._main:main"
+genesis-live-server = "genesis.live.server:main"
 
 [tool.setuptools.packages.find]
 where = ["."]

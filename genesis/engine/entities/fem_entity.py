@@ -9,7 +9,9 @@ import torch
 import genesis as gs
 import genesis.utils.element as eu
 import genesis.utils.geom as gu
+import genesis.utils.heterogeneous_materials as hmu
 import genesis.utils.mesh as mu
+import genesis.utils.volumetric_mesh as vu
 from genesis.engine.entities.rigid_entity import RigidLink
 from genesis.engine.couplers import SAPCoupler
 from genesis.engine.states.cache import QueriedStates
@@ -73,22 +75,37 @@ class FEMEntity(Entity):
         self._surface.update_texture()
 
         self.sample()
+        self._heterogeneous_material_np = None
 
         # Check if this is cloth (elements are already triangles)
         from genesis.engine.materials.FEM.cloth import Cloth as ClothMaterial
 
         is_cloth = isinstance(self.material, ClothMaterial)
+        if self.material.heterogeneous is not None:
+            if is_cloth:
+                gs.raise_exception("Heterogeneous per-tetrahedron materials are not supported for FEM cloth.")
+            self._heterogeneous_material_np = hmu.load_heterogeneous_material(
+                self.material.heterogeneous,
+                self.n_elements,
+            )
 
         if is_cloth:
             # For cloth, elements are already surface triangles
             self._surface_tri_np = self.elems
             self._n_surfaces = len(self._surface_tri_np)
             if self._n_surfaces > 0:
-                self._n_surface_vertices = len(np.unique(self._surface_tri_np))
+                self._boundary_vertex_indices_np = np.unique(self._surface_tri_np).astype(gs.np_int, copy=False)
+                self._n_surface_vertices = len(self._boundary_vertex_indices_np)
             else:
+                self._boundary_vertex_indices_np = np.empty((0,), dtype=gs.np_int)
                 self._n_surface_vertices = 0
             # For cloth, each triangle is its own "element"
             self._surface_el_np = np.arange(self.elems.shape[0], dtype=gs.np_int)
+        elif self._precomputed_surface_tri_np is not None:
+            self._surface_tri_np = self._precomputed_surface_tri_np
+            self._surface_el_np = self._precomputed_surface_el_np
+            self._n_surfaces = len(self._surface_tri_np)
+            self._n_surface_vertices = len(self._boundary_vertex_indices_np)
         else:
             # For volumetric FEM, extract surface triangles from tetrahedral elements
             el2tri = np.array(
@@ -107,8 +124,10 @@ class FEMEntity(Entity):
             self._n_surfaces = len(self._surface_tri_np)
 
             if self._n_surfaces > 0:
-                self._n_surface_vertices = len(np.unique(self._surface_tri_np))
+                self._boundary_vertex_indices_np = np.unique(self._surface_tri_np).astype(gs.np_int, copy=False)
+                self._n_surface_vertices = len(self._boundary_vertex_indices_np)
             else:
+                self._boundary_vertex_indices_np = np.empty((0,), dtype=gs.np_int)
                 self._n_surface_vertices = 0
 
             tri2el = np.repeat(np.arange(self.elems.shape[0], dtype=gs.np_int)[:, np.newaxis], 4, axis=1)
@@ -405,6 +424,10 @@ class FEMEntity(Entity):
 
         is_cloth = isinstance(self.material, ClothMaterial)
         self._uvs = None
+        self._precomputed_surface_tri_np = None
+        self._precomputed_surface_el_np = None
+        self._boundary_vertex_indices_np = None
+        self._volumetric_mesh_metadata = None
 
         if is_cloth:
             # Cloth: load surface mesh directly (no tetrahedralization)
@@ -428,6 +451,32 @@ class FEMEntity(Entity):
                 gs.raise_exception(f"Cloth material only supports Mesh morph. Got: {self.morph}.")
         else:
             # Regular FEM: tetrahedralize mesh
+            if isinstance(self.morph, gs.options.morphs.TetMesh):
+                data = vu.load_tet_mesh(self._morph.file)
+                scale = np.array(self._morph.scale, dtype=gs.np_float)
+                scale_vec = np.broadcast_to(scale, (3,)).astype(gs.np_float, copy=False)
+                pos = np.array(self._morph.pos, dtype=gs.np_float)
+                verts = data.verts * scale + pos
+                metadata = dict(data.metadata)
+                metadata.update(
+                    {
+                        "bbox_scaled_min": data.bbox_min * scale_vec + pos,
+                        "bbox_scaled_max": data.bbox_max * scale_vec + pos,
+                        "applied_transform": {
+                            "scale": tuple(float(v) for v in scale_vec),
+                            "pos": tuple(float(v) for v in pos),
+                            "quat": tuple(float(v) for v in self._morph.quat),
+                            "offset_pos": tuple(float(v) for v in self._morph.offset_pos),
+                            "offset_quat": tuple(float(v) for v in self._morph.offset_quat),
+                        },
+                    }
+                )
+                self._precomputed_surface_tri_np = data.surface_triangles
+                self._precomputed_surface_el_np = data.surface_triangle_tet_indices
+                self._boundary_vertex_indices_np = data.boundary_vertex_indices
+                self._volumetric_mesh_metadata = metadata
+                self.instantiate(verts, data.tets)
+                return
             if isinstance(self.morph, gs.options.morphs.Sphere):
                 verts, elems = eu.sphere_to_elements(
                     pos=self._morph.pos,
@@ -490,6 +539,15 @@ class FEMEntity(Entity):
         else:
             # Regular FEM: add vertices, elements, and surfaces for physics and rendering
             elems_np = self.elems.astype(gs.np_int, copy=False)
+            empty_material_np = np.empty((0,), dtype=gs.np_float)
+            if self._heterogeneous_material_np is None:
+                mat_mu_per_el = empty_material_np
+                mat_lam_per_el = empty_material_np
+                mat_rho_per_el = empty_material_np
+            else:
+                mat_mu_per_el = self._heterogeneous_material_np.mu
+                mat_lam_per_el = self._heterogeneous_material_np.lam
+                mat_rho_per_el = self._heterogeneous_material_np.density
             self._solver._kernel_add_elements(
                 f=self._sim.cur_substep_local,
                 mat_idx=self._material.idx,
@@ -497,6 +555,9 @@ class FEMEntity(Entity):
                 mat_lam=self._material.lam,
                 mat_rho=self._material.rho,
                 mat_friction_mu=self._material.friction_mu,
+                mat_mu_per_el=mat_mu_per_el,
+                mat_lam_per_el=mat_lam_per_el,
+                mat_rho_per_el=mat_rho_per_el,
                 n_surfaces=self._n_surfaces,
                 v_start=self._v_start,
                 el_start=self._el_start,
@@ -1064,6 +1125,8 @@ class FEMEntity(Entity):
             return "fem_sphere"
         if isinstance(morph, gs.morphs.Cylinder):
             return "fem_cylinder"
+        if isinstance(morph, gs.morphs.TetMesh):
+            return f"fem_{Path(morph.file).stem}"
         if isinstance(morph, gs.morphs.Mesh):
             return f"fem_{Path(morph.file).stem}"
         return "fem_entity"
@@ -1126,6 +1189,26 @@ class FEMEntity(Entity):
     def surface_triangles(self):
         """Surface triangles of the FEM mesh."""
         return self._surface_tri_np
+
+    @property
+    def surface_triangle_tet_indices(self):
+        """Tetrahedron owner index for each surface triangle."""
+        return self._surface_el_np
+
+    @property
+    def boundary_vertex_indices(self):
+        """Unique vertex indices on the boundary surface."""
+        return self._boundary_vertex_indices_np
+
+    @property
+    def volumetric_mesh_metadata(self):
+        """Metadata reported by the direct volumetric mesh loader, if any."""
+        return self._volumetric_mesh_metadata
+
+    @property
+    def heterogeneous_material_metadata(self):
+        """Metadata reported by the per-element material loader, if any."""
+        return None if self._heterogeneous_material_np is None else self._heterogeneous_material_np.metadata
 
     @property
     def uvs(self):

@@ -1131,6 +1131,9 @@ class FEMSolver(Solver):
         mat_lam: qd.f32,
         mat_rho: qd.f32,
         mat_friction_mu: qd.f32,
+        mat_mu_per_el: qd.types.ndarray(),
+        mat_lam_per_el: qd.types.ndarray(),
+        mat_rho_per_el: qd.types.ndarray(),
         n_surfaces: qd.i32,
         v_start: qd.i32,
         el_start: qd.i32,
@@ -1162,6 +1165,7 @@ class FEMSolver(Solver):
 
         dt2_inv = 1.0 / (self.substep_dt**2)
         n_elems_local = elems.shape[0]
+        has_heterogeneous_material = mat_mu_per_el.shape[0] > 0
         for i_e in range(n_elems_local):
             i_global = i_e + el_start
 
@@ -1182,13 +1186,20 @@ class FEMSolver(Solver):
 
             for j in qd.static(range(4)):
                 self.elements_i[i_global].el2v[j] = elems[i_e, j] + v_start
+            el_mu = mat_mu
+            el_lam = mat_lam
+            el_rho = mat_rho
+            if has_heterogeneous_material:
+                el_mu = mat_mu_per_el[i_e]
+                el_lam = mat_lam_per_el[i_e]
+                el_rho = mat_rho_per_el[i_e]
             self.elements_i[i_global].mat_idx = mat_idx
-            self.elements_i[i_global].mu = mat_mu
-            self.elements_i[i_global].lam = mat_lam
+            self.elements_i[i_global].mu = el_mu
+            self.elements_i[i_global].lam = el_lam
             self.elements_i[i_global].friction_mu = mat_friction_mu
-            self.elements_i[i_global].mass_scaled = mat_rho * V_scaled
+            self.elements_i[i_global].mass_scaled = el_rho * V_scaled
             for j in qd.static(range(4)):
-                mass = 0.25 * mat_rho * V
+                mass = 0.25 * el_rho * V
                 self.elements_v_info[self.elements_i[i_global].el2v[j]].mass += mass
                 self.elements_v_info[self.elements_i[i_global].el2v[j]].mass_over_dt2 += mass * dt2_inv
             self.elements_i[i_global].muscle_group = 0

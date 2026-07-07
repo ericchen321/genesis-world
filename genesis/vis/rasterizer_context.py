@@ -106,6 +106,7 @@ class RasterizerContext:
         self.vverts_nodes = dict()
         self._per_env_vverts_entity_uids: set = set()
         self.static_nodes = dict()  # used across all frames
+        self._fem_surface_vertex_indices = dict()
         self.dynamic_nodes = dict()  # nodes that live within single frame
         self.external_nodes = dict()  # nodes added by external user
         self.seg_node_map = dict()
@@ -186,6 +187,7 @@ class RasterizerContext:
                 self.remove_node(external_node)
             node_registry.clear()
         self._per_env_vverts_entity_uids.clear()
+        self._fem_surface_vertex_indices.clear()
 
     def reset(self):
         self._t = -1
@@ -894,12 +896,19 @@ class RasterizerContext:
                         triangles_all[fem_entity.s_start : (fem_entity.s_start + fem_entity.n_surfaces)]
                         - fem_entity.v_start
                     )
+                    surf_idx, inv = np.unique(triangles.flat, return_inverse=True)
+                    if surf_idx.shape[0] != fem_entity.n_surface_vertices:
+                        gs.raise_exception(
+                            f"FEM entity {fem_entity.uid} surface vertex map has {surf_idx.shape[0]} vertices, "
+                            f"expected {fem_entity.n_surface_vertices}."
+                        )
+                    surf_idx = np.ascontiguousarray(surf_idx)
+                    triangles_reindexed = inv.reshape(triangles.shape)
                     for idx in self.rendered_envs_idx:
                         vertices = vertices_all[fem_entity.v_start : fem_entity.v_start + fem_entity.n_vertices, idx]
                         uvs = uvs_all[fem_entity.v_start : fem_entity.v_start + fem_entity.n_vertices]
-                        # Select only vertices used in surface triangles, then reindex triangles against the new vertex list
-                        surf_idx, inv = np.unique(triangles.flat, return_inverse=True)
-                        triangles_reindexed = inv.reshape(triangles.shape)
+                        node_key = (idx, fem_entity.uid)
+                        self._fem_surface_vertex_indices[node_key] = surf_idx.copy()
                         vertices = vertices[surf_idx]
                         uvs = uvs[surf_idx]
 
@@ -919,17 +928,36 @@ class RasterizerContext:
 
     def update_fem(self):
         if self.sim.fem_solver.is_active:
-            vertices_all, triangles_all, _uvs = self.sim.fem_solver.get_state_render(self.sim.cur_substep_local)
+            vertices_all, _, _ = self.sim.fem_solver.get_state_render(self.sim.cur_substep_local)
             vertices_all = vertices_all.to_numpy(dtype=gs.np_float)
-            triangles_all = triangles_all.to_numpy(dtype=gs.np_int).reshape((-1, 3))
 
             for fem_entity in self.sim.fem_solver.entities:
                 if fem_entity.surface.vis_mode == "visual":
                     for idx in self.rendered_envs_idx:
+                        node_key = (idx, fem_entity.uid)
+                        surf_idx = self._fem_surface_vertex_indices[node_key]
                         vertices = vertices_all[fem_entity.v_start : fem_entity.v_start + fem_entity.n_vertices, idx]
+                        vertices = vertices[surf_idx]
 
-                        node = self.static_nodes[(idx, fem_entity.uid)]
+                        node = self.static_nodes[node_key]
+                        primitive = node.mesh.primitives[0]
+                        if primitive.vertex_mapping is None:
+                            expected_logical_n = primitive.positions.shape[0]
+                        else:
+                            expected_logical_n = (
+                                int(primitive.vertex_mapping.max()) + 1 if primitive.vertex_mapping.size else 0
+                            )
+                        if vertices.shape[0] != expected_logical_n:
+                            gs.raise_exception(
+                                f"FEM entity {fem_entity.uid} update has {vertices.shape[0]} logical vertices, "
+                                f"expected {expected_logical_n} for rasterizer node {node_key}."
+                            )
                         update_data = self._scene.reorder_vertices(node, vertices)
+                        if update_data.shape != primitive.positions.shape:
+                            gs.raise_exception(
+                                f"FEM entity {fem_entity.uid} update buffer shape {update_data.shape} does not match "
+                                f"rasterizer primitive positions shape {primitive.positions.shape} for node {node_key}."
+                            )
                         self.jit.update_buffer(self._scene.get_buffer_id(node, "pos"), update_data)
                         normal_data = self.jit.update_normal(node, update_data)
                         if normal_data is not None:
