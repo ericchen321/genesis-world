@@ -21,6 +21,14 @@ from genesis.utils.misc import to_gs_tensor, tensor_to_array, broadcast_tensor
 from .base_entity import Entity
 
 
+def _stats_np(array: np.ndarray) -> dict[str, float]:
+    return {
+        "min": float(np.min(array)),
+        "max": float(np.max(array)),
+        "mean": float(np.mean(array)),
+    }
+
+
 def assert_muscle(method):
     @wraps(method)
     def wrapper(self, *args, **kwargs):
@@ -76,18 +84,15 @@ class FEMEntity(Entity):
 
         self.sample()
         self._heterogeneous_material_np = None
+        self._surface_heterogeneous_material_np = None
+        self._surface_heterogeneous_backend_arrays = None
+        self._surface_heterogeneous_source_faces_np = None
+        self._surface_face_remap_np = None
 
         # Check if this is cloth (elements are already triangles)
         from genesis.engine.materials.FEM.cloth import Cloth as ClothMaterial
 
         is_cloth = isinstance(self.material, ClothMaterial)
-        if self.material.heterogeneous is not None:
-            if is_cloth:
-                gs.raise_exception("Heterogeneous per-tetrahedron materials are not supported for FEM cloth.")
-            self._heterogeneous_material_np = hmu.load_heterogeneous_material(
-                self.material.heterogeneous,
-                self.n_elements,
-            )
 
         if is_cloth:
             # For cloth, elements are already surface triangles
@@ -134,6 +139,17 @@ class FEMEntity(Entity):
             unique_el = tri2el.flat[unique_idcs]
             self._surface_el_np = unique_el[cnt == 1]
 
+        if self.material.heterogeneous is not None:
+            if is_cloth:
+                self._load_surface_heterogeneous_material()
+            else:
+                if not isinstance(self.material.heterogeneous, hmu.HeterogeneousMaterial):
+                    gs.raise_exception("Volumetric FEM heterogeneity requires HeterogeneousMaterial.")
+                self._heterogeneous_material_np = hmu.load_heterogeneous_material(
+                    self.material.heterogeneous,
+                    self.n_elements,
+                )
+
         if isinstance(self.sim.coupler, SAPCoupler):
             self.compute_pressure_field()
 
@@ -143,6 +159,120 @@ class FEMEntity(Entity):
         self._queried_states = QueriedStates()
 
         self.active = False  # This attribute is only used in forward pass. It should NOT be used during backward pass.
+
+    def _load_surface_heterogeneous_material(self):
+        if not isinstance(self.material.heterogeneous, hmu.SurfaceHeterogeneousMaterial):
+            gs.raise_exception("FEM cloth heterogeneity requires SurfaceHeterogeneousMaterial.")
+        if not isinstance(self.morph, gs.options.morphs.Mesh):
+            gs.raise_exception("FEM cloth surface heterogeneity requires a Mesh morph.")
+
+        material_data = hmu.load_surface_heterogeneous_material(
+            self.material.heterogeneous,
+            triangle_count=self.n_elements,
+        )
+        hmu.validate_surface_mesh_material_contract(self.morph.file, material_data)
+        source_faces = hmu.load_obj_triangle_faces(self.morph.file)
+        if source_faces.shape != self.elems.shape or not np.array_equal(source_faces, self.elems):
+            gs.raise_exception(
+                "FEM cloth surface heterogeneous material requires backend triangle order to match source OBJ face order."
+            )
+
+        self._surface_heterogeneous_material_np = material_data
+        self._surface_heterogeneous_source_faces_np = source_faces
+        self._surface_heterogeneous_backend_arrays = self.compute_surface_heterogeneous_backend_arrays()
+
+    def compute_surface_heterogeneous_backend_arrays(self) -> dict[str, np.ndarray | dict[str, object]] | None:
+        material_data = self._surface_heterogeneous_material_np
+        if material_data is None:
+            return None
+
+        vertices = np.asarray(tensor_to_array(self.init_positions), dtype=np.float64)
+        if vertices.ndim == 3:
+            vertices = vertices[0]
+        faces = np.asarray(self.surface_triangles, dtype=np.int64)
+        if faces.ndim != 2 or faces.shape[1] != 3:
+            gs.raise_exception(f"Surface heterogeneous backend faces must have shape (n, 3), got {faces.shape}.")
+
+        source_faces = self._surface_heterogeneous_source_faces_np
+        if self._surface_face_remap_np is None:
+            if source_faces is None or source_faces.shape != faces.shape or not np.array_equal(source_faces, faces):
+                gs.raise_exception(
+                    "Surface heterogeneous backend face order must match source material rows when no remap is present."
+                )
+            face_remap = np.arange(faces.shape[0], dtype=np.int64)
+        else:
+            face_remap = hmu.validate_surface_face_remap(
+                self._surface_face_remap_np,
+                source_triangle_count=int(material_data.metadata["row_count"]),
+                backend_triangle_count=int(faces.shape[0]),
+            ).astype(np.int64, copy=False)
+
+        backend_E = np.asarray(material_data.youngs_modulus, dtype=np.float64)[face_remap]
+        backend_nu = np.asarray(material_data.poisson_ratio, dtype=np.float64)[face_remap]
+        backend_mu, backend_lam = hmu._surface_lame2d_from_e_nu(backend_E, backend_nu)
+        thickness_by_triangle = np.asarray(material_data.thickness, dtype=np.float64)[face_remap]
+        area_density_by_triangle = np.asarray(material_data.area_density, dtype=np.float64)[face_remap]
+
+        p0 = vertices[faces[:, 0]]
+        p1 = vertices[faces[:, 1]]
+        p2 = vertices[faces[:, 2]]
+        area_by_triangle = 0.5 * np.linalg.norm(np.cross(p1 - p0, p2 - p0), axis=1)
+        if not np.all(np.isfinite(area_by_triangle)) or np.any(area_by_triangle <= 0.0):
+            gs.raise_exception("Surface heterogeneous material encountered non-positive or non-finite triangle area.")
+
+        mass_by_triangle = area_by_triangle * area_density_by_triangle
+        volume_by_vertex = np.zeros(vertices.shape[0], dtype=np.float64)
+        thickness_area_sum_by_vertex = np.zeros(vertices.shape[0], dtype=np.float64)
+        area_sum_by_vertex = np.zeros(vertices.shape[0], dtype=np.float64)
+        for tri_index, face in enumerate(faces):
+            tri_mass_share = mass_by_triangle[tri_index] / 3.0
+            tri_area = area_by_triangle[tri_index]
+            tri_thickness = thickness_by_triangle[tri_index]
+            for vertex_index in face:
+                volume_by_vertex[vertex_index] += tri_mass_share
+                thickness_area_sum_by_vertex[vertex_index] += tri_area * tri_thickness
+                area_sum_by_vertex[vertex_index] += tri_area
+
+        if np.any(area_sum_by_vertex <= 0.0):
+            unused = np.flatnonzero(area_sum_by_vertex <= 0.0)
+            gs.raise_exception(
+                f"Surface heterogeneous material cannot assign mass/thickness to unused vertices: {unused.tolist()}."
+            )
+        thickness_by_vertex = thickness_area_sum_by_vertex / area_sum_by_vertex
+        if not np.all(np.isfinite(volume_by_vertex)) or not np.all(np.isfinite(thickness_by_vertex)):
+            gs.raise_exception("Surface heterogeneous material produced non-finite vertex mass or thickness.")
+
+        total_area = float(np.sum(area_by_triangle))
+        total_mass = float(np.sum(mass_by_triangle))
+        metadata = dict(material_data.metadata)
+        metadata.update(
+            {
+                "heterogeneous_kind": "surface_triangles",
+                "face_order": "obj_source_order",
+                "backend_order": "source_order" if self._surface_face_remap_np is None else "surface_face_remap",
+                "total_area": total_area,
+                "total_mass": total_mass,
+                "surface_total_area": total_area,
+                "surface_total_mass": total_mass,
+                "triangle_area": _stats_np(area_by_triangle),
+                "triangle_mass": _stats_np(mass_by_triangle),
+                "vertex_mass": _stats_np(volume_by_vertex),
+                "vertex_thickness": _stats_np(thickness_by_vertex),
+                "ipc_mass_density": 1.0,
+            }
+        )
+
+        return {
+            "lambda_by_triangle": backend_lam,
+            "mu_by_triangle": backend_mu,
+            "thickness_by_triangle": thickness_by_triangle,
+            "area_density_by_triangle": area_density_by_triangle,
+            "area_by_triangle": area_by_triangle,
+            "mass_by_triangle": mass_by_triangle,
+            "volume_by_vertex": volume_by_vertex,
+            "thickness_by_vertex": thickness_by_vertex,
+            "metadata": metadata,
+        }
 
     # ------------------------------------------------------------------------------------
     # ----------------------------------- basic entity ops -------------------------------
@@ -434,9 +564,13 @@ class FEMEntity(Entity):
             if isinstance(self.morph, gs.options.morphs.Mesh):
                 import trimesh
 
-                mesh = trimesh.load_mesh(self._morph.file)
+                mesh = trimesh.load_mesh(self._morph.file, process=False)
                 verts = mesh.vertices * self._morph.scale + np.array(self._morph.pos)
-                faces = mesh.faces
+                faces = np.asarray(mesh.faces, dtype=gs.np_int)
+                if faces.ndim != 2 or faces.shape[1] != 3:
+                    gs.raise_exception(
+                        f"FEM cloth requires a triangle surface mesh. Got face shape {faces.shape}."
+                    )
                 # For cloth, we store faces as "elements" (treating them as surface elements)
                 self.instantiate(verts, faces)
 
@@ -959,14 +1093,38 @@ class FEMEntity(Entity):
                 List of environment indices to apply the constraints to. If None, applies to all environments.
         """
         from genesis.engine.couplers import IPCCoupler
+        from genesis.engine.materials.FEM.cloth import Cloth as ClothMaterial
+
+        if isinstance(self.sim.coupler, IPCCoupler):
+            if not isinstance(self.material, ClothMaterial):
+                gs.raise_exception(
+                    "FEM vertex constraints under IPCCoupler are supported only for FEM.Cloth surface shell entities."
+                )
+            if link is not None:
+                gs.raise_exception("IPC surface vertex constraints do not support link-following targets.")
+
+            use_current_poss = target_poss is None
+            envs_idx = self._scene._sanitize_envs_idx(envs_idx)
+            verts_idx_local = self._sanitize_verts_idx_local(verts_idx_local, envs_idx)
+            target_poss = self._sanitize_verts_tensor(target_poss, gs.tc_float, verts_idx_local, envs_idx, (3,))
+
+            if use_current_poss:
+                self._kernel_get_verts_pos(self._sim.cur_substep_local, target_poss, verts_idx_local)
+
+            strength = float(stiffness) if float(stiffness) > 0.0 else None
+            self.sim.coupler.set_surface_vertex_constraints(
+                self,
+                verts_idx_local,
+                target_poss,
+                envs_idx=envs_idx,
+                strength=strength,
+            )
+            return
 
         if self._solver._use_implicit_solver and not self._solver._enable_vertex_constraints:
             gs.raise_exception(
                 "This feature is disabled. Please set 'enable_vertex_constraints=True' when using FEM implicit solver."
             )
-
-        if isinstance(self.sim.coupler, IPCCoupler):
-            gs.raise_exception("This method is only supported by IPC coupler.")
 
         if not self._solver._constraints_initialized:
             self._solver.init_constraints()
@@ -1007,6 +1165,27 @@ class FEMEntity(Entity):
 
     def update_constraint_targets(self, verts_idx_local, target_poss, envs_idx=None):
         """Update target positions for existing constraints."""
+        from genesis.engine.couplers import IPCCoupler
+        from genesis.engine.materials.FEM.cloth import Cloth as ClothMaterial
+
+        if isinstance(self.sim.coupler, IPCCoupler):
+            if not isinstance(self.material, ClothMaterial):
+                gs.raise_exception(
+                    "FEM vertex constraint target updates under IPCCoupler are supported only for FEM.Cloth "
+                    "surface shell entities."
+                )
+            assert target_poss is not None
+            envs_idx = self._scene._sanitize_envs_idx(envs_idx)
+            verts_idx_local = self._sanitize_verts_idx_local(verts_idx_local, envs_idx)
+            target_poss = self._sanitize_verts_tensor(target_poss, gs.tc_float, verts_idx_local, envs_idx, (3,))
+            self.sim.coupler.update_surface_vertex_constraint_targets(
+                self,
+                verts_idx_local,
+                target_poss,
+                envs_idx=envs_idx,
+            )
+            return
+
         if not self._solver._constraints_initialized:
             gs.logger.warning("Ignoring update_constraint_targets; constraints have not been initialized.")
             return
@@ -1021,6 +1200,27 @@ class FEMEntity(Entity):
 
     def remove_vertex_constraints(self, verts_idx_local=None, envs_idx=None):
         """Remove constraints from specified vertices, or all if None."""
+        from genesis.engine.couplers import IPCCoupler
+        from genesis.engine.materials.FEM.cloth import Cloth as ClothMaterial
+
+        if isinstance(self.sim.coupler, IPCCoupler):
+            if not isinstance(self.material, ClothMaterial):
+                gs.raise_exception(
+                    "FEM vertex constraint removal under IPCCoupler is supported only for FEM.Cloth surface shell "
+                    "entities."
+                )
+            envs_idx = self._scene._sanitize_envs_idx(envs_idx)
+            if verts_idx_local is None:
+                self.sim.coupler.remove_surface_vertex_constraints(self, envs_idx=envs_idx)
+            else:
+                verts_idx_local = self._sanitize_verts_idx_local(verts_idx_local, envs_idx)
+                self.sim.coupler.remove_surface_vertex_constraints(
+                    self,
+                    verts_idx_local,
+                    envs_idx=envs_idx,
+                )
+            return
+
         if not self._solver._constraints_initialized:
             gs.logger.warning("Ignoring remove_vertex_constraints; constraints have not been initialized.")
             return
@@ -1208,7 +1408,24 @@ class FEMEntity(Entity):
     @property
     def heterogeneous_material_metadata(self):
         """Metadata reported by the per-element material loader, if any."""
+        if self._surface_heterogeneous_backend_arrays is not None:
+            return self._surface_heterogeneous_backend_arrays["metadata"]
         return None if self._heterogeneous_material_np is None else self._heterogeneous_material_np.metadata
+
+    @property
+    def surface_heterogeneous_material(self):
+        """Surface heterogeneous material arrays for cloth entities, if any."""
+        return self._surface_heterogeneous_material_np
+
+    @property
+    def surface_heterogeneous_material_metadata(self):
+        """Surface heterogeneous material metadata for cloth entities, if any."""
+        return None if self._surface_heterogeneous_backend_arrays is None else self._surface_heterogeneous_backend_arrays["metadata"]
+
+    @property
+    def surface_heterogeneous_backend_arrays(self):
+        """Backend-order surface shell material arrays for IPC, if any."""
+        return self._surface_heterogeneous_backend_arrays
 
     @property
     def uvs(self):

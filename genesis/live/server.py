@@ -8,7 +8,8 @@ import threading
 import time
 from contextlib import closing
 
-from .protocol import GenesisLiveError, recv_json, send_json
+from .capabilities import capability_report
+from .protocol import SURFACE_BACKEND_CAPABILITIES, GenesisLiveError, recv_json, send_json
 from .ready_file import ready_payload, write_ready_file
 from .session import GenesisLiveSession
 
@@ -65,6 +66,8 @@ class GenesisLiveServer:
                 start_paused=self.session.start_paused,
                 heartbeat_interval_s=self.heartbeat_interval_s,
                 status=self.session.status(),
+                capabilities=self.session.handshake()["capabilities"],
+                backend_requirements=self.session.backend_requirements(),
                 session_token=self.session.session_id,
             ),
         )
@@ -91,14 +94,32 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run a Genesis live diagnostic server.")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=0)
-    parser.add_argument("--ready-file", required=True)
+    parser.add_argument("--ready-file", default=None)
     parser.add_argument("--scene-config", default=None)
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--heartbeat-interval-s", type=float, default=1.0)
+    parser.add_argument("--print-capabilities", action="store_true")
+    parser.add_argument("--require-capability", action="append", default=[])
     paused = parser.add_mutually_exclusive_group()
     paused.add_argument("--start-paused", dest="start_paused", action="store_true", default=True)
     paused.add_argument("--no-start-paused", dest="start_paused", action="store_false")
     args = parser.parse_args(argv)
+
+    if args.print_capabilities:
+        report = capability_report(args.require_capability)
+        missing = report["missing_required_capabilities"]
+        if missing:
+            error_code = "missing_required_capability"
+            if any(capability in SURFACE_BACKEND_CAPABILITIES for capability in missing):
+                error_code = "unsupported_surface_backend"
+            report["error"] = {"code": error_code, "missing_required_capabilities": missing}
+            print(json_dumps(report), flush=True)
+            return 1
+        print(json_dumps(report), flush=True)
+        return 0
+
+    if args.ready_file is None:
+        parser.error("--ready-file is required unless --print-capabilities is used")
 
     server = GenesisLiveServer(
         host=args.host,
@@ -114,6 +135,12 @@ def main(argv: list[str] | None = None) -> int:
     except KeyboardInterrupt:
         return 130
     return 0
+
+
+def json_dumps(payload: dict) -> str:
+    import json
+
+    return json.dumps(payload, indent=2, sort_keys=True)
 
 
 if __name__ == "__main__":

@@ -11,17 +11,56 @@ PROTOCOL = "genesis-live-v1"
 HEADER_STRUCT = struct.Struct(">I")
 MAX_MESSAGE_BYTES = 64 * 1024 * 1024
 
-CAPABILITIES = (
-    "volumetric_mesh_import",
-    "heterogeneous_fem_material_arrays",
-    "static_box_anchors",
-    "live_box_controller_actions",
+BASE_CAPABILITIES = (
     "pause_resume_reset",
     "rgb_triptych_telemetry",
     "frame_metadata",
     "geometry_context",
     "fused_observation",
 )
+
+VOLUMETRIC_CAPABILITIES = (
+    "volumetric_mesh_import",
+    "heterogeneous_fem_material_arrays",
+    "static_box_anchors",
+    "live_box_controller_actions",
+)
+
+SURFACE_CAPABILITIES = (
+    "surface_mesh_import",
+    "surface_shell_diagnostics",
+)
+
+SURFACE_POSITION_CONSTRAINT_CAPABILITIES = (
+    "surface_static_box_anchors",
+    "surface_live_box_controller_actions",
+)
+
+SURFACE_HETEROGENEOUS_CAPABILITIES = (
+    "heterogeneous_surface_material_arrays",
+)
+
+SURFACE_BACKEND_CAPABILITIES = (
+    SURFACE_CAPABILITIES + SURFACE_POSITION_CONSTRAINT_CAPABILITIES + SURFACE_HETEROGENEOUS_CAPABILITIES
+)
+
+CAPABILITIES = VOLUMETRIC_CAPABILITIES + BASE_CAPABILITIES
+
+
+def capabilities_for_report(
+    surface_backend_available: bool,
+    surface_heterogeneous_backend_available: bool = False,
+    surface_position_constraint_available: bool = False,
+) -> tuple[str, ...]:
+    capabilities = list(VOLUMETRIC_CAPABILITIES)
+    if surface_backend_available:
+        capabilities.extend(SURFACE_CAPABILITIES)
+    if surface_position_constraint_available:
+        capabilities.extend(SURFACE_POSITION_CONSTRAINT_CAPABILITIES)
+    if surface_heterogeneous_backend_available:
+        capabilities.extend(SURFACE_HETEROGENEOUS_CAPABILITIES)
+    capabilities.extend(BASE_CAPABILITIES)
+    return tuple(capabilities)
 
 
 @dataclass

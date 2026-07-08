@@ -101,7 +101,10 @@ def test_live_session_lifecycle_and_box_action(tmp_path):
     assert session.status()["paused"]
 
     geometry = session.dispatch("geometry.context.get", {"entity": "body"})
+    assert geometry["representation"] == "volumetric"
+    assert geometry["primitive_kind"] == "tetrahedron"
     assert geometry["vertex_count"] == 5
+    assert geometry["element_count"] == 2
     assert geometry["max_extent"] == pytest.approx(2.0)
 
     resumed = session.dispatch("sim.resume", {"steps": 3})

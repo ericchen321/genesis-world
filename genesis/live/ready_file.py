@@ -9,7 +9,7 @@ from typing import Any
 
 import genesis as gs
 
-from .protocol import CAPABILITIES, PROTOCOL
+from .protocol import PROTOCOL
 
 
 def ready_payload(
@@ -21,6 +21,8 @@ def ready_payload(
     start_paused: bool,
     heartbeat_interval_s: float,
     status: dict[str, Any],
+    capabilities: list[str] | tuple[str, ...],
+    backend_requirements: dict[str, Any] | None = None,
     session_token: str | None = None,
 ) -> dict[str, Any]:
     payload = {
@@ -31,12 +33,14 @@ def ready_payload(
         "session_token": session_token,
         "start_paused": bool(start_paused),
         "scene_config_path": scene_config_path,
-        "capabilities": list(CAPABILITIES),
+        "capabilities": list(capabilities),
         "heartbeat_interval_s": float(heartbeat_interval_s),
         "ready_time": time.time(),
         "genesis_version": gs.__version__,
         "status": status,
     }
+    if backend_requirements is not None:
+        payload["backend_requirements"] = backend_requirements
     return payload
 
 

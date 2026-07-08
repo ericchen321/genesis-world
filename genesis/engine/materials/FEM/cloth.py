@@ -7,6 +7,7 @@ This material is used with FEMEntity and IPCCoupler for shell/membrane simulatio
 from typing import Literal
 
 from genesis.typing import NonNegativeFloat, PositiveFloat
+from genesis.utils.heterogeneous_materials import SurfaceHeterogeneousMaterial
 
 from .base import Base
 
@@ -67,3 +68,4 @@ class Cloth(Base):
     thickness: PositiveFloat = 0.001
     bending_stiffness: NonNegativeFloat | None = None
     model: Literal["linear", "stable_neohookean", "linear_corotated"] = "stable_neohookean"
+    heterogeneous: SurfaceHeterogeneousMaterial | None = None

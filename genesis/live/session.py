@@ -5,15 +5,22 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import genesis as gs
 import numpy as np
 
 from genesis.engine.controllers.box_end_effector import apply_static_box_anchors
+from genesis.utils.heterogeneous_materials import (
+    SurfaceHeterogeneousMaterial,
+    load_obj_triangle_faces,
+    load_surface_heterogeneous_material,
+    validate_surface_mesh_material_contract,
+)
 
 from .actions import ActionRegistry, apply_probe_action
-from .protocol import CAPABILITIES, PROTOCOL, GenesisLiveError, error_response, ok_response
+from .capabilities import capability_report, surface_backend_status
+from .protocol import PROTOCOL, GenesisLiveError, error_response, ok_response
 from .snapshots import controller_snapshots, fused_observation, geometry_context
 from .visual_telemetry import GENESIS_NATIVE_DEBUG_CAMERA_RENDERER, VisualTelemetry
 
@@ -65,12 +72,185 @@ class GenesisLiveSession:
             raise GenesisLiveError("invalid_scene_config", "scene config must be a JSON object")
         return data
 
-    def _ensure_genesis_initialized(self) -> None:
+    def _scene_requires_surface_backend(self, scene_config: dict[str, Any]) -> bool:
+        for entity_cfg in scene_config.get("entities", []):
+            if not isinstance(entity_cfg, dict):
+                continue
+            morph_cfg = entity_cfg.get("morph", {})
+            material_cfg = entity_cfg.get("material", {})
+            if isinstance(morph_cfg, dict) and morph_cfg.get("type") == "surface_mesh":
+                return True
+            if isinstance(material_cfg, dict) and material_cfg.get("type") in {"surface_shell", "cloth"}:
+                return True
+        return False
+
+    def _scene_requested_backend(self, scene_config: dict[str, Any]) -> Literal["cpu", "cuda"]:
+        backend = scene_config.get("backend", "cpu")
+        if backend not in {"cpu", "cuda"}:
+            raise GenesisLiveError("invalid_scene_config", "scene backend must be 'cpu' or 'cuda'")
+        return backend
+
+    def _validate_scene_config_before_build(self, scene_config: dict[str, Any]) -> None:
+        for index, entity_cfg in enumerate(scene_config.get("entities", [])):
+            if not isinstance(entity_cfg, dict):
+                raise GenesisLiveError("invalid_scene_config", "entity entries must be JSON objects")
+            morph_cfg = entity_cfg.get("morph", {})
+            material_cfg = entity_cfg.get("material", {})
+            if not isinstance(morph_cfg, dict) or not isinstance(material_cfg, dict):
+                raise GenesisLiveError("invalid_scene_config", "entity morph and material entries must be JSON objects")
+            morph_type = morph_cfg.get("type")
+            material_type = material_cfg.get("type", "elastic")
+            if morph_type == "surface_mesh":
+                if material_type not in {"surface_shell", "cloth"}:
+                    raise GenesisLiveError(
+                        "invalid_scene_config",
+                        "surface_mesh morph requires material.type='surface_shell' or 'cloth'",
+                        details={"entity_index": index, "material_type": material_type},
+                    )
+                if "file" not in morph_cfg:
+                    raise GenesisLiveError("invalid_scene_config", "surface_mesh morph requires file")
+                faces = self._validate_surface_obj_faces(morph_cfg["file"], entity_index=index)
+                heterogeneous = material_cfg.get("heterogeneous")
+                if heterogeneous is not None:
+                    material_file = self._surface_heterogeneous_material_file(
+                        heterogeneous,
+                        entity_index=index,
+                        mesh_file=morph_cfg["file"],
+                    )
+                    self._validate_surface_heterogeneous_material_contract(
+                        mesh_file=morph_cfg["file"],
+                        material_file=material_file,
+                        source_triangle_count=int(faces.shape[0]),
+                        entity_index=index,
+                    )
+            elif morph_type == "tet_mesh":
+                if material_type != "elastic":
+                    raise GenesisLiveError(
+                        "invalid_scene_config",
+                        "tet_mesh morph requires material.type='elastic' for this feature",
+                        details={"entity_index": index, "material_type": material_type},
+                    )
+
+    def _validate_surface_obj_faces(self, mesh_file: str | Path, *, entity_index: int) -> np.ndarray:
+        path = Path(mesh_file)
+        if path.suffix.lower() != ".obj":
+            raise GenesisLiveError(
+                "invalid_scene_config",
+                "surface_mesh live path requires a source OBJ mesh with triangle faces",
+                details={"entity_index": entity_index, "file": str(path)},
+            )
+        try:
+            faces = load_obj_triangle_faces(path)
+        except gs.GenesisException as exc:
+            raise GenesisLiveError(
+                "invalid_scene_config",
+                "surface_mesh live path requires source OBJ triangle faces",
+                details={"entity_index": entity_index, "file": str(path), "error": str(exc)},
+            ) from exc
+        if faces.shape[0] == 0:
+            raise GenesisLiveError(
+                "invalid_scene_config",
+                "surface_mesh live path requires at least one source OBJ face",
+                details={"entity_index": entity_index, "file": str(path)},
+            )
+        return faces
+
+    def _surface_heterogeneous_material_file(
+        self,
+        heterogeneous: Any,
+        *,
+        entity_index: int,
+        mesh_file: str | Path,
+    ) -> str:
+        details = {"entity_index": entity_index, "mesh_file": str(mesh_file)}
+        if not isinstance(heterogeneous, dict):
+            raise GenesisLiveError(
+                "invalid_surface_heterogeneous_material",
+                "surface material.heterogeneous must be an object",
+                details=details,
+            )
+        allowed_keys = {"kind", "material_file"}
+        if set(heterogeneous) != allowed_keys:
+            raise GenesisLiveError(
+                "invalid_surface_heterogeneous_material",
+                "surface material.heterogeneous must contain exactly kind='surface_triangles' and material_file",
+                details={**details, "keys": sorted(heterogeneous), "allowed_keys": sorted(allowed_keys)},
+            )
+        if heterogeneous["kind"] != "surface_triangles":
+            raise GenesisLiveError(
+                "invalid_surface_heterogeneous_material",
+                "surface material.heterogeneous.kind must be 'surface_triangles'",
+                details={**details, "kind": heterogeneous["kind"]},
+            )
+        material_file = heterogeneous["material_file"]
+        if not isinstance(material_file, str) or not material_file:
+            raise GenesisLiveError(
+                "invalid_surface_heterogeneous_material",
+                "surface material.heterogeneous.material_file must be a filesystem path string",
+                details=details,
+            )
+        return material_file
+
+    def _validate_surface_heterogeneous_material_contract(
+        self,
+        *,
+        mesh_file: str | Path,
+        material_file: str | Path,
+        source_triangle_count: int,
+        entity_index: int,
+    ) -> None:
+        try:
+            material_data = load_surface_heterogeneous_material(
+                SurfaceHeterogeneousMaterial(file=material_file),
+                triangle_count=source_triangle_count,
+            )
+            validate_surface_mesh_material_contract(mesh_file, material_data)
+        except gs.GenesisException as exc:
+            raise GenesisLiveError(
+                "invalid_surface_heterogeneous_material",
+                "surface heterogeneous material does not match the source OBJ triangle contract",
+                details={
+                    "entity_index": entity_index,
+                    "mesh_file": str(mesh_file),
+                    "material_file": str(material_file),
+                    "source_triangle_count": int(source_triangle_count),
+                    "error": str(exc),
+                },
+            ) from exc
+
+    def _ensure_genesis_initialized(self, backend: Literal["cpu", "cuda"], *, requires_surface_backend: bool) -> None:
+        if requires_surface_backend:
+            if backend != "cuda":
+                raise GenesisLiveError(
+                    "unsupported_surface_backend",
+                    "surface shell diagnostics require scene backend='cuda'",
+                    details={"requested_backend": backend},
+                )
+            status = surface_backend_status()
+            if not status["available"]:
+                raise GenesisLiveError(
+                    "unsupported_surface_backend",
+                    "surface shell diagnostics require uipc, CUDA, and IPCCoupler support",
+                    details=status,
+                )
+            if gs._initialized:
+                if gs.backend != gs.cuda:
+                    raise GenesisLiveError(
+                        "unsupported_surface_backend",
+                        "surface shell diagnostics require Genesis to be initialized on CUDA",
+                        details={"current_backend": str(gs.backend), "required_backend": "cuda"},
+                    )
+                return
+            gs.init(backend=gs.cuda, logging_level="warning")
+            return
         if not gs._initialized:
             gs.init(backend=gs.cpu, logging_level="warning")
 
     def build_scene(self) -> None:
-        self._ensure_genesis_initialized()
+        self._validate_scene_config_before_build(self._scene_config)
+        requires_surface_backend = self._scene_requires_surface_backend(self._scene_config)
+        backend = self._scene_requested_backend(self._scene_config)
+        self._ensure_genesis_initialized(backend, requires_surface_backend=requires_surface_backend)
         self.visual_telemetry.reset_triptych_cameras()
         if self.scene is not None:
             self.scene.destroy()
@@ -81,11 +261,16 @@ class GenesisLiveSession:
         sim_options = self._scene_config.get("sim_options", {})
         fem_options = {"enable_vertex_constraints": True}
         fem_options.update(self._scene_config.get("fem_options", {}))
-        self.scene = gs.Scene(
-            show_viewer=False,
-            sim_options=gs.options.SimOptions(**sim_options),
-            fem_options=gs.options.FEMOptions(**fem_options),
-        )
+        scene_kwargs = {
+            "show_viewer": False,
+            "sim_options": gs.options.SimOptions(**sim_options),
+            "fem_options": gs.options.FEMOptions(**fem_options),
+        }
+        if requires_surface_backend:
+            scene_kwargs["coupler_options"] = gs.options.IPCCouplerOptions(
+                **self._scene_config.get("coupler_options", {})
+            )
+        self.scene = gs.Scene(**scene_kwargs)
 
         self.entities = {}
         pending_anchors = []
@@ -106,7 +291,14 @@ class GenesisLiveSession:
         for entity, anchors in pending_anchors:
             if anchors:
                 name = next(name for name, candidate in self.entities.items() if candidate is entity)
-                self.anchor_records[name] = apply_static_box_anchors(entity, anchors, frame="env_local")
+                try:
+                    self.anchor_records[name] = apply_static_box_anchors(entity, anchors, frame="env_local")
+                except gs.GenesisException as exc:
+                    raise GenesisLiveError(
+                        "invalid_scene_config",
+                        "static box anchor selection failed",
+                        details={"entity": name, "error": str(exc)},
+                    ) from exc
         self.current_step = 0
         self.paused = self.start_paused
         self.running = False
@@ -115,30 +307,68 @@ class GenesisLiveSession:
 
     def _build_morph(self, morph_cfg: dict[str, Any]):
         morph_type = morph_cfg.get("type")
-        if morph_type != "tet_mesh":
-            raise GenesisLiveError("invalid_scene_config", "only morph.type='tet_mesh' is supported by this feature")
-        if "file" not in morph_cfg:
-            raise GenesisLiveError("invalid_scene_config", "tet_mesh morph requires file")
-        kwargs = {"file": morph_cfg["file"]}
-        if "scale" in morph_cfg:
-            kwargs["scale"] = tuple(morph_cfg["scale"])
-        if "pos" in morph_cfg:
-            kwargs["pos"] = tuple(morph_cfg["pos"])
-        return gs.morphs.TetMesh(**kwargs)
+        if morph_type == "tet_mesh":
+            if "file" not in morph_cfg:
+                raise GenesisLiveError("invalid_scene_config", "tet_mesh morph requires file")
+            kwargs = {"file": morph_cfg["file"]}
+            if "scale" in morph_cfg:
+                kwargs["scale"] = tuple(morph_cfg["scale"])
+            if "pos" in morph_cfg:
+                kwargs["pos"] = tuple(morph_cfg["pos"])
+            return gs.morphs.TetMesh(**kwargs)
+        if morph_type == "surface_mesh":
+            if "file" not in morph_cfg:
+                raise GenesisLiveError("invalid_scene_config", "surface_mesh morph requires file")
+            for key in ("decimate", "convexify", "force_retet", "quality", "retet"):
+                if bool(morph_cfg.get(key, False)):
+                    raise GenesisLiveError(
+                        "invalid_scene_config",
+                        f"surface_mesh live path does not allow mesh rewriting option: {key}",
+                    )
+            kwargs = {"file": morph_cfg["file"], "convexify": False, "decimate": False}
+            for key in ("scale", "pos", "euler", "quat"):
+                if key in morph_cfg:
+                    kwargs[key] = tuple(morph_cfg[key])
+            if "file_meshes_are_zup" in morph_cfg:
+                kwargs["file_meshes_are_zup"] = bool(morph_cfg["file_meshes_are_zup"])
+            return gs.morphs.Mesh(**kwargs)
+        raise GenesisLiveError(
+            "invalid_scene_config",
+            "only morph.type='tet_mesh' or morph.type='surface_mesh' is supported by this feature",
+        )
 
     def _build_material(self, material_cfg: dict[str, Any]):
         material_type = material_cfg.get("type", "elastic")
-        if material_type != "elastic":
-            raise GenesisLiveError("invalid_scene_config", "only material.type='elastic' is supported by this feature")
-        kwargs = {
-            key: material_cfg[key]
-            for key in ("E", "nu", "rho", "friction_mu")
-            if key in material_cfg
-        }
-        heterogeneous = material_cfg.get("heterogeneous")
-        if heterogeneous is not None:
-            kwargs["heterogeneous"] = gs.materials.FEM.HeterogeneousMaterial(**heterogeneous)
-        return gs.materials.FEM.Elastic(**kwargs)
+        if material_type == "elastic":
+            kwargs = {
+                key: material_cfg[key]
+                for key in ("E", "nu", "rho", "friction_mu")
+                if key in material_cfg
+            }
+            heterogeneous = material_cfg.get("heterogeneous")
+            if heterogeneous is not None:
+                kwargs["heterogeneous"] = gs.materials.FEM.HeterogeneousMaterial(**heterogeneous)
+            return gs.materials.FEM.Elastic(**kwargs)
+        if material_type in {"surface_shell", "cloth"}:
+            kwargs = {
+                key: material_cfg[key]
+                for key in ("E", "nu", "rho", "thickness", "bending_stiffness", "friction_mu", "contact_resistance")
+                if key in material_cfg
+            }
+            heterogeneous = material_cfg.get("heterogeneous")
+            if heterogeneous is not None:
+                kwargs["heterogeneous"] = gs.materials.FEM.SurfaceHeterogeneousMaterial(
+                    file=self._surface_heterogeneous_material_file(
+                        heterogeneous,
+                        entity_index=-1,
+                        mesh_file="<material_build>",
+                    )
+                )
+            return gs.materials.FEM.Cloth(**kwargs)
+        raise GenesisLiveError(
+            "invalid_scene_config",
+            "only material.type='elastic', 'surface_shell', or 'cloth' is supported by this feature",
+        )
 
     def default_entity(self):
         if not self.entities:
@@ -153,6 +383,9 @@ class GenesisLiveSession:
         return name, entity
 
     def status(self) -> dict[str, Any]:
+        coupler_type = None
+        if self.scene is not None and getattr(self.scene, "sim", None) is not None:
+            coupler_type = self.scene.sim.coupler.__class__.__name__
         return {
             "protocol": PROTOCOL,
             "session_id": self.session_id,
@@ -164,14 +397,22 @@ class GenesisLiveSession:
             "heartbeat_timestamp": self.heartbeat_timestamp,
             "fatal_error": self.fatal_error,
             "controller_count": len(self.controllers),
+            "backend": str(gs.backend) if gs._initialized else None,
+            "coupler_type": coupler_type,
+            "surface_scene": self._scene_requires_surface_backend(self._scene_config),
         }
 
+    def backend_requirements(self) -> dict[str, Any]:
+        return capability_report()["backend_requirements"]
+
     def handshake(self) -> dict[str, Any]:
+        report = capability_report()
         return {
             "protocol": PROTOCOL,
             "session_id": self.session_id,
             "genesis_version": gs.__version__,
-            "capabilities": list(CAPABILITIES),
+            "capabilities": report["capabilities"],
+            "backend_requirements": report["backend_requirements"],
             "status": self.status(),
         }
 

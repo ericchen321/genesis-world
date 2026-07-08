@@ -48,6 +48,71 @@ def _box_spec(spec, default_frame: str):
     return su.normalize_aabb_box(box), frame
 
 
+def _box_tolerance_spec(spec):
+    if not isinstance(spec, Mapping):
+        return None
+    candidates = []
+    nested = spec.get("aabb_box")
+    if isinstance(nested, Mapping):
+        candidates.append(nested)
+    candidates.append(spec)
+    for candidate in candidates:
+        for key in ("selection_tolerance", "tolerance", "atol"):
+            if key in candidate:
+                return candidate[key]
+    return None
+
+
+def _selection_tolerance(value) -> float:
+    if value is None:
+        value = 0.0
+    tolerance = float(value)
+    if not np.isfinite(tolerance) or tolerance < 0.0:
+        gs.raise_exception(f"AABB selection tolerance must be finite and non-negative, got {value}.")
+    return tolerance
+
+
+def _entity_representation(entity) -> tuple[str, str]:
+    from genesis.engine.materials.FEM.cloth import Cloth as ClothMaterial
+
+    if isinstance(entity.material, ClothMaterial):
+        return "surface", "triangle"
+    return "volumetric", "tetrahedron"
+
+
+def _zero_selection_message(
+    *,
+    kind: str,
+    identifier: str,
+    entity,
+    source_box: np.ndarray,
+    env_local_box: np.ndarray,
+    frame: str,
+    env_idx: int,
+    tolerance: float,
+    selected_count: int,
+) -> str:
+    positions = su.fem_entity_positions(entity, env_idx=env_idx, use_current=True)
+    bbox_min = positions.min(axis=0)
+    bbox_max = positions.max(axis=0)
+    representation, primitive_kind = _entity_representation(entity)
+    return (
+        f"{kind} '{identifier}' selected no FEM vertices; "
+        f"frame={frame}; "
+        f"source_box={source_box.tolist()}; "
+        f"env_local_box={env_local_box.tolist()}; "
+        f"entity_bbox_min={bbox_min.tolist()}; "
+        f"entity_bbox_max={bbox_max.tolist()}; "
+        f"vertex_count={int(getattr(entity, 'n_vertices', positions.shape[0]))}; "
+        f"selected_count={int(selected_count)}; "
+        f"tolerance={float(tolerance)}; "
+        f"env_idx={int(env_idx)}; "
+        f"representation={representation}; "
+        f"primitive_kind={primitive_kind}. "
+        "Adjust the box bounds/frame or increase selection_tolerance/atol."
+    )
+
+
 @dataclass
 class BoxAnchorRecord:
     anchor_id: str
@@ -55,6 +120,7 @@ class BoxAnchorRecord:
     source_box: np.ndarray
     env_local_box: np.ndarray
     selected_vertices: np.ndarray
+    selection_tolerance: float = 0.0
     optional: bool = False
 
     @property
@@ -69,6 +135,7 @@ class BoxAnchorRecord:
             "env_local_box": self.env_local_box.tolist(),
             "selected_vertices": self.selected_vertices.tolist(),
             "selected_vertex_count": self.selected_vertex_count,
+            "selection_tolerance": float(self.selection_tolerance),
             "optional": self.optional,
         }
 
@@ -82,6 +149,7 @@ class BoxEndEffectorState:
     selected_vertices: np.ndarray
     target_positions: np.ndarray
     displacement: np.ndarray = field(default_factory=lambda: np.zeros(3, dtype=_float_dtype()))
+    selection_tolerance: float = 0.0
     duration_steps: int = 0
     speed: float = DEFAULT_BOX_EE_SPEED
     distance_scale: float = 0.0
@@ -106,6 +174,7 @@ class BoxEndEffectorState:
             "selected_vertex_count": self.selected_vertex_count,
             "target_positions": self.target_positions.tolist(),
             "displacement": self.displacement.tolist(),
+            "selection_tolerance": float(self.selection_tolerance),
             "duration_steps": int(self.duration_steps),
             "speed": float(self.speed),
             "distance_scale": float(self.distance_scale),
@@ -151,15 +220,25 @@ def apply_static_box_anchors(
     is_soft_constraint: bool = False,
     stiffness: float = 0.0,
     use_current_positions: bool = False,
+    selection_tolerance: float = 0.0,
+    atol: float | None = None,
 ) -> list[BoxAnchorRecord]:
     records: list[BoxAnchorRecord] = []
+    default_tolerance = _selection_tolerance(selection_tolerance if atol is None else atol)
     for i, anchor in enumerate(anchors):
         source_box, anchor_frame = _box_spec(anchor, frame)
         optional = bool(anchor.get("optional", False)) if isinstance(anchor, Mapping) else False
         if isinstance(anchor, Mapping):
             anchor_id = str(anchor.get("anchor_id", anchor.get("id", f"anchor_{i}")))
+            anchor_tolerance = _selection_tolerance(
+                anchor.get(
+                    "selection_tolerance",
+                    anchor.get("tolerance", anchor.get("atol", default_tolerance)),
+                )
+            )
         else:
             anchor_id = f"anchor_{i}"
+            anchor_tolerance = default_tolerance
         env_local_box = su.aabb_to_env_local(
             source_box,
             anchor_frame,
@@ -174,9 +253,22 @@ def apply_static_box_anchors(
             use_current=use_current_positions,
             object_to_env=object_to_env,
             world_to_env=world_to_env,
+            atol=anchor_tolerance,
         )
         if selected.size == 0 and not optional:
-            gs.raise_exception(f"Static box anchor '{anchor_id}' selected no FEM vertices.")
+            gs.raise_exception(
+                _zero_selection_message(
+                    kind="Static box anchor",
+                    identifier=anchor_id,
+                    entity=entity,
+                    source_box=source_box,
+                    env_local_box=env_local_box,
+                    frame=anchor_frame,
+                    env_idx=env_idx,
+                    tolerance=anchor_tolerance,
+                    selected_count=selected.size,
+                )
+            )
 
         if selected.size > 0:
             targets = _selected_target_positions(entity, selected, env_idx)
@@ -195,6 +287,7 @@ def apply_static_box_anchors(
                 source_box=_copy_float_array(source_box),
                 env_local_box=_copy_float_array(env_local_box),
                 selected_vertices=_copy_int_array(selected),
+                selection_tolerance=anchor_tolerance,
                 optional=optional,
             )
         )
@@ -242,7 +335,26 @@ class BoxEndEffectorController:
     def snapshot(self) -> dict[str, object]:
         return self._state.to_dict()
 
+    def _uses_ipc_surface_constraints(self) -> bool:
+        from genesis.engine.couplers import IPCCoupler
+        from genesis.engine.materials.FEM.cloth import Cloth as ClothMaterial
+
+        return isinstance(self.entity.sim.coupler, IPCCoupler) and isinstance(self.entity.material, ClothMaterial)
+
     def _capture_preexisting_constraints(self, selected_vertices: np.ndarray) -> None:
+        if self._uses_ipc_surface_constraints():
+            query = self.entity.sim.coupler.query_surface_vertex_constraints(
+                self.entity,
+                selected_vertices,
+                envs_idx=_envs_idx_arg(self.entity, self.env_idx),
+            )
+            mask = np.asarray(query["is_constrained"], dtype=bool)
+            self._preexisting_constraint_mask = mask
+            self._preexisting_constraint_targets = np.asarray(query["target_poss"], dtype=_float_dtype())[mask].copy()
+            self._preexisting_constraint_soft = np.ones(np.count_nonzero(mask), dtype=bool)
+            self._preexisting_constraint_stiffness = np.asarray(query["strength"], dtype=_float_dtype())[mask].copy()
+            return
+
         if not self.entity.solver._constraints_initialized:
             self._preexisting_constraint_mask = np.zeros(selected_vertices.shape, dtype=bool)
             self._preexisting_constraint_targets = _empty_targets()
@@ -302,11 +414,17 @@ class BoxEndEffectorController:
         optional: bool = False,
         is_soft_constraint: bool = False,
         stiffness: float = 0.0,
+        selection_tolerance: float | None = None,
+        atol: float | None = None,
     ) -> BoxEndEffectorState:
         if self._state.active:
             gs.raise_exception(f"BoxEE controller '{self.controller_id}' already has an active grasp.")
 
         source_box, frame = _box_spec(aabb_box, frame)
+        tolerance_value = atol if atol is not None else selection_tolerance
+        if tolerance_value is None:
+            tolerance_value = _box_tolerance_spec(aabb_box)
+        tolerance = _selection_tolerance(tolerance_value)
         env_local_box = su.aabb_to_env_local(
             source_box,
             frame,
@@ -321,11 +439,24 @@ class BoxEndEffectorController:
             use_current=True,
             object_to_env=self.object_to_env,
             world_to_env=self.world_to_env,
+            atol=tolerance,
         )
 
         if selected.size == 0:
             if not optional:
-                gs.raise_exception(f"BoxEE controller '{self.controller_id}' selected no FEM vertices.")
+                gs.raise_exception(
+                    _zero_selection_message(
+                        kind="BoxEE controller",
+                        identifier=self.controller_id,
+                        entity=self.entity,
+                        source_box=source_box,
+                        env_local_box=env_local_box,
+                        frame=frame,
+                        env_idx=self.env_idx,
+                        tolerance=tolerance,
+                        selected_count=selected.size,
+                    )
+                )
             self._state = BoxEndEffectorState(
                 controller_id=self.controller_id,
                 frame=frame,
@@ -333,6 +464,7 @@ class BoxEndEffectorController:
                 env_local_box=_copy_float_array(env_local_box),
                 selected_vertices=_copy_int_array(selected),
                 target_positions=_empty_targets(),
+                selection_tolerance=tolerance,
                 active=False,
                 optional=True,
             )
@@ -355,6 +487,7 @@ class BoxEndEffectorController:
             env_local_box=_copy_float_array(env_local_box),
             selected_vertices=_copy_int_array(selected),
             target_positions=_copy_float_array(targets),
+            selection_tolerance=tolerance,
             active=True,
             motion_active=False,
             optional=optional,
@@ -411,6 +544,7 @@ class BoxEndEffectorController:
             selected_vertices=_copy_int_array(self._state.selected_vertices),
             target_positions=_copy_float_array(self._state.target_positions),
             displacement=np.zeros(3, dtype=_float_dtype()),
+            selection_tolerance=float(self._state.selection_tolerance),
             duration_steps=int(duration_steps),
             speed=float(speed),
             distance_scale=float(distance_scale),
@@ -472,6 +606,7 @@ class BoxEndEffectorController:
             selected_vertices=_copy_int_array(self._state.selected_vertices),
             target_positions=_copy_float_array(targets),
             displacement=displacement,
+            selection_tolerance=float(self._state.selection_tolerance),
             duration_steps=int(self._state.duration_steps),
             speed=float(self._motion_speed),
             distance_scale=float(self._state.distance_scale),
@@ -496,8 +631,16 @@ class BoxEndEffectorController:
         speed: float = DEFAULT_BOX_EE_SPEED,
         max_distance_scale: float = DEFAULT_MAX_DISTANCE_SCALE,
         optional: bool = False,
+        selection_tolerance: float | None = None,
+        atol: float | None = None,
     ) -> BoxEndEffectorState:
-        state = self.grasp(aabb_box, frame=frame, optional=optional)
+        state = self.grasp(
+            aabb_box,
+            frame=frame,
+            optional=optional,
+            selection_tolerance=selection_tolerance,
+            atol=atol,
+        )
         if state.selected_vertex_count == 0:
             return state
         return self.move_positive_y(
@@ -530,6 +673,7 @@ class BoxEndEffectorController:
             selected_vertices=np.empty((0,), dtype=gs.np_int if gs._initialized else np.int32),
             target_positions=_empty_targets(),
             displacement=_copy_float_array(self._state.displacement),
+            selection_tolerance=float(self._state.selection_tolerance),
             duration_steps=self._state.duration_steps,
             speed=self._state.speed,
             distance_scale=self._state.distance_scale,

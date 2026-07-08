@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import Any
 
+import genesis as gs
+
 from genesis.engine.controllers.box_end_effector import BoxEndEffectorController
 
 from .protocol import GenesisLiveError
@@ -61,15 +63,39 @@ def apply_probe_action(session, params: dict[str, Any]) -> dict[str, Any]:
         if distance_scale is None:
             raise GenesisLiveError("invalid_controller_request", "box controller requires distance_scale")
         duration_steps = int(params.get("duration_steps", controller_spec.get("duration_steps", 1)))
+        box_tolerance = None
+        if isinstance(aabb_box, dict):
+            box_tolerance = aabb_box.get("selection_tolerance", aabb_box.get("tolerance", aabb_box.get("atol")))
+        selection_tolerance = controller_spec.get(
+            "selection_tolerance",
+            controller_spec.get(
+                "tolerance",
+                controller_spec.get("atol", params.get("selection_tolerance", params.get("atol", box_tolerance))),
+            ),
+        )
 
         controller = BoxEndEffectorController(entity, controller_id=controller_id)
         frame = aabb_box.get("frame", "env_local") if isinstance(aabb_box, dict) else "env_local"
-        state = controller.grasp_and_move_positive_y(
-            aabb_box,
-            frame=frame,
-            distance_scale=float(distance_scale),
-            duration_steps=duration_steps,
-        )
+        try:
+            state = controller.grasp_and_move_positive_y(
+                aabb_box,
+                frame=frame,
+                distance_scale=float(distance_scale),
+                duration_steps=duration_steps,
+                speed=float(controller_spec.get("speed", params.get("speed", 0.6))),
+                max_distance_scale=float(
+                    controller_spec.get("max_distance_scale", params.get("max_distance_scale", 1.0))
+                ),
+                selection_tolerance=None if selection_tolerance is None else float(selection_tolerance),
+            )
+        except gs.GenesisException as exc:
+            message = str(exc)
+            code = "probe_selection_failed" if "selected no FEM vertices" in message else "probe_action_failed"
+            raise GenesisLiveError(
+                code,
+                message,
+                details={"action": action, "entity": entity_name, "controller_id": controller_id},
+            ) from exc
         session.controllers[controller_id] = controller
         return {
             "action": action,

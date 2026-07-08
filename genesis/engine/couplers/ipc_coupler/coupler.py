@@ -41,6 +41,7 @@ if TYPE_CHECKING or UIPC_AVAILABLE:
         ElasticModuli,
         ElasticModuli2D,
         ExternalArticulationConstraint,
+        SoftPositionConstraint,
         SoftTransformConstraint,
         StableNeoHookean,
         StrainLimitingBaraffWitkinShell,
@@ -63,6 +64,7 @@ ABD_KAPPA = 100.0  # MPa unit
 # TODO: consider deriving from Genesis joint properties instead of hardcoding.
 STIFFNESS_DEFAULT = 1e4
 JOINT_STRENGTH_RATIO = 100.0
+SURFACE_POSITION_CONSTRAINT_STRENGTH_RATE_DEFAULT = 100.0
 
 
 def _animate_rigid_link(coupler_ref, link, env_idx, info):
@@ -138,6 +140,7 @@ class IPCCoupler(RBC):
         self._ipc_abd: AffineBodyConstitution | None = None
         self._ipc_stk: StableNeoHookean | None = None
         self._ipc_stc: SoftTransformConstraint | None = None
+        self._ipc_spc: SoftPositionConstraint | None = None
         self._ipc_nks: StrainLimitingBaraffWitkinShell | None = None
         self._ipc_dsb: DiscreteShellBending | None = None
         self._ipc_eac: ExternalArticulationConstraint | None = None
@@ -157,6 +160,7 @@ class IPCCoupler(RBC):
 
         # ==== ABD Geometry & State ====
         self._abd_slots_by_link: dict["RigidLink", list[GeometrySlot]] = {}
+        self._cloth_slots_by_entity_env: dict[tuple["FEMEntity", int], SimplicialComplexSlot] = {}
         self._abd_state_feature: AffineBodyStateAccessorFeature | None = None
         self._abd_state_geom: SimplicialComplex | None = None  # Geometry for batch data transfer
         self._abd_data_by_link: dict["RigidLink", list[ABDLinkEntry]] = {}
@@ -339,6 +343,7 @@ class IPCCoupler(RBC):
                     self._ipc_nks.apply_to(
                         mesh, moduli=moduli, mass_density=entity.material.rho, thickness=entity.material.thickness
                     )
+                    self._apply_surface_heterogeneous_shell_attrs(mesh, entity)
 
                     # Apply bending stiffness if specified
                     if entity.material.bending_stiffness is not None:
@@ -347,6 +352,7 @@ class IPCCoupler(RBC):
                             self._ipc_constitution_tabular.insert(self._ipc_dsb)
 
                         self._ipc_dsb.apply_to(mesh, bending_stiffness=entity.material.bending_stiffness)
+                    self._apply_surface_position_constraint(mesh, entity)
                 else:
                     if self._ipc_stk is None:
                         self._ipc_stk = StableNeoHookean()
@@ -363,7 +369,295 @@ class IPCCoupler(RBC):
                 meta_attrs.create("env_idx", str(env_idx))
 
                 # ---- Create IPC object and geometry slot ----
-                fem_obj.geometries().create(mesh)
+                fem_geom_slot, _ = fem_obj.geometries().create(mesh)
+                if is_cloth:
+                    self._cloth_slots_by_entity_env[(entity, env_idx)] = fem_geom_slot
+
+    def _required_ipc_attr_view(self, domain, attr_name: str, expected_len: int, *, domain_name: str):
+        attr = domain.find(attr_name)
+        if not attr:
+            gs.raise_exception(
+                f"Surface heterogeneous shell backend requires IPC attr '{domain_name}.{attr_name}'."
+            )
+        view = uipc.view(attr)
+        if view.reshape(-1).shape[0] != expected_len:
+            gs.raise_exception(
+                f"Surface heterogeneous shell backend attr '{domain_name}.{attr_name}' has length "
+                f"{view.reshape(-1).shape[0]}, expected {expected_len}."
+            )
+        return view
+
+    def _apply_surface_heterogeneous_shell_attrs(self, mesh, entity: "FEMEntity") -> None:
+        arrays = entity.surface_heterogeneous_backend_arrays
+        if arrays is None:
+            return
+
+        lambda_by_triangle = np.asarray(arrays["lambda_by_triangle"], dtype=np.float64)
+        mu_by_triangle = np.asarray(arrays["mu_by_triangle"], dtype=np.float64)
+        thickness_by_vertex = np.asarray(arrays["thickness_by_vertex"], dtype=np.float64)
+        volume_by_vertex = np.asarray(arrays["volume_by_vertex"], dtype=np.float64)
+        metadata = arrays["metadata"]
+
+        triangle_count = int(lambda_by_triangle.shape[0])
+        vertex_count = int(volume_by_vertex.shape[0])
+        if mu_by_triangle.shape != (triangle_count,):
+            gs.raise_exception("Surface heterogeneous shell mu array does not match triangle lambda array length.")
+        if thickness_by_vertex.shape != (vertex_count,):
+            gs.raise_exception("Surface heterogeneous shell vertex thickness array does not match vertex volume length.")
+
+        self._required_ipc_attr_view(
+            mesh.triangles(),
+            "lambda",
+            triangle_count,
+            domain_name="triangles",
+        )[:] = lambda_by_triangle
+        self._required_ipc_attr_view(
+            mesh.triangles(),
+            "mu",
+            triangle_count,
+            domain_name="triangles",
+        )[:] = mu_by_triangle
+        self._required_ipc_attr_view(
+            mesh.vertices(),
+            "thickness",
+            vertex_count,
+            domain_name="vertices",
+        )[:] = thickness_by_vertex
+        self._required_ipc_attr_view(
+            mesh.vertices(),
+            "volume",
+            vertex_count,
+            domain_name="vertices",
+        )[:] = volume_by_vertex
+        self._required_ipc_attr_view(mesh.meta(), "mass_density", 1, domain_name="meta")[:] = np.array(
+            [1.0],
+            dtype=np.float64,
+        )
+
+        meta_attrs = mesh.meta()
+        meta_attrs.create("surface_heterogeneous", "true")
+        meta_attrs.create("surface_total_area", str(float(metadata["total_area"])))
+        meta_attrs.create("surface_total_mass", str(float(metadata["total_mass"])))
+        meta_attrs.create("surface_material_rows", str(int(metadata["row_count"])))
+
+    def _surface_constraint_attr_views(self, mesh, expected_vertices: int, *, context: str):
+        vertices = mesh.vertices()
+        is_constrained_attr = vertices.find(uipc.builtin.is_constrained)
+        aim_position_attr = vertices.find(uipc.builtin.aim_position)
+        strength_ratio_attr = vertices.find("strength_ratio")
+        missing = []
+        if not is_constrained_attr:
+            missing.append(f"vertices.{uipc.builtin.is_constrained}")
+        if not aim_position_attr:
+            missing.append(f"vertices.{uipc.builtin.aim_position}")
+        if not strength_ratio_attr:
+            missing.append("vertices.strength_ratio")
+        if missing:
+            gs.raise_exception(
+                f"IPC surface vertex constraints require SoftPositionConstraint attrs for {context}; "
+                f"missing {missing}."
+            )
+
+        is_constrained = uipc.view(is_constrained_attr)
+        aim_position = uipc.view(aim_position_attr)
+        strength_ratio = uipc.view(strength_ratio_attr)
+        if is_constrained.reshape(-1).shape[0] != expected_vertices:
+            gs.raise_exception(
+                f"IPC surface vertex constraint attr is_constrained has "
+                f"{is_constrained.reshape(-1).shape[0]} entries, expected {expected_vertices} for {context}."
+            )
+        if aim_position.reshape(-1).shape[0] != expected_vertices * 3:
+            gs.raise_exception(
+                f"IPC surface vertex constraint attr aim_position has "
+                f"{aim_position.reshape(-1).shape[0]} scalar entries, expected {expected_vertices * 3} for {context}."
+            )
+        if strength_ratio.reshape(-1).shape[0] != expected_vertices:
+            gs.raise_exception(
+                f"IPC surface vertex constraint attr strength_ratio has "
+                f"{strength_ratio.reshape(-1).shape[0]} entries, expected {expected_vertices} for {context}."
+            )
+        return is_constrained, aim_position, strength_ratio
+
+    def _apply_surface_position_constraint(self, mesh, entity: "FEMEntity") -> None:
+        if self._ipc_spc is None:
+            self._ipc_spc = SoftPositionConstraint()
+            self._ipc_constitution_tabular.insert(self._ipc_spc)
+        strength_rate = float(getattr(self.options, "constraint_strength_translation", None) or 0.0)
+        if strength_rate <= 0.0:
+            strength_rate = SURFACE_POSITION_CONSTRAINT_STRENGTH_RATE_DEFAULT
+        self._ipc_spc.apply_to(mesh, strength_rate=strength_rate)
+        self._surface_constraint_attr_views(
+            mesh,
+            entity.n_vertices,
+            context=f"entity={entity.name or entity.idx}",
+        )
+
+    def _array_from_tensor_or_array(self, value, dtype):
+        if hasattr(value, "detach") or hasattr(value, "to_numpy"):
+            value = tensor_to_array(value)
+        return np.asarray(value, dtype=dtype)
+
+    def _surface_env_indices(self, envs_idx) -> list[int]:
+        if envs_idx is None:
+            return list(range(self.sim._B))
+        envs = self._array_from_tensor_or_array(envs_idx, np.int64).reshape(-1)
+        if envs.size == 0:
+            gs.raise_exception("IPC surface vertex constraints require at least one environment index.")
+        if np.any(envs < 0) or np.any(envs >= self.sim._B):
+            gs.raise_exception(
+                f"IPC surface vertex constraint env indices {envs.tolist()} are out of range for {self.sim._B} envs."
+            )
+        return [int(env_idx) for env_idx in envs]
+
+    def _surface_vertex_indices(self, entity: "FEMEntity", verts_idx_local) -> np.ndarray:
+        if verts_idx_local is None:
+            verts = np.arange(entity.n_vertices, dtype=np.int64)
+        else:
+            verts = self._array_from_tensor_or_array(verts_idx_local, np.int64)
+            if verts.ndim == 2:
+                if not np.all(verts == verts[0]):
+                    gs.raise_exception(
+                        "IPC surface vertex constraints do not support different vertex selections per environment."
+                    )
+                verts = verts[0]
+            elif verts.ndim != 1:
+                gs.raise_exception(
+                    f"IPC surface vertex constraints require 1D vertex indices, got shape {verts.shape}."
+                )
+        verts = verts.reshape(-1)
+        if verts.size and (np.any(verts < 0) or np.any(verts >= entity.n_vertices)):
+            gs.raise_exception(
+                f"IPC surface vertex constraint indices {verts.tolist()} are out of range for "
+                f"entity '{entity.name or entity.idx}' with {entity.n_vertices} vertices."
+            )
+        return verts.astype(np.int64, copy=False)
+
+    def _surface_constraint_targets(self, target_poss, *, n_envs: int, n_vertices: int) -> np.ndarray:
+        targets = self._array_from_tensor_or_array(target_poss, np.float64)
+        if targets.shape == (n_vertices, 3):
+            targets = np.broadcast_to(targets.reshape(1, n_vertices, 3), (n_envs, n_vertices, 3)).copy()
+        if targets.shape != (n_envs, n_vertices, 3):
+            gs.raise_exception(
+                "IPC surface vertex constraint targets must have shape "
+                f"({n_vertices}, 3) or ({n_envs}, {n_vertices}, 3), got {targets.shape}."
+            )
+        if not np.all(np.isfinite(targets)):
+            gs.raise_exception("IPC surface vertex constraint targets must contain only finite values.")
+        return targets
+
+    def _surface_strength_rate(self, strength) -> float:
+        if strength is None:
+            strength_rate = float(getattr(self.options, "constraint_strength_translation", None) or 0.0)
+        else:
+            strength_rate = float(strength)
+        if strength_rate <= 0.0:
+            strength_rate = SURFACE_POSITION_CONSTRAINT_STRENGTH_RATE_DEFAULT
+        if not np.isfinite(strength_rate):
+            gs.raise_exception(f"IPC surface vertex constraint strength must be finite, got {strength}.")
+        return strength_rate
+
+    def _surface_geometry(self, entity: "FEMEntity", env_idx: int):
+        slot = self._cloth_slots_by_entity_env.get((entity, env_idx))
+        if slot is None:
+            gs.raise_exception(
+                f"IPC surface vertex constraints require a registered cloth geometry for "
+                f"entity '{entity.name or entity.idx}' env {env_idx}."
+            )
+        return slot.geometry()
+
+    def set_surface_vertex_constraints(
+        self,
+        entity: "FEMEntity",
+        verts_idx_local,
+        target_poss,
+        *,
+        envs_idx=None,
+        strength=None,
+    ) -> None:
+        env_indices = self._surface_env_indices(envs_idx)
+        verts = self._surface_vertex_indices(entity, verts_idx_local)
+        targets = self._surface_constraint_targets(target_poss, n_envs=len(env_indices), n_vertices=len(verts))
+        strength_rate = self._surface_strength_rate(strength)
+        for i_env, env_idx in enumerate(env_indices):
+            geom = self._surface_geometry(entity, env_idx)
+            is_constrained, aim_position, strength_ratio = self._surface_constraint_attr_views(
+                geom,
+                entity.n_vertices,
+                context=f"entity={entity.name or entity.idx} env={env_idx}",
+            )
+            is_constrained[verts] = 1
+            aim_position[verts] = targets[i_env].reshape((len(verts), 3, 1))
+            strength_ratio[verts] = strength_rate
+
+    def update_surface_vertex_constraint_targets(
+        self,
+        entity: "FEMEntity",
+        verts_idx_local,
+        target_poss,
+        *,
+        envs_idx=None,
+    ) -> None:
+        env_indices = self._surface_env_indices(envs_idx)
+        verts = self._surface_vertex_indices(entity, verts_idx_local)
+        targets = self._surface_constraint_targets(target_poss, n_envs=len(env_indices), n_vertices=len(verts))
+        for i_env, env_idx in enumerate(env_indices):
+            geom = self._surface_geometry(entity, env_idx)
+            is_constrained, aim_position, _strength_ratio = self._surface_constraint_attr_views(
+                geom,
+                entity.n_vertices,
+                context=f"entity={entity.name or entity.idx} env={env_idx}",
+            )
+            unconstrained = verts[is_constrained[verts].reshape(-1) == 0]
+            if unconstrained.size:
+                gs.raise_exception(
+                    f"Cannot update IPC surface target positions for unconstrained vertices "
+                    f"{unconstrained.tolist()} on entity '{entity.name or entity.idx}' env {env_idx}."
+                )
+            aim_position[verts] = targets[i_env].reshape((len(verts), 3, 1))
+
+    def remove_surface_vertex_constraints(self, entity: "FEMEntity", verts_idx_local=None, *, envs_idx=None) -> None:
+        env_indices = self._surface_env_indices(envs_idx)
+        verts = None if verts_idx_local is None else self._surface_vertex_indices(entity, verts_idx_local)
+        for env_idx in env_indices:
+            geom = self._surface_geometry(entity, env_idx)
+            is_constrained, _aim_position, _strength_ratio = self._surface_constraint_attr_views(
+                geom,
+                entity.n_vertices,
+                context=f"entity={entity.name or entity.idx} env={env_idx}",
+            )
+            if verts is None:
+                is_constrained[:] = 0
+            else:
+                is_constrained[verts] = 0
+
+    def query_surface_vertex_constraints(self, entity: "FEMEntity", verts_idx_local=None, *, envs_idx=None):
+        env_indices = self._surface_env_indices(envs_idx)
+        verts = self._surface_vertex_indices(entity, verts_idx_local)
+        masks = []
+        targets = []
+        strengths = []
+        for env_idx in env_indices:
+            geom = self._surface_geometry(entity, env_idx)
+            is_constrained, aim_position, strength_ratio = self._surface_constraint_attr_views(
+                geom,
+                entity.n_vertices,
+                context=f"entity={entity.name or entity.idx} env={env_idx}",
+            )
+            masks.append(is_constrained[verts].reshape(-1).astype(bool, copy=True))
+            targets.append(aim_position[verts].reshape((len(verts), 3)).astype(gs.np_float, copy=True))
+            strengths.append(strength_ratio[verts].reshape(-1).astype(gs.np_float, copy=True))
+        result = {
+            "envs_idx": env_indices,
+            "verts_idx_local": verts.astype(gs.np_int, copy=True),
+            "is_constrained": np.stack(masks, axis=0),
+            "target_poss": np.stack(targets, axis=0),
+            "strength": np.stack(strengths, axis=0),
+        }
+        if len(env_indices) == 1:
+            result["is_constrained"] = result["is_constrained"][0]
+            result["target_poss"] = result["target_poss"][0]
+            result["strength"] = result["strength"][0]
+        return result
 
     def _add_rigid_geoms_to_ipc(self) -> None:
         """Add rigid geoms to the IPC scene as ABD objects, merging geoms by link."""
