@@ -11,6 +11,83 @@ from genesis.utils.misc import tensor_to_array
 from .utils import assert_allclose, get_hf_dataset
 
 
+_TWO_TET_VERTS = np.array(
+    [
+        [0.0, 0.0, 0.0],
+        [1.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [0.0, 0.0, 1.0],
+        [0.0, 0.0, -1.0],
+    ],
+    dtype=np.float64,
+)
+_TWO_TETS = np.array([[0, 1, 2, 3], [0, 2, 1, 4]], dtype=np.int64)
+
+
+def _write_two_tet_mesh(path):
+    igl.writeMESH(str(path), _TWO_TET_VERTS, _TWO_TETS, np.empty((0, 3), dtype=np.int64))
+
+
+def _build_native_implicit_two_tet_scene(tmp_path, *, n_linesearch_iterations=0):
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    mesh_path = tmp_path / "two_tets.mesh"
+    _write_two_tet_mesh(mesh_path)
+
+    scene = gs.Scene(
+        sim_options=gs.options.SimOptions(
+            dt=0.05,
+            substeps=1,
+            gravity=(0.0, 0.0, 0.0),
+        ),
+        fem_options=gs.options.FEMOptions(
+            enable_vertex_constraints=True,
+            use_implicit_solver=True,
+            n_newton_iterations=2,
+            n_pcg_iterations=100,
+            n_linesearch_iterations=n_linesearch_iterations,
+            damping_alpha=0.0,
+            damping_beta=0.0,
+        ),
+        show_viewer=False,
+        show_FPS=False,
+    )
+    entity = scene.add_entity(
+        morph=gs.morphs.TetMesh(file=str(mesh_path), pos=(0.0, 0.0, 2.0)),
+        material=gs.materials.FEM.Elastic(E=100.0, rho=100.0, model="linear_corotated"),
+    )
+    scene.build()
+    return scene, entity
+
+
+def _run_native_implicit_soft_pull(tmp_path, *, stiffness, n_linesearch_iterations=0, n_steps=4):
+    scene, entity = _build_native_implicit_two_tet_scene(
+        tmp_path,
+        n_linesearch_iterations=n_linesearch_iterations,
+    )
+    vertex_idx = 1
+    initial = tensor_to_array(entity.get_state().pos[0, vertex_idx]).copy()
+    target = initial + np.array([0.3, 0.0, 0.0], dtype=np.float64)
+    target_tensor = torch.tensor(target[None], dtype=gs.tc_float, device=gs.device)
+    entity.set_vertex_constraints([vertex_idx], target_tensor, is_soft_constraint=True, stiffness=stiffness)
+
+    for _ in range(n_steps):
+        scene.step(update_visualizer=False)
+
+    final = tensor_to_array(entity.get_state().pos[0, vertex_idx]).copy()
+    return initial, target, final
+
+
+def _native_constraint_slice(scene, entity):
+    constraints = scene.fem_solver.vertex_constraints
+    vertex_slice = slice(entity.v_start, entity.v_start + entity.n_vertices)
+    return {
+        "is_constrained": constraints.is_constrained.to_numpy()[vertex_slice, 0],
+        "target_pos": constraints.target_pos.to_numpy()[vertex_slice, 0],
+        "is_soft_constraint": constraints.is_soft_constraint.to_numpy()[vertex_slice, 0],
+        "stiffness": constraints.stiffness.to_numpy()[vertex_slice, 0],
+    }
+
+
 @pytest.mark.required
 def test_interior_tetrahedralized_vertex(cube_verts_and_faces, box_obj_path, show_viewer):
     """
@@ -404,6 +481,147 @@ def test_implicit_sap_coupler_collide_sphere_box(show_viewer):
         entity_center = 0.5 * (BV[0] + BV[-1])
         assert_allclose(entity_center[:2], 0.0, tol=0.02)
         assert_allclose(entity_center[2], init_height, tol=5e-3)
+
+
+@pytest.mark.required
+@pytest.mark.parametrize("precision", ["64"])
+@pytest.mark.parametrize("invalid_stiffness", [0.0, -1.0, float("nan"), float("inf"), float("-inf")])
+def test_native_implicit_soft_constraint_rejects_invalid_stiffness(tmp_path, invalid_stiffness):
+    _scene, entity = _build_native_implicit_two_tet_scene(tmp_path)
+
+    with pytest.raises(gs.GenesisException, match="finite stiffness > 0.0"):
+        entity.set_vertex_constraints([0], is_soft_constraint=True, stiffness=invalid_stiffness)
+
+    entity.set_vertex_constraints([0])
+
+
+@pytest.mark.required
+@pytest.mark.parametrize("precision", ["64"])
+def test_native_vertex_constraint_public_api_hard_default_stores_state(tmp_path):
+    scene, entity = _build_native_implicit_two_tet_scene(tmp_path)
+    initial = tensor_to_array(entity.get_state().pos[0, 0]).copy()
+
+    entity.set_vertex_constraints([0])
+
+    constraints = _native_constraint_slice(scene, entity)
+    assert constraints["is_constrained"][0]
+    assert not constraints["is_soft_constraint"][0]
+    assert constraints["stiffness"][0] == pytest.approx(0.0)
+    np.testing.assert_allclose(constraints["target_pos"][0], initial, atol=1e-6)
+
+
+@pytest.mark.required
+@pytest.mark.parametrize("precision", ["64"])
+def test_native_implicit_soft_constraint_public_api_stores_state(tmp_path):
+    from genesis.engine.couplers import IPCCoupler
+
+    scene, entity = _build_native_implicit_two_tet_scene(tmp_path)
+    initial = tensor_to_array(entity.get_state().pos[0, 1]).copy()
+    target = initial + np.array([0.2, 0.1, 0.0], dtype=np.float64)
+    target_tensor = torch.tensor(target[None], dtype=gs.tc_float, device=gs.device)
+
+    entity.set_vertex_constraints([1], target_tensor, is_soft_constraint=True, stiffness=500.0)
+
+    constraints = _native_constraint_slice(scene, entity)
+    assert constraints["is_constrained"][1]
+    assert constraints["is_soft_constraint"][1]
+    assert constraints["stiffness"][1] == pytest.approx(500.0)
+    np.testing.assert_allclose(constraints["target_pos"][1], target, atol=1e-6)
+    assert not isinstance(scene.sim.coupler, IPCCoupler)
+
+
+@pytest.mark.required
+@pytest.mark.parametrize("precision", ["64"])
+def test_native_implicit_soft_constraint_update_target_retargets_energy(tmp_path):
+    scene, entity = _build_native_implicit_two_tet_scene(tmp_path)
+    vertex_idx = 1
+    initial = tensor_to_array(entity.get_state().pos[0, vertex_idx]).copy()
+    first_target = initial + np.array([0.2, 0.0, 0.0], dtype=np.float64)
+    entity.set_vertex_constraints(
+        [vertex_idx],
+        torch.tensor(first_target[None], dtype=gs.tc_float, device=gs.device),
+        is_soft_constraint=True,
+        stiffness=500.0,
+    )
+
+    for _ in range(2):
+        scene.step(update_visualizer=False)
+
+    position_at_update = tensor_to_array(entity.get_state().pos[0, vertex_idx]).copy()
+    new_target = position_at_update + np.array([0.0, 0.3, 0.0], dtype=np.float64)
+    entity.update_constraint_targets(
+        [vertex_idx],
+        torch.tensor(new_target[None], dtype=gs.tc_float, device=gs.device),
+    )
+    np.testing.assert_allclose(_native_constraint_slice(scene, entity)["target_pos"][vertex_idx], new_target, atol=1e-6)
+
+    for _ in range(4):
+        scene.step(update_visualizer=False)
+
+    final = tensor_to_array(entity.get_state().pos[0, vertex_idx]).copy()
+    assert np.linalg.norm(final - new_target) < np.linalg.norm(position_at_update - new_target)
+    assert np.dot(final - position_at_update, new_target - position_at_update) > 0.0
+
+
+@pytest.mark.required
+@pytest.mark.parametrize("precision", ["64"])
+def test_native_implicit_soft_constraint_remove_disables_energy(tmp_path):
+    scene, entity = _build_native_implicit_two_tet_scene(tmp_path)
+    vertex_idx = 1
+    initial = tensor_to_array(entity.get_state().pos[0, vertex_idx]).copy()
+    stale_target = initial + np.array([0.5, 0.0, 0.0], dtype=np.float64)
+    entity.set_vertex_constraints(
+        [vertex_idx],
+        torch.tensor(stale_target[None], dtype=gs.tc_float, device=gs.device),
+        is_soft_constraint=True,
+        stiffness=1000.0,
+    )
+
+    entity.remove_vertex_constraints([vertex_idx])
+    constraints = _native_constraint_slice(scene, entity)
+    assert not constraints["is_constrained"][vertex_idx]
+
+    for _ in range(4):
+        scene.step(update_visualizer=False)
+
+    final = tensor_to_array(entity.get_state().pos[0, vertex_idx]).copy()
+    assert np.linalg.norm(final - initial) < 1e-6
+    assert np.linalg.norm(final - stale_target) >= np.linalg.norm(initial - stale_target) - 1e-6
+
+
+@pytest.mark.required
+@pytest.mark.parametrize("precision", ["64"])
+def test_native_implicit_soft_constraint_moves_toward_target(tmp_path):
+    initial, target, final = _run_native_implicit_soft_pull(tmp_path, stiffness=500.0)
+
+    initial_error = np.linalg.norm(initial - target)
+    final_error = np.linalg.norm(final - target)
+    assert final_error < initial_error
+    assert np.dot(final - initial, target - initial) > 0.0
+
+
+@pytest.mark.required
+@pytest.mark.parametrize("precision", ["64"])
+def test_native_implicit_soft_constraint_stiffness_monotonicity(tmp_path):
+    _initial_low, target_low, final_low = _run_native_implicit_soft_pull(tmp_path / "low", stiffness=50.0)
+    _initial_high, target_high, final_high = _run_native_implicit_soft_pull(tmp_path / "high", stiffness=1000.0)
+
+    low_error = np.linalg.norm(final_low - target_low)
+    high_error = np.linalg.norm(final_high - target_high)
+    assert high_error < low_error
+
+
+@pytest.mark.required
+@pytest.mark.parametrize("precision", ["64"])
+def test_native_implicit_soft_constraint_with_linesearch(tmp_path):
+    initial, target, final = _run_native_implicit_soft_pull(
+        tmp_path,
+        stiffness=500.0,
+        n_linesearch_iterations=5,
+    )
+
+    assert np.linalg.norm(final - target) < np.linalg.norm(initial - target)
+    assert np.dot(final - initial, target - initial) > 0.0
 
 
 @pytest.mark.required

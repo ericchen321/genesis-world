@@ -498,9 +498,10 @@ class FEMSolver(Solver):
         dt2 = self.substep_dt**2
         for i_v, i_b in qd.ndrange(self.n_vertices, self._B):
             if qd.static(self._enable_vertex_constraints):
-                if self.vertex_constraints.is_constrained[i_v, i_b]:
-                    self.elements_v[f + 1, i_v, i_b].pos = self.vertex_constraints.target_pos[i_v, i_b]
-                    self.elements_v_energy[i_b, i_v].inertia = self.vertex_constraints.target_pos[i_v, i_b]
+                vc = self.vertex_constraints[i_v, i_b]
+                if vc.is_constrained and not vc.is_soft_constraint:
+                    self.elements_v[f + 1, i_v, i_b].pos = vc.target_pos
+                    self.elements_v_energy[i_b, i_v].inertia = vc.target_pos
                 else:
                     self.elements_v_energy[i_b, i_v].inertia = (
                         self.elements_v[f, i_v, i_b].pos
@@ -585,7 +586,8 @@ class FEMSolver(Solver):
 
         if qd.static(self._enable_vertex_constraints):
             for i in qd.static(range(4)):
-                if self.vertex_constraints.is_constrained[i_vs[i], i_b]:
+                vc = self.vertex_constraints[i_vs[i], i_b]
+                if vc.is_constrained and not vc.is_soft_constraint:
                     S[i, :] = qd.Vector.zero(gs.qd_float, 3)
         return S
 
@@ -701,6 +703,18 @@ class FEMSolver(Solver):
                     V * damping_beta_factor * S[k, i] * S[k, j] * self.elements_el_hessian[i_b, i, j, i_e]
                 )
 
+        # implicit soft target penalty: E = 0.5 * k * ||x - target||^2
+        if qd.static(self._enable_vertex_constraints):
+            for i_b, i_v in qd.ndrange(self._B, self.n_vertices):
+                if not self.batch_active[i_b]:
+                    continue
+                vc = self.vertex_constraints[i_v, i_b]
+                if vc.is_constrained and vc.is_soft_constraint:
+                    pos_error = self.elements_v[f + 1, i_v, i_b].pos - vc.target_pos
+                    self.elements_v_energy[i_b, i_v].force += -vc.stiffness * pos_error
+                    for i in qd.static(range(3)):
+                        self.pcg_state_v[i_b, i_v].diag3x3[i, i] += vc.stiffness
+
         # inverse
         for i_b, i_v in qd.ndrange(self._B, self.n_vertices):
             if not self.batch_active[i_b]:
@@ -730,6 +744,10 @@ class FEMSolver(Solver):
             self.pcg_state_v[i_b, i_v].Ap = (
                 self.elements_v_info[i_v].mass_over_dt2 * damping_alpha_factor * self.pcg_state_v[i_b, i_v].p
             )
+            if qd.static(self._enable_vertex_constraints):
+                vc = self.vertex_constraints[i_v, i_b]
+                if vc.is_constrained and vc.is_soft_constraint:
+                    self.pcg_state_v[i_b, i_v].Ap += vc.stiffness * self.pcg_state_v[i_b, i_v].p
 
         for i_b, i_e in qd.ndrange(self._B, self.n_elements):
             if not self.batch_pcg_active[i_b]:
@@ -852,6 +870,11 @@ class FEMSolver(Solver):
                 continue
             diff = self.elements_v[f + 1, i_v, i_b].pos - self.elements_v_energy[i_b, i_v].inertia
             self.linesearch_state[i_b].prev_energy += 0.5 * self.elements_v_info[i_v].mass_over_dt2 * diff.dot(diff)
+            if qd.static(self._enable_vertex_constraints):
+                vc = self.vertex_constraints[i_v, i_b]
+                if vc.is_constrained and vc.is_soft_constraint:
+                    soft_diff = self.elements_v[f + 1, i_v, i_b].pos - vc.target_pos
+                    self.linesearch_state[i_b].prev_energy += 0.5 * vc.stiffness * soft_diff.dot(soft_diff)
             self.linesearch_state_v[i_b, i_v].x_prev = self.elements_v[f + 1, i_v, i_b].pos
             self.linesearch_state[i_b].m -= self.pcg_state_v[i_b, i_v].x.dot(self.elements_v_energy[i_b, i_v].force)
         # Elastic
@@ -884,6 +907,11 @@ class FEMSolver(Solver):
                 self.linesearch_state[i_b].energy += (
                     0.5 * self.elements_v_info[i_v].mass_over_dt2 * diff.dot(diff) * damping_alpha_dt
                 )
+            if qd.static(self._enable_vertex_constraints):
+                vc = self.vertex_constraints[i_v, i_b]
+                if vc.is_constrained and vc.is_soft_constraint:
+                    soft_diff = self.elements_v[f + 1, i_v, i_b].pos - vc.target_pos
+                    self.linesearch_state[i_b].energy += 0.5 * vc.stiffness * soft_diff.dot(soft_diff)
 
         # compute elastic energy
         self._func_compute_ele_energy(f)

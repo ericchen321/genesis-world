@@ -41,9 +41,48 @@ def _build_two_tet_scene(tmp_path):
     return scene, entity
 
 
+def _build_native_implicit_two_tet_scene(tmp_path):
+    mesh_path = tmp_path / "two_tets.mesh"
+    _write_tet_mesh(mesh_path)
+
+    scene = gs.Scene(
+        sim_options=gs.options.SimOptions(
+            dt=0.05,
+            substeps=1,
+            gravity=(0.0, 0.0, 0.0),
+        ),
+        fem_options=gs.options.FEMOptions(
+            enable_vertex_constraints=True,
+            use_implicit_solver=True,
+            n_newton_iterations=2,
+            n_pcg_iterations=100,
+            damping_alpha=0.0,
+            damping_beta=0.0,
+        ),
+        show_viewer=False,
+        show_FPS=False,
+    )
+    entity = scene.add_entity(
+        morph=gs.morphs.TetMesh(file=str(mesh_path)),
+        material=gs.materials.FEM.Elastic(E=100.0, rho=100.0, model="linear_corotated"),
+    )
+    scene.build()
+    return scene, entity
+
+
 def _constraint_flags(scene, entity):
     flags = scene.fem_solver.vertex_constraints.is_constrained.to_numpy()
     return flags[entity.v_start : entity.v_start + entity.n_vertices, 0]
+
+
+def _constraint_soft_flags(scene, entity):
+    flags = scene.fem_solver.vertex_constraints.is_soft_constraint.to_numpy()
+    return flags[entity.v_start : entity.v_start + entity.n_vertices, 0]
+
+
+def _constraint_stiffness(scene, entity):
+    stiffness = scene.fem_solver.vertex_constraints.stiffness.to_numpy()
+    return stiffness[entity.v_start : entity.v_start + entity.n_vertices, 0]
 
 
 def _constraint_target(scene, entity, vertex_idx):
@@ -100,6 +139,35 @@ def test_static_box_anchor_constrains_expected_vertices(tmp_path):
     flags = _constraint_flags(scene, entity)
     assert flags[0]
     assert not flags[1]
+
+
+def test_static_box_anchor_defaults_to_hard_zero_stiffness(tmp_path):
+    scene, entity = _build_two_tet_scene(tmp_path)
+
+    apply_static_box_anchors(
+        entity,
+        [{"anchor_id": "origin_pin", "frame": "env_local", "box": [-0.05, -0.05, -0.05, 0.05, 0.05, 0.05]}],
+    )
+
+    assert _constraint_flags(scene, entity)[0]
+    assert not _constraint_soft_flags(scene, entity)[0]
+    assert _constraint_stiffness(scene, entity)[0] == pytest.approx(0.0)
+
+
+def test_static_box_anchor_forwards_soft_constraint_settings(tmp_path):
+    scene, entity = _build_native_implicit_two_tet_scene(tmp_path)
+
+    records = apply_static_box_anchors(
+        entity,
+        [{"anchor_id": "origin_soft", "frame": "env_local", "box": [-0.05, -0.05, -0.05, 0.05, 0.05, 0.05]}],
+        is_soft_constraint=True,
+        stiffness=250.0,
+    )
+
+    assert records[0].selected_vertex_count == 1
+    assert _constraint_flags(scene, entity)[0]
+    assert _constraint_soft_flags(scene, entity)[0]
+    assert _constraint_stiffness(scene, entity)[0] == pytest.approx(250.0)
 
 
 def test_box_ee_grasp_selects_current_positions(tmp_path):
@@ -201,6 +269,82 @@ def test_box_ee_release_restores_overlapping_static_anchor(tmp_path):
 
     flags = _constraint_flags(scene, entity)
     assert flags[3]
+    np.testing.assert_allclose(_constraint_target(scene, entity, 3), original_target, atol=1e-6)
+
+
+def test_box_ee_soft_grasp_requires_positive_stiffness(tmp_path):
+    _scene, entity = _build_native_implicit_two_tet_scene(tmp_path)
+    controller = BoxEndEffectorController(entity)
+
+    with pytest.raises(gs.GenesisException, match="finite stiffness > 0.0"):
+        controller.grasp(
+            [-0.05, -0.05, 0.95, 0.05, 0.05, 1.05],
+            is_soft_constraint=True,
+        )
+
+    assert not controller.state.active
+
+
+def test_box_ee_soft_grasp_advance_motion_preserves_soft_stiffness(tmp_path):
+    scene, entity = _build_native_implicit_two_tet_scene(tmp_path)
+    controller = BoxEndEffectorController(entity)
+
+    state = controller.grasp(
+        [-0.05, -0.05, 0.95, 0.05, 0.05, 1.05],
+        is_soft_constraint=True,
+        stiffness=500.0,
+    )
+
+    np.testing.assert_array_equal(state.selected_vertices, np.array([3], dtype=gs.np_int))
+    assert _constraint_flags(scene, entity)[3]
+    assert _constraint_soft_flags(scene, entity)[3]
+    assert _constraint_stiffness(scene, entity)[3] == pytest.approx(500.0)
+
+    controller.move_positive_y(distance_scale=0.5, duration_steps=12, speed=0.6)
+    state = controller.advance_motion(steps=12)
+
+    np.testing.assert_allclose(state.displacement, np.array([0.0, 0.05, 0.0], dtype=gs.np_float), atol=1e-6)
+    np.testing.assert_allclose(_constraint_target(scene, entity, 3), np.array([0.0, 0.05, 1.0]), atol=1e-6)
+    assert _constraint_soft_flags(scene, entity)[3]
+    assert _constraint_stiffness(scene, entity)[3] == pytest.approx(500.0)
+
+    position_at_update = tensor_to_array(entity.get_state().pos[0, 3]).copy()
+    target = _constraint_target(scene, entity, 3).copy()
+    for _ in range(4):
+        scene.step(update_visualizer=False)
+
+    final = tensor_to_array(entity.get_state().pos[0, 3]).copy()
+    assert np.linalg.norm(final - target) < np.linalg.norm(position_at_update - target)
+    assert np.dot(final - position_at_update, target - position_at_update) > 0.0
+
+
+def test_box_ee_release_restores_overlapping_soft_static_anchor(tmp_path):
+    scene, entity = _build_native_implicit_two_tet_scene(tmp_path)
+    apply_static_box_anchors(
+        entity,
+        [{"anchor_id": "top_soft", "frame": "env_local", "box": [-0.05, -0.05, 0.95, 0.05, 0.05, 1.05]}],
+        is_soft_constraint=True,
+        stiffness=123.0,
+    )
+    original_target = _constraint_target(scene, entity, 3).copy()
+    controller = BoxEndEffectorController(entity)
+
+    controller.grasp(
+        [-0.05, -0.05, 0.95, 0.05, 0.05, 1.05],
+        is_soft_constraint=True,
+        stiffness=456.0,
+    )
+    assert _constraint_soft_flags(scene, entity)[3]
+    assert _constraint_stiffness(scene, entity)[3] == pytest.approx(456.0)
+    controller.move_positive_y(distance_scale=0.5, duration_steps=12)
+    controller.advance_motion(steps=12)
+    assert not np.allclose(_constraint_target(scene, entity, 3), original_target)
+
+    controller.release()
+
+    assert _constraint_flags(scene, entity)[3]
+    assert _constraint_soft_flags(scene, entity)[3]
+    assert _constraint_stiffness(scene, entity)[3] == pytest.approx(123.0)
     np.testing.assert_allclose(_constraint_target(scene, entity, 3), original_target, atol=1e-6)
 
 

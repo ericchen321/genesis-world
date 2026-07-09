@@ -1086,9 +1086,10 @@ class FEMEntity(Entity):
                 Optional rigid link for the vertices to follow, maintaining relative position.
             is_soft_constraint: bool
                 By default, use a hard constraint directly sets position and zero velocity.
-                A soft constraint uses a spring force to pull the vertex towards the target position.
+                For native FEM implicit solves, a soft constraint adds a quadratic position penalty and keeps the
+                vertex as a live degree of freedom. For native FEM explicit solves, it uses a legacy spring force.
             stiffness : float
-                Specify a spring stiffness for a soft constraint. Critical damping is applied.
+                Specify stiffness for a soft constraint. Native FEM soft constraints require a finite positive value.
             envs_idx : array_like, optional
                 List of environment indices to apply the constraints to. If None, applies to all environments.
         """
@@ -1120,6 +1121,11 @@ class FEMEntity(Entity):
                 strength=strength,
             )
             return
+
+        if is_soft_constraint:
+            stiffness = float(stiffness)
+            if not np.isfinite(stiffness) or stiffness <= 0.0:
+                gs.raise_exception("Native FEM soft vertex constraints require finite stiffness > 0.0.")
 
         if self._solver._use_implicit_solver and not self._solver._enable_vertex_constraints:
             gs.raise_exception(
