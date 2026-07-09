@@ -9,6 +9,21 @@ from genesis.engine.controllers.box_end_effector import BoxEndEffectorController
 from .protocol import GenesisLiveError
 
 
+BOX_EE_NATIVE_FEM_COMPLIANT_STIFFNESS = 750.0
+BOX_EE_IPC_SURFACE_COMPLIANT_STRENGTH_RATE = 100.0
+BOX_EE_COMPLIANCE_OVERRIDE_KEYS = frozenset(
+    {
+        "stiffness",
+        "controller_stiffness",
+        "strength",
+        "strength_rate",
+        "constraint_strength",
+        "soft_constraint",
+        "is_soft_constraint",
+    }
+)
+
+
 class ActionRegistry:
     def __init__(self):
         self._actions: dict[str, dict[str, Any]] = {}
@@ -41,6 +56,28 @@ def _entity_for_action(session, params: dict[str, Any]):
     return session.entity_by_name(str(entity_name))
 
 
+def _reject_compliance_override_keys(params: dict[str, Any], controller_spec: dict[str, Any]) -> None:
+    offenders = sorted(
+        {f"params.{key}" for key in BOX_EE_COMPLIANCE_OVERRIDE_KEYS if key in params}
+        | {f"controllers[0].{key}" for key in BOX_EE_COMPLIANCE_OVERRIDE_KEYS if key in controller_spec}
+    )
+    if offenders:
+        raise GenesisLiveError(
+            "invalid_controller_request",
+            "BoxEE compliance controls are backend-owned; remove override field(s): " + ", ".join(offenders),
+        )
+
+
+def _box_ee_compliant_policy(entity) -> tuple[bool, float]:
+    from genesis.engine.couplers import IPCCoupler
+    from genesis.engine.materials.FEM.cloth import Cloth as ClothMaterial
+
+    if isinstance(entity.sim.coupler, IPCCoupler) and isinstance(entity.material, ClothMaterial):
+        # Existing FEMEntity API transports IPC surface strength-rate through the stiffness keyword.
+        return True, BOX_EE_IPC_SURFACE_COMPLIANT_STRENGTH_RATE
+    return True, BOX_EE_NATIVE_FEM_COMPLIANT_STIFFNESS
+
+
 def apply_probe_action(session, params: dict[str, Any]) -> dict[str, Any]:
     action = params.get("action")
     if action is None and params.get("action_id"):
@@ -55,6 +92,7 @@ def apply_probe_action(session, params: dict[str, Any]) -> dict[str, Any]:
     if action == "box_ee_grasp_and_move":
         entity_name, entity = _entity_for_action(session, params)
         controller_spec = _controller_spec(params)
+        _reject_compliance_override_keys(params, controller_spec)
         controller_id = str(controller_spec.get("controller_id") or params.get("controller_id") or "box_ee_0")
         aabb_box = controller_spec.get("aabb_box")
         if aabb_box is None:
@@ -76,6 +114,7 @@ def apply_probe_action(session, params: dict[str, Any]) -> dict[str, Any]:
 
         controller = BoxEndEffectorController(entity, controller_id=controller_id)
         frame = aabb_box.get("frame", "env_local") if isinstance(aabb_box, dict) else "env_local"
+        is_soft_constraint, compliance_value = _box_ee_compliant_policy(entity)
         try:
             state = controller.grasp_and_move_positive_y(
                 aabb_box,
@@ -86,6 +125,8 @@ def apply_probe_action(session, params: dict[str, Any]) -> dict[str, Any]:
                 max_distance_scale=float(
                     controller_spec.get("max_distance_scale", params.get("max_distance_scale", 1.0))
                 ),
+                is_soft_constraint=is_soft_constraint,
+                stiffness=compliance_value,
                 selection_tolerance=None if selection_tolerance is None else float(selection_tolerance),
             )
         except gs.GenesisException as exc:

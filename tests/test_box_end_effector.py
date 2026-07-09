@@ -318,6 +318,47 @@ def test_box_ee_soft_grasp_advance_motion_preserves_soft_stiffness(tmp_path):
     assert np.dot(final - position_at_update, target - position_at_update) > 0.0
 
 
+def test_box_ee_grasp_and_move_forwards_soft_constraint_settings(tmp_path):
+    scene, entity = _build_native_implicit_two_tet_scene(tmp_path)
+    controller = BoxEndEffectorController(entity)
+
+    state = controller.grasp_and_move_positive_y(
+        [-0.05, -0.05, 0.95, 0.05, 0.05, 1.05],
+        distance_scale=0.5,
+        duration_steps=12,
+        speed=0.6,
+        is_soft_constraint=True,
+        stiffness=750.0,
+    )
+
+    np.testing.assert_array_equal(state.selected_vertices, np.array([3], dtype=gs.np_int))
+    assert _constraint_flags(scene, entity)[3]
+    assert _constraint_soft_flags(scene, entity)[3]
+    assert _constraint_stiffness(scene, entity)[3] == pytest.approx(750.0)
+
+    state = controller.advance_motion(steps=12)
+
+    np.testing.assert_allclose(state.displacement, np.array([0.0, 0.05, 0.0], dtype=gs.np_float), atol=1e-6)
+    np.testing.assert_allclose(_constraint_target(scene, entity, 3), np.array([0.0, 0.05, 1.0]), atol=1e-6)
+    assert _constraint_soft_flags(scene, entity)[3]
+    assert _constraint_stiffness(scene, entity)[3] == pytest.approx(750.0)
+
+
+def test_box_ee_grasp_and_move_soft_constraint_requires_positive_stiffness(tmp_path):
+    _scene, entity = _build_native_implicit_two_tet_scene(tmp_path)
+    controller = BoxEndEffectorController(entity)
+
+    with pytest.raises(gs.GenesisException, match="finite stiffness > 0.0"):
+        controller.grasp_and_move_positive_y(
+            [-0.05, -0.05, 0.95, 0.05, 0.05, 1.05],
+            distance_scale=0.5,
+            duration_steps=12,
+            is_soft_constraint=True,
+        )
+
+    assert not controller.state.active
+
+
 def test_box_ee_release_restores_overlapping_soft_static_anchor(tmp_path):
     scene, entity = _build_native_implicit_two_tet_scene(tmp_path)
     apply_static_box_anchors(

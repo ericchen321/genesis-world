@@ -631,6 +631,8 @@ class BoxEndEffectorController:
         speed: float = DEFAULT_BOX_EE_SPEED,
         max_distance_scale: float = DEFAULT_MAX_DISTANCE_SCALE,
         optional: bool = False,
+        is_soft_constraint: bool = False,
+        stiffness: float = 0.0,
         selection_tolerance: float | None = None,
         atol: float | None = None,
     ) -> BoxEndEffectorState:
@@ -638,6 +640,8 @@ class BoxEndEffectorController:
             aabb_box,
             frame=frame,
             optional=optional,
+            is_soft_constraint=is_soft_constraint,
+            stiffness=stiffness,
             selection_tolerance=selection_tolerance,
             atol=atol,
         )
