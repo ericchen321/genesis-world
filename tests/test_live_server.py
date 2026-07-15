@@ -12,7 +12,8 @@ import numpy as np
 import pytest
 from PIL import Image
 
-from genesis.live.protocol import PROTOCOL, recv_json, send_json
+import genesis as gs
+from genesis.live.protocol import PROTOCOL, GenesisLiveError, recv_json, send_json
 from genesis.live.session import GenesisLiveSession
 from genesis.live.visual_telemetry import GENESIS_NATIVE_DEBUG_CAMERA_RENDERER
 
@@ -86,6 +87,36 @@ def test_protocol_framing_round_trip():
     finally:
         left.close()
         right.close()
+
+
+@pytest.mark.parametrize("backend", [None])
+@pytest.mark.parametrize(("requested_backend", "expected"), (("cpu", gs.cpu), ("cuda", gs.cuda)))
+def test_live_session_initialization_honors_requested_volumetric_backend(
+    monkeypatch, backend, requested_backend, expected
+):
+    del backend
+    calls = []
+    monkeypatch.setattr(gs, "_initialized", False)
+    monkeypatch.setattr(gs, "init", lambda **kwargs: calls.append(kwargs))
+
+    session = GenesisLiveSession.__new__(GenesisLiveSession)
+    session._ensure_genesis_initialized(requested_backend, requires_surface_backend=False)
+
+    assert calls == [{"backend": expected, "logging_level": "warning"}]
+
+
+@pytest.mark.parametrize("backend", [None])
+def test_live_session_rejects_initialized_volumetric_backend_mismatch(monkeypatch, backend):
+    del backend
+    monkeypatch.setattr(gs, "_initialized", True)
+    monkeypatch.setattr(gs, "backend", gs.cpu)
+
+    session = GenesisLiveSession.__new__(GenesisLiveSession)
+    with pytest.raises(GenesisLiveError) as exc_info:
+        session._ensure_genesis_initialized("cuda", requires_surface_backend=False)
+
+    assert exc_info.value.code == "backend_mismatch"
+    assert exc_info.value.details == {"current_backend": str(gs.cpu), "required_backend": "cuda"}
 
 
 def test_live_session_lifecycle_and_box_action(tmp_path):

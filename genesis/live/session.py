@@ -233,18 +233,18 @@ class GenesisLiveSession:
                     "surface shell diagnostics require uipc, CUDA, and IPCCoupler support",
                     details=status,
                 )
-            if gs._initialized:
-                if gs.backend != gs.cuda:
-                    raise GenesisLiveError(
-                        "unsupported_surface_backend",
-                        "surface shell diagnostics require Genesis to be initialized on CUDA",
-                        details={"current_backend": str(gs.backend), "required_backend": "cuda"},
-                    )
-                return
-            gs.init(backend=gs.cuda, logging_level="warning")
+
+        requested_backend = gs.cuda if backend == "cuda" else gs.cpu
+        if gs._initialized:
+            if gs.backend != requested_backend:
+                error_code = "unsupported_surface_backend" if requires_surface_backend else "backend_mismatch"
+                raise GenesisLiveError(
+                    error_code,
+                    "Genesis is already initialized on a different backend",
+                    details={"current_backend": str(gs.backend), "required_backend": backend},
+                )
             return
-        if not gs._initialized:
-            gs.init(backend=gs.cpu, logging_level="warning")
+        gs.init(backend=requested_backend, logging_level="warning")
 
     def build_scene(self) -> None:
         self._validate_scene_config_before_build(self._scene_config)
