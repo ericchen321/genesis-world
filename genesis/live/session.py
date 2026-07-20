@@ -53,6 +53,7 @@ class GenesisLiveSession:
         self._scene_config = self._load_scene_config(scene_config_path)
         self.scene = None
         self.entities = {}
+        self.context_entities = {}
         self.visual_telemetry = VisualTelemetry(self._resolve_output_dir())
         self.build_scene()
 
@@ -100,6 +101,8 @@ class GenesisLiveSession:
                 raise GenesisLiveError("invalid_scene_config", "entity morph and material entries must be JSON objects")
             morph_type = morph_cfg.get("type")
             material_type = material_cfg.get("type", "elastic")
+            if entity_cfg.get("part_segmentation") is not None:
+                self._validate_part_segmentation_contract(entity_cfg["part_segmentation"], entity_index=index)
             if morph_type == "surface_mesh":
                 if material_type not in {"surface_shell", "cloth"}:
                     raise GenesisLiveError(
@@ -131,6 +134,90 @@ class GenesisLiveSession:
                         details={"entity_index": index, "material_type": material_type},
                     )
 
+    def _validate_part_segmentation_contract(self, config: Any, *, entity_index: int) -> None:
+        if not isinstance(config, dict):
+            raise GenesisLiveError(
+                "invalid_part_segmentation",
+                "each diagnostic entity requires a part_segmentation object",
+                details={"entity_index": entity_index},
+            )
+        required = {
+            "primitive_labels_file",
+            "primitive_labels_key",
+            "palette_file",
+            "palette_key",
+            "parts",
+            "context_palette",
+        }
+        if set(config) != required:
+            raise GenesisLiveError(
+                "invalid_part_segmentation",
+                "part_segmentation has unexpected or missing keys",
+                details={"entity_index": entity_index, "keys": sorted(config), "required": sorted(required)},
+            )
+        labels_key = config["primitive_labels_key"]
+        if labels_key not in {"tri_part_labels", "tet_part_labels"}:
+            raise GenesisLiveError("invalid_part_segmentation", "unsupported primitive_labels_key")
+        labels_path = Path(str(config["primitive_labels_file"]))
+        palette_path = Path(str(config["palette_file"]))
+        try:
+            with np.load(labels_path, allow_pickle=False) as payload:
+                labels = np.asarray(payload[labels_key])
+            with np.load(palette_path, allow_pickle=False) as payload:
+                colors = np.asarray(payload[str(config["palette_key"])])[:, :3]
+        except (OSError, KeyError, ValueError, IndexError) as exc:
+            raise GenesisLiveError(
+                "invalid_part_segmentation",
+                "failed to load part segmentation labels or palette",
+                details={"entity_index": entity_index, "error": str(exc)},
+            ) from exc
+        if labels.ndim != 1 or not np.issubdtype(labels.dtype, np.integer) or np.any(labels < 0):
+            raise GenesisLiveError("invalid_part_segmentation", "primitive labels must be a non-negative integer vector")
+        if colors.ndim != 2 or colors.shape[1] != 3 or not np.all(np.isfinite(colors)):
+            raise GenesisLiveError("invalid_part_segmentation", "part palette must contain finite RGB rows")
+        colors_u8 = np.rint(colors).astype(np.int64)
+        if not np.allclose(colors, colors_u8, atol=1e-6, rtol=0.0) or np.any((colors_u8 < 0) | (colors_u8 > 255)):
+            raise GenesisLiveError("invalid_part_segmentation", "part palette RGB values must be integers in [0, 255]")
+        if np.any(np.all(colors_u8 == 0, axis=1)) or len({tuple(row) for row in colors_u8.tolist()}) != colors_u8.shape[0]:
+            raise GenesisLiveError("invalid_part_segmentation", "part palette colors must be unique and non-black")
+        parts = config["parts"]
+        if not isinstance(parts, list) or not parts:
+            raise GenesisLiveError("invalid_part_segmentation", "part_segmentation.parts must be non-empty")
+        part_ids = []
+        for part in parts:
+            if not isinstance(part, dict) or set(part) != {"part_id", "part_name", "part_color_rgb"}:
+                raise GenesisLiveError("invalid_part_segmentation", "each part entry requires id, name, and RGB")
+            part_id = int(part["part_id"])
+            if not str(part["part_name"]).strip() or part_id < 0 or part_id >= colors_u8.shape[0]:
+                raise GenesisLiveError("invalid_part_segmentation", "part entry has invalid id or empty name")
+            if list(np.asarray(part["part_color_rgb"], dtype=np.int64)) != list(colors_u8[part_id]):
+                raise GenesisLiveError("invalid_part_segmentation", "part entry color does not match palette")
+            part_ids.append(part_id)
+        if len(set(part_ids)) != len(part_ids) or set(np.unique(labels).tolist()) != set(part_ids):
+            raise GenesisLiveError("invalid_part_segmentation", "part ids must exactly cover primitive labels")
+        context_palette = config["context_palette"]
+        if not isinstance(context_palette, dict) or set(context_palette) != {"background", "ground", "fixture", "probe"}:
+            raise GenesisLiveError("invalid_part_segmentation", "context_palette has invalid categories")
+        context_colors = {}
+        for kind, raw_color in context_palette.items():
+            color = np.asarray(raw_color)
+            if color.shape != (3,) or not np.issubdtype(color.dtype, np.integer):
+                raise GenesisLiveError("invalid_part_segmentation", f"context color {kind!r} must be an integer RGB triplet")
+            if np.any((color < 0) | (color > 255)):
+                raise GenesisLiveError("invalid_part_segmentation", f"context color {kind!r} must be in [0, 255]")
+            context_colors[kind] = tuple(int(value) for value in color)
+        if context_colors["background"] != (0, 0, 0):
+            raise GenesisLiveError("invalid_part_segmentation", "context background must be black")
+        if len(set(context_colors.values())) != len(context_colors):
+            raise GenesisLiveError("invalid_part_segmentation", "context palette colors must be unique")
+        asset_colors = {tuple(int(value) for value in row) for row in colors_u8}
+        conflicts = sorted(set(context_colors.values()).intersection(asset_colors))
+        if conflicts:
+            raise GenesisLiveError(
+                "invalid_part_segmentation",
+                "context palette colors conflict with asset part colors",
+                details={"conflicts": conflicts},
+            )
     def _validate_surface_obj_faces(self, mesh_file: str | Path, *, entity_index: int) -> np.ndarray:
         path = Path(mesh_file)
         if path.suffix.lower() != ".obj":
@@ -273,6 +360,7 @@ class GenesisLiveSession:
         self.scene = gs.Scene(**scene_kwargs)
 
         self.entities = {}
+        self.context_entities = {}
         pending_anchors = []
         for index, entity_cfg in enumerate(self._scene_config.get("entities", [])):
             if not isinstance(entity_cfg, dict):
@@ -283,6 +371,8 @@ class GenesisLiveSession:
             morph = self._build_morph(morph_cfg)
             material = self._build_material(material_cfg)
             entity = self.scene.add_entity(morph=morph, material=material, name=name)
+            if entity_cfg.get("part_segmentation") is not None:
+                entity._part_segmentation_config = dict(entity_cfg["part_segmentation"])
             self.entities[name] = entity
             pending_anchors.append((entity, entity_cfg.get("anchors", [])))
 
@@ -577,8 +667,15 @@ class GenesisLiveSession:
         mode = visual.get("mode", "rgb_triptych")
         if mode in {"depth", "depth_triptych", "von_mises", "von_mises_triptych"}:
             raise GenesisLiveError("unsupported_visual_mode", f"{mode} is not supported by this migration feature")
-        if mode != "rgb_triptych":
+        if mode not in {"rgb_triptych", "part_segmentation_triptych"}:
             raise GenesisLiveError("unsupported_visual_mode", f"unsupported diagnostic visual mode: {mode}")
+        if mode == "part_segmentation_triptych" and any(
+            getattr(entity, "_part_segmentation_config", None) is None for entity in self.entities.values()
+        ):
+            raise GenesisLiveError(
+                "invalid_visual_request",
+                "part_segmentation_triptych requires a part_segmentation contract on every diagnostic entity",
+            )
         self._visual_render_every_steps(visual)
 
     def _visual_render_every_steps(self, visual) -> int | None:
@@ -600,7 +697,12 @@ class GenesisLiveSession:
         if visual is None:
             return {"requested": False}
         self._validate_fem_state(checked_at="before_visual_capture")
-        metadata = self.visual_telemetry.capture_rgb_triptych(self, frame_index=frame_index)
+        mode = visual.get("mode", "rgb_triptych")
+        handlers = {
+            "rgb_triptych": self.visual_telemetry.capture_rgb_triptych,
+            "part_segmentation_triptych": self.visual_telemetry.capture_part_segmentation_triptych,
+        }
+        metadata = handlers[mode](self, frame_index=frame_index)
         metadata["frame_sequence_index"] = int(frame_sequence_index)
         metadata["render_every_steps"] = int(render_every_steps)
         self.last_frame_index = int(metadata["stitched"]["frame_index"])
@@ -616,24 +718,26 @@ class GenesisLiveSession:
     ) -> dict[str, Any]:
         if visual is None:
             return {"requested": False}
+        mode = visual.get("mode", "rgb_triptych")
+        human_mode = "part segmentation triptych" if mode == "part_segmentation_triptych" else "RGB triptych"
         if not frames:
             return {
                 "requested": True,
-                "mode": "rgb_triptych",
+                "mode": mode,
                 "rendered": False,
                 "render_backend": GENESIS_NATIVE_DEBUG_CAMERA_RENDERER,
                 "renderer": {
                     "backend": GENESIS_NATIVE_DEBUG_CAMERA_RENDERER,
-                    "mode": "rgb_triptych",
+                    "mode": mode,
                     "debug_camera": True,
-                    "reason": "no RGB triptych frame boundary reached during this resume",
+                    "reason": f"no {human_mode} frame boundary reached during this resume",
                 },
                 "render_every_steps": int(render_every_steps or DEFAULT_RENDER_EVERY_STEPS),
                 "steps_requested": int(steps_requested),
                 "frames": [],
                 "frame_metadata": [],
                 "count": 0,
-                "reason": "no RGB triptych frame boundary reached during this resume",
+                "reason": f"no {human_mode} frame boundary reached during this resume",
             }
         result = dict(frames[-1])
         result["frames"] = frames

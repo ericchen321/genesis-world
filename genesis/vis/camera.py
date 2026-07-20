@@ -385,6 +385,7 @@ class Camera(RBC):
         normal=False,
         antialiasing=False,
         force_render=False,
+        render_pass="rgb",
     ):
         """
         Render the camera view.
@@ -445,14 +446,14 @@ class Camera(RBC):
                 rgb_arr = self._raytracer.render_camera(self)
 
             if depth or segmentation or normal:
-                self._rasterizer.update_scene(force_render)
+                self._rasterizer.update_scene(force_render, render_pass=render_pass)
                 _, depth_arr, seg_idxc_arr, normal_arr = self._rasterizer.render_camera(
-                    self, False, depth, segmentation, normal=normal
+                    self, False, depth, segmentation, normal=normal, render_pass=render_pass
                 )
         else:
-            self._rasterizer.update_scene(force_render)
+            self._rasterizer.update_scene(force_render, render_pass=render_pass)
             rgb_arr, depth_arr, seg_idxc_arr, normal_arr = self._rasterizer.render_camera(
-                self, rgb_, depth, segmentation, normal=normal
+                self, rgb_, depth, segmentation, normal=normal, render_pass=render_pass
             )
 
         # Colorize the segmentation map is necessary

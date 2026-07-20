@@ -68,7 +68,7 @@ class Rasterizer(RBC):
             self._viewer.close_offscreen(self._camera_targets[camera.uid])
         del self._camera_targets[camera.uid]
 
-    def render_camera(self, camera, rgb=True, depth=False, segmentation=False, normal=False):
+    def render_camera(self, camera, rgb=True, depth=False, segmentation=False, normal=False, render_pass="rgb"):
         # Update camera
         self.update_camera(camera)
 
@@ -77,6 +77,11 @@ class Rasterizer(RBC):
         # Force env-separate rendering when the camera has a per-env pose (attached camera in batched scene)
         camera_node = self._camera_nodes[camera.uid]
         env_separate_rigid = self._context.env_separate_rigid or camera_node.matrix.ndim == 3
+        if render_pass == "part_segmentation":
+            active_nodes = frozenset(self._context.segmentation_only_nodes)
+        else:
+            active_nodes = frozenset(self._context._scene.mesh_nodes - self._context.segmentation_only_nodes)
+        excluded_nodes = frozenset(self._context._scene.mesh_nodes - active_nodes)
         if self._offscreen:
             # Set the context
             self._renderer.make_current()
@@ -95,6 +100,9 @@ class Rasterizer(RBC):
                         plane_reflection=rgb and self._context.plane_reflection,
                         shadow=rgb and self._context.shadow,
                         skip_markers=skip_markers,
+                        excluded_nodes=excluded_nodes,
+                        active_nodes=active_nodes,
+                        render_pass=render_pass,
                     )
 
                 if segmentation:
@@ -110,6 +118,9 @@ class Rasterizer(RBC):
                         plane_reflection=False,
                         shadow=False,
                         skip_markers=skip_markers,
+                        excluded_nodes=excluded_nodes,
+                        active_nodes=active_nodes,
+                        render_pass=render_pass,
                     )
             finally:
                 # Unset the context
@@ -151,8 +162,8 @@ class Rasterizer(RBC):
             normal_arr = retval[int(rgb + depth)]
         return rgb_arr, depth_arr, seg_idxc_arr, normal_arr
 
-    def update_scene(self, force_render: bool = False):
-        self._context.update(force_render)
+    def update_scene(self, force_render: bool = False, render_pass: str = "rgb"):
+        self._context.update(force_render, render_pass=render_pass)
 
     def destroy(self):
         for node in self._camera_nodes.values():

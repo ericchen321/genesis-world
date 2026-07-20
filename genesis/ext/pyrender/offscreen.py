@@ -116,6 +116,9 @@ class OffscreenRenderer(object):
         plane_reflection=False,
         env_separate_rigid=False,
         skip_markers=False,
+        excluded_nodes=None,
+        active_nodes=None,
+        render_pass="rgb",
     ):
         """Render a scene with the given set of flags.
 
@@ -178,12 +181,26 @@ class OffscreenRenderer(object):
         if rgb or depth or seg:
             if self._platform.supports_framebuffers():
                 flags |= RenderFlags.OFFSCREEN
-                retval = renderer.render(scene, flags, seg_node_map)
+                retval = renderer.render(
+                    scene,
+                    flags,
+                    seg_node_map,
+                    excluded_nodes=excluded_nodes,
+                    active_nodes=active_nodes,
+                    render_pass=render_pass,
+                )
                 assert retval is not None
             else:
                 if flags & RenderFlags.ENV_SEPARATE:
                     gs.raise_exception("'env_separate_rigid=True' not supported on this platform.")
-                result = renderer.render(scene, flags, seg_node_map)
+                result = renderer.render(
+                    scene,
+                    flags,
+                    seg_node_map,
+                    excluded_nodes=excluded_nodes,
+                    active_nodes=active_nodes,
+                    render_pass=render_pass,
+                )
                 assert result is not None
                 glBindFramebuffer(GL_READ_FRAMEBUFFER, 0)
                 glReadBuffer(GL_FRONT)
@@ -231,12 +248,26 @@ class OffscreenRenderer(object):
 
             if self._platform.supports_framebuffers():
                 normal_arr, *_ = renderer.render(
-                    scene, flags, is_first_pass=not first_pass_done, force_skip_shadows=True
+                    scene,
+                    flags,
+                    is_first_pass=not first_pass_done,
+                    force_skip_shadows=True,
+                    excluded_nodes=excluded_nodes,
+                    active_nodes=active_nodes,
+                    render_pass=render_pass,
                 )
             else:
                 glBindFramebuffer(GL_READ_FRAMEBUFFER, 0)
                 glReadBuffer(GL_FRONT)
-                renderer.render(scene, flags, is_first_pass=not first_pass_done, force_skip_shadows=True)
+                renderer.render(
+                    scene,
+                    flags,
+                    is_first_pass=not first_pass_done,
+                    force_skip_shadows=True,
+                    excluded_nodes=excluded_nodes,
+                    active_nodes=active_nodes,
+                    render_pass=render_pass,
+                )
                 normal_arr = renderer.jit.read_color_buf(self.viewport_height, self.viewport_width, rgba=False)
                 normal_arr = renderer._resize_image(normal_arr, antialias=not seg)
 

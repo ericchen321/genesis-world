@@ -1,3 +1,5 @@
+import time
+
 import numpy as np
 import torch
 import trimesh
@@ -10,6 +12,28 @@ from genesis.ext import pyrender
 from genesis.ext.pyrender.jit_render import JITRenderer
 from genesis.utils.misc import tensor_to_array, qd_to_numpy
 
+PART_SEGMENTATION_CONTEXT_EDGE_RADIUS = 0.004
+
+
+def _part_segmentation_wireframe_box_mesh(bounds):
+    bounds = np.asarray(bounds, dtype=np.float32)
+    center = (bounds[0] + bounds[1]) * 0.5
+    size = bounds[1] - bounds[0]
+    edge_meshes = []
+    for axis in range(3):
+        transverse_axes = [index for index in range(3) if index != axis]
+        for side_0 in (0, 1):
+            for side_1 in (0, 1):
+                edge_center = center.copy()
+                edge_center[transverse_axes[0]] = bounds[side_0, transverse_axes[0]]
+                edge_center[transverse_axes[1]] = bounds[side_1, transverse_axes[1]]
+                edge_extents = np.full(3, 2.0 * PART_SEGMENTATION_CONTEXT_EDGE_RADIUS, dtype=np.float32)
+                edge_extents[axis] = max(float(size[axis]), 2.0 * PART_SEGMENTATION_CONTEXT_EDGE_RADIUS)
+                edge = trimesh.creation.box(extents=edge_extents)
+                edge.apply_translation(edge_center)
+                edge_meshes.append(edge)
+    return trimesh.util.concatenate(edge_meshes)
+
 
 class SegmentationColorMap:
     def __init__(self, seed: int = 0, to_torch: bool = False):
@@ -17,11 +41,22 @@ class SegmentationColorMap:
         self.to_torch = to_torch
         self.idxc_map = {0: -1}
         self.key_map = {-1: 0}
+        self._next_idxc = 1
         self.idxc_to_color = None
 
     def seg_key_to_idxc(self, seg_key):
-        seg_idxc = self.key_map.setdefault(seg_key, len(self.key_map))
+        seg_idxc = self.key_map.get(seg_key)
+        if seg_idxc is None:
+            seg_idxc = self._next_idxc
+            self._next_idxc += 1
+            self.key_map[seg_key] = seg_idxc
         self.idxc_map[seg_idxc] = seg_key
+        return seg_idxc
+
+    def remove_seg_key(self, seg_key):
+        seg_idxc = self.key_map.pop(seg_key, None)
+        if seg_idxc is not None:
+            self.idxc_map.pop(seg_idxc, None)
         return seg_idxc
 
     def seg_idxc_to_key(self, seg_idxc):
@@ -36,7 +71,7 @@ class SegmentationColorMap:
         # seg_idxc_rgb: colorized seg_idxc internally used by renderer
 
         # Evenly spaced hues
-        num_keys = len(self.key_map)
+        num_keys = max(self.idxc_map, default=0) + 1
         hues = np.linspace(0.0, 1.0, num_keys, endpoint=False)
         rng = np.random.default_rng(seed=self.seed)
         rng.shuffle(hues)
@@ -107,6 +142,20 @@ class RasterizerContext:
         self._per_env_vverts_entity_uids: set = set()
         self.static_nodes = dict()  # used across all frames
         self._fem_surface_vertex_indices = dict()
+        self._part_segmentation_vertex_indices = dict()
+        self.part_segmentation_nodes = dict()
+        self.part_segmentation_context_nodes = dict()
+        self._part_segmentation_context_vertex_counts = dict()
+        self._part_segmentation_context_colors = dict()
+        self._part_segmentation_context_seg_keys = dict()
+        self.last_part_segmentation_context_update = {}
+        self.part_segmentation_floor_nodes = dict()
+        self.part_segmentation_indexed_counts = dict()
+        self.segmentation_only_nodes = set()
+        self.rgb_only_nodes = set()
+        self.part_segmentation_palette_by_idxc = {}
+        self.last_part_segmentation_update = {}
+        self.last_render_update_stats = {}
         self.dynamic_nodes = dict()  # nodes that live within single frame
         self.external_nodes = dict()  # nodes added by external user
         self.seg_node_map = dict()
@@ -182,12 +231,27 @@ class RasterizerContext:
             self.vverts_nodes,
             self.static_nodes,
             self.external_nodes,
+            self.part_segmentation_nodes,
+            self.part_segmentation_context_nodes,
+            self.part_segmentation_floor_nodes,
         ):
             for external_node in node_registry.values():
                 self.remove_node(external_node)
             node_registry.clear()
         self._per_env_vverts_entity_uids.clear()
         self._fem_surface_vertex_indices.clear()
+        self._part_segmentation_vertex_indices.clear()
+        self.part_segmentation_nodes.clear()
+        self.part_segmentation_context_nodes.clear()
+        self._part_segmentation_context_vertex_counts.clear()
+        self._part_segmentation_context_colors.clear()
+        self._part_segmentation_context_seg_keys.clear()
+        self.last_part_segmentation_context_update.clear()
+        self.part_segmentation_floor_nodes.clear()
+        self.part_segmentation_indexed_counts.clear()
+        self.segmentation_only_nodes.clear()
+        self.rgb_only_nodes.clear()
+        self.part_segmentation_palette_by_idxc.clear()
 
     def reset(self):
         self._t = -1
@@ -870,7 +934,12 @@ class RasterizerContext:
                             )
                             node = self.static_nodes[(idx, pbd_entity.uid)]
                             update_data = self._scene.reorder_vertices(node, new_verts.astype(np.float32))
-                            self.jit.update_buffer(self._scene.get_buffer_id(node, "pos"), update_data)
+                            self.jit.update_buffer(
+                                self._scene.get_buffer_id(node, "pos"),
+                                update_data,
+                                node=node,
+                                buffer_name="pos",
+                            )
                             normal_data = self.jit.update_normal(node, update_data)
                             if normal_data is not None:
                                 self.jit.update_buffer(self._scene.get_buffer_id(node, "normal"), normal_data)
@@ -878,10 +947,20 @@ class RasterizerContext:
                         vverts = vverts_env[pbd_entity.vvert_start : pbd_entity.vvert_end]
                         node = self.static_nodes[(idx, pbd_entity.uid)]
                         update_data = self._scene.reorder_vertices(node, vverts.astype(np.float32))
-                        self.jit.update_buffer(self._scene.get_buffer_id(node, "pos"), update_data)
+                        self.jit.update_buffer(
+                            self._scene.get_buffer_id(node, "pos"),
+                            update_data,
+                            node=node,
+                            buffer_name="pos",
+                        )
                         normal_data = self.jit.update_normal(node, update_data)
                         if normal_data is not None:
-                            self.jit.update_buffer(self._scene.get_buffer_id(node, "normal"), normal_data)
+                            self.jit.update_buffer(
+                                self._scene.get_buffer_id(node, "normal"),
+                                normal_data,
+                                node=node,
+                                buffer_name="normal",
+                            )
 
     def on_fem(self):
         if self.sim.fem_solver.is_active:
@@ -925,12 +1004,158 @@ class RasterizerContext:
                             ),
                             i_b=idx,
                         )
+                        rgb_node = self.static_nodes[node_key]
+                        part_config = getattr(fem_entity, "_part_segmentation_config", None)
+                        if part_config is not None:
+                            self.remove_node_seg(rgb_node)
+                            self.rgb_only_nodes.add(rgb_node)
+                            labels = np.asarray(fem_entity.surface_primitive_part_labels, dtype=np.int64)
+                            if labels.shape != (triangles.shape[0],):
+                                gs.raise_exception(
+                                    f"FEM entity {fem_entity.uid} has {labels.shape} surface part labels, "
+                                    f"expected {(triangles.shape[0],)}."
+                                )
+                            parts = {int(part["part_id"]): part for part in part_config["parts"]}
+                            unknown = sorted(set(int(value) for value in np.unique(labels)) - set(parts))
+                            if unknown:
+                                gs.raise_exception(
+                                    f"FEM entity {fem_entity.uid} surface labels reference unknown part ids {unknown}."
+                                )
+                            entity_vertices = vertices_all[
+                                fem_entity.v_start : fem_entity.v_start + fem_entity.n_vertices, idx
+                            ]
+                            for part_id in sorted(parts):
+                                part_triangles = triangles[labels == part_id]
+                                if part_triangles.shape[0] == 0:
+                                    continue
+                                part_vertices, part_inverse = np.unique(part_triangles.flat, return_inverse=True)
+                                part_vertices = np.ascontiguousarray(part_vertices, dtype=np.int64)
+                                part_faces = np.ascontiguousarray(part_inverse.reshape((-1, 3)), dtype=np.int64)
+                                mesh = trimesh.Trimesh(entity_vertices[part_vertices], part_faces, process=False)
+                                part_mesh = pyrender.Mesh.from_trimesh(
+                                        mesh,
+                                        smooth=True,
+                                        double_sided=fem_entity.surface.double_sided,
+                                    )
+                                primitive = part_mesh.primitives[0]
+                                if primitive.indices is None or primitive.vertex_mapping is not None:
+                                    gs.raise_exception(
+                                        f"FEM entity {fem_entity.uid} part {part_id} segmentation mesh is not indexed."
+                                    )
+                                if primitive.positions.shape[0] != part_vertices.shape[0] or primitive.indices.shape != part_faces.shape:
+                                    gs.raise_exception(
+                                        f"FEM entity {fem_entity.uid} part {part_id} indexed mesh changed vertex/face counts."
+                                    )
+                                part_node = self.add_node(part_mesh)
+                                part_key = (idx, fem_entity.uid, part_id)
+                                self.part_segmentation_nodes[part_key] = part_node
+                                self._part_segmentation_vertex_indices[part_key] = part_vertices
+                                self.segmentation_only_nodes.add(part_node)
+                                self.part_segmentation_indexed_counts[part_key] = {
+                                    "vertex_count": int(primitive.positions.shape[0]),
+                                    "face_count": int(primitive.indices.shape[0]),
+                                    "index_count": int(primitive.indices.size),
+                                    "expanded_vertex_count": 0,
+                                }
+                                seg_key = ("hag4r_part", fem_entity.uid, part_id)
+                                self.create_node_seg(seg_key, part_node)
+                                seg_idxc = self.seg_color_map.key_map[seg_key]
+                                self.part_segmentation_palette_by_idxc[seg_idxc] = np.asarray(
+                                    parts[part_id]["part_color_rgb"], dtype=np.uint8
+                                )
+            self._create_fem_floor_segmentation_proxy(vertices_all)
 
-    def update_fem(self):
+    def _create_fem_floor_segmentation_proxy(self, vertices_all):
+        configured = [
+            entity
+            for entity in self.sim.fem_solver.entities
+            if getattr(entity, "_part_segmentation_config", None) is not None
+        ]
+        if not configured:
+            return
+        palette = configured[0]._part_segmentation_config["context_palette"]
+        for entity in configured[1:]:
+            if entity._part_segmentation_config["context_palette"] != palette:
+                gs.raise_exception("All diagnostic FEM entities must share the same context palette.")
+        positions = np.asarray(vertices_all[:, 0], dtype=np.float32)
+        xy_min = positions[:, :2].min(axis=0)
+        xy_max = positions[:, :2].max(axis=0)
+        center = (xy_min + xy_max) * 0.5
+        extent = np.maximum(xy_max - xy_min, 1.0) * 3.0
+        floor_height = float(self.sim.fem_solver.floor_height)
+        vertices = np.asarray(
+            [
+                [center[0] - extent[0] * 0.5, center[1] - extent[1] * 0.5, floor_height],
+                [center[0] + extent[0] * 0.5, center[1] - extent[1] * 0.5, floor_height],
+                [center[0] + extent[0] * 0.5, center[1] + extent[1] * 0.5, floor_height],
+                [center[0] - extent[0] * 0.5, center[1] + extent[1] * 0.5, floor_height],
+            ],
+            dtype=np.float32,
+        )
+        faces = np.asarray([[0, 1, 2], [0, 2, 3]], dtype=np.int64)
+        mesh = trimesh.Trimesh(vertices, faces, process=False)
+        render_mesh = pyrender.Mesh.from_trimesh(mesh, smooth=True, double_sided=True)
+        primitive = render_mesh.primitives[0]
+        if primitive.indices is None or primitive.positions.shape[0] != 4 or primitive.indices.shape != (2, 3):
+            gs.raise_exception("FEM floor segmentation proxy must remain an indexed two-triangle quad.")
+        node = self.add_node(render_mesh)
+        self.part_segmentation_floor_nodes["fem_floor"] = node
+        self.segmentation_only_nodes.add(node)
+        seg_key = ("hag4r_context", "ground", "fem_floor")
+        self.create_node_seg(seg_key, node)
+        seg_idxc = self.seg_color_map.key_map[seg_key]
+        self.part_segmentation_palette_by_idxc[seg_idxc] = np.asarray(palette["ground"], dtype=np.uint8)
+
+    def update_fem(self, render_pass="rgb"):
         if self.sim.fem_solver.is_active:
             vertices_all, _, _ = self.sim.fem_solver.get_state_render(self.sim.cur_substep_local)
             vertices_all = vertices_all.to_numpy(dtype=gs.np_float)
 
+            if render_pass == "part_segmentation":
+                uploaded_bytes = 0
+                active_nodes = 0
+                for fem_entity in self.sim.fem_solver.entities:
+                    if fem_entity.surface.vis_mode != "visual":
+                        continue
+                    if getattr(fem_entity, "_part_segmentation_config", None) is None:
+                        gs.raise_exception(
+                            f"FEM entity {fem_entity.uid} does not define a part segmentation contract."
+                        )
+                    for idx in self.rendered_envs_idx:
+                        entity_vertices = vertices_all[
+                            fem_entity.v_start : fem_entity.v_start + fem_entity.n_vertices, idx
+                        ]
+                        part_ids = sorted(
+                            key[2]
+                            for key in self.part_segmentation_nodes
+                            if key[0] == idx and key[1] == fem_entity.uid
+                        )
+                        for part_id in part_ids:
+                            part_key = (idx, fem_entity.uid, part_id)
+                            node = self.part_segmentation_nodes[part_key]
+                            vertices = entity_vertices[self._part_segmentation_vertex_indices[part_key]]
+                            update_data = self._scene.reorder_vertices(node, vertices)
+                            self.jit.update_buffer(
+                                self._scene.get_buffer_id(node, "pos"),
+                                update_data,
+                                node=node,
+                                buffer_name="pos",
+                            )
+                            uploaded_bytes += int(update_data.nbytes)
+                            active_nodes += 1
+                self.last_part_segmentation_update = {
+                    "fem_state_fetch_count": 1,
+                    "active_part_node_count": active_nodes,
+                    "position_upload_bytes": uploaded_bytes,
+                    "rgb_fem_state_fetch_count": 0,
+                    "rgb_position_upload_bytes": 0,
+                    "rgb_update_node_count": 0,
+                }
+                self.last_render_update_stats = dict(self.last_part_segmentation_update)
+                return
+
+            uploaded_bytes = 0
+            active_nodes = 0
             for fem_entity in self.sim.fem_solver.entities:
                 if fem_entity.surface.vis_mode == "visual":
                     for idx in self.rendered_envs_idx:
@@ -958,10 +1183,30 @@ class RasterizerContext:
                                 f"FEM entity {fem_entity.uid} update buffer shape {update_data.shape} does not match "
                                 f"rasterizer primitive positions shape {primitive.positions.shape} for node {node_key}."
                             )
-                        self.jit.update_buffer(self._scene.get_buffer_id(node, "pos"), update_data)
+                        self.jit.update_buffer(
+                            self._scene.get_buffer_id(node, "pos"),
+                            update_data,
+                            node=node,
+                            buffer_name="pos",
+                        )
+                        uploaded_bytes += int(update_data.nbytes)
+                        active_nodes += 1
                         normal_data = self.jit.update_normal(node, update_data)
                         if normal_data is not None:
-                            self.jit.update_buffer(self._scene.get_buffer_id(node, "normal"), normal_data)
+                            self.jit.update_buffer(
+                                self._scene.get_buffer_id(node, "normal"),
+                                normal_data,
+                                node=node,
+                                buffer_name="normal",
+                            )
+            self.last_render_update_stats = {
+                "fem_state_fetch_count": 1,
+                "active_rgb_node_count": active_nodes,
+                "position_upload_bytes": uploaded_bytes,
+                "rgb_fem_state_fetch_count": 1,
+                "rgb_position_upload_bytes": uploaded_bytes,
+                "rgb_update_node_count": active_nodes,
+            }
 
     def update_sensors(self):
         self.sim._sensor_manager.draw_debug(self)
@@ -1178,13 +1423,25 @@ class RasterizerContext:
     def clear_debug_objects(self):
         self.clear_external_nodes()
 
-    def update(self, force_render: bool = False):
+    def update(self, force_render: bool = False, render_pass: str = "rgb"):
         # Early return if already updated previously
-        if not force_render and self._t >= self.scene._t:
+        if not force_render and self._t >= self.scene._t and getattr(self, "_last_render_pass", None) == render_pass:
             return
+
+        update_started = time.perf_counter()
 
         # Update current time right away
         self._t = self.scene._t
+        self._last_render_pass = render_pass
+        self.jit.reset_buffer_upload_stats(render_pass)
+
+        if render_pass == "part_segmentation":
+            # The Live diagnostic segmentation pass owns a deliberately tiny visual scene:
+            # fixed part/context topology plus current FEM positions. Camera pose is updated
+            # by Rasterizer.render_camera; unrelated solver and RGB debug branches stay cold.
+            self.update_fem(render_pass=render_pass)
+            self.last_render_update_stats["scene_update_seconds"] = time.perf_counter() - update_started
+            return
 
         # Remove up old dynamic nodes
         self.clear_dynamic_nodes(only_outdated=True)
@@ -1202,12 +1459,13 @@ class RasterizerContext:
         self.update_mpm()
         self.update_sph()
         self.update_pbd()
-        self.update_fem()
+        self.update_fem(render_pass=render_pass)
         self.update_sensors()
 
         # Update camera fructum
         for camera in self.visualizer.cameras:
             self.update_camera_frustum(camera)
+        self.last_render_update_stats["scene_update_seconds"] = time.perf_counter() - update_started
 
     def add_light(self, light):
         # light direction is light pose's -z frame
@@ -1228,6 +1486,100 @@ class RasterizerContext:
 
     def remove_node_seg(self, seg_node):
         self.seg_node_map.pop(seg_node, None)
+
+    def register_part_segmentation_context_entity(self, entity, *, kind, color):
+        color = np.asarray(color, dtype=np.uint8)
+        if color.shape != (3,):
+            gs.raise_exception(f"Part segmentation context color for {kind!r} must have shape (3,).")
+        for geom in entity.vgeoms:
+            node = self.rigid_nodes.get(geom.uid)
+            if node is None:
+                continue
+            self.remove_node_seg(node)
+            seg_key = ("hag4r_context", kind, geom.uid)
+            self.create_node_seg(seg_key, node)
+            seg_idxc = self.seg_color_map.key_map[seg_key]
+            self.part_segmentation_palette_by_idxc[seg_idxc] = color
+            self.segmentation_only_nodes.add(node)
+
+    def replace_part_segmentation_context_boxes(self, records):
+        requested = {}
+        for index, record in enumerate(records):
+            bounds = np.asarray(record["bounds"], dtype=np.float32)
+            color = np.asarray(record["color"], dtype=np.uint8)
+            if bounds.shape != (2, 3) or np.any(bounds[0] > bounds[1]):
+                gs.raise_exception("Part segmentation context box bounds must have shape (2, 3) and be ordered.")
+            key = (str(record["kind"]), str(record.get("controller_id") or index))
+            if key in requested:
+                gs.raise_exception(f"Duplicate part segmentation context box key: {key}.")
+            requested[key] = (bounds, color)
+
+        removed = 0
+        for key in set(self.part_segmentation_context_nodes) - set(requested):
+            node = self.part_segmentation_context_nodes.pop(key)
+            seg_key = self._part_segmentation_context_seg_keys.pop(key)
+            seg_idxc = self.seg_color_map.remove_seg_key(seg_key)
+            if seg_idxc is not None:
+                self.part_segmentation_palette_by_idxc.pop(seg_idxc, None)
+            self._part_segmentation_context_vertex_counts.pop(key, None)
+            self._part_segmentation_context_colors.pop(key, None)
+            self.jit.discard_buffer_updates_for_node(node)
+            self.remove_node_seg(node)
+            self.segmentation_only_nodes.discard(node)
+            self.remove_node(node)
+            removed += 1
+
+        created = 0
+        reused = 0
+        position_upload_bytes = 0
+        for key, (bounds, color) in requested.items():
+            node = self.part_segmentation_context_nodes.get(key)
+            if node is None:
+                wireframe_mesh = _part_segmentation_wireframe_box_mesh(bounds)
+                render_mesh = pyrender.Mesh.from_trimesh(wireframe_mesh, smooth=True, double_sided=True)
+                primitive = render_mesh.primitives[0]
+                if primitive.indices is None:
+                    gs.raise_exception("Part segmentation wireframe context box must remain indexed.")
+                node = self.add_node(render_mesh)
+                self.part_segmentation_context_nodes[key] = node
+                self._part_segmentation_context_vertex_counts[key] = int(primitive.positions.shape[0])
+                self._part_segmentation_context_colors[key] = color.copy()
+                self.segmentation_only_nodes.add(node)
+                seg_key = ("hag4r_context_box", *key)
+                self._part_segmentation_context_seg_keys[key] = seg_key
+                self.create_node_seg(seg_key, node)
+                seg_idxc = self.seg_color_map.key_map[seg_key]
+                self.part_segmentation_palette_by_idxc[seg_idxc] = color.copy()
+                created += 1
+                continue
+
+            if not np.array_equal(color, self._part_segmentation_context_colors[key]):
+                gs.raise_exception(f"Part segmentation context box {key} changed its fixed palette color.")
+            primitive = node.mesh.primitives[0]
+            positions = np.asarray(_part_segmentation_wireframe_box_mesh(bounds).vertices, dtype=np.float32)
+            if positions.shape != primitive.positions.shape:
+                gs.raise_exception(f"Part segmentation context box {key} changed its fixed wireframe topology.")
+            primitive.positions = positions
+            self.jit.update_buffer(
+                self._scene.get_buffer_id(node, "pos"),
+                positions,
+                node=node,
+                buffer_name="pos",
+            )
+            position_upload_bytes += int(positions.nbytes)
+            reused += 1
+
+        self.last_part_segmentation_context_update = {
+            "context_node_create_count": created,
+            "context_node_reuse_count": reused,
+            "context_node_remove_count": removed,
+            "context_position_upload_bytes": position_upload_bytes,
+            "context_wireframe_vertex_count": sum(self._part_segmentation_context_vertex_counts.values()),
+            "context_wireframe_triangle_count": sum(
+                int(node.mesh.primitives[0].indices.shape[0])
+                for node in self.part_segmentation_context_nodes.values()
+            ),
+        }
 
     def seg_idxc_to_idxc_rgb(self, seg_idxc):
         seg_idxc_rgb = np.array(

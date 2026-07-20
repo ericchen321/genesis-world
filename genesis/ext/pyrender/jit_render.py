@@ -205,14 +205,24 @@ class JITRenderer:
         self._update_normal_smooth = None
         self._update_buffer_fn = None
         self._buffer = dict()
+        self.last_buffer_upload_stats = {}
+        self._active_node_signature = None
         self.set_primitive(scene, node_list, primitive_list)
         self.set_light(scene, scene.light_nodes, scene.ambient_light)
         self.reflection_mat = np.identity(4, np.float32)
 
-    def update(self, scene):
-        if scene.meshes_updated:
+    def update(self, scene, *, active_nodes=None, excluded_nodes=None):
+        active_nodes = None if active_nodes is None else frozenset(active_nodes)
+        excluded_nodes = frozenset() if excluded_nodes is None else frozenset(excluded_nodes)
+        active_node_signature = (
+            None if active_nodes is None else frozenset(id(node) for node in active_nodes),
+            frozenset(id(node) for node in excluded_nodes),
+        )
+        if scene.meshes_updated or active_node_signature != self._active_node_signature:
             node_list, primitive_list = [], []
             for node in scene.sorted_mesh_nodes():
+                if node in excluded_nodes or (active_nodes is not None and node not in active_nodes):
+                    continue
                 mesh = node.mesh
                 if not mesh.is_visible:
                     continue
@@ -221,6 +231,7 @@ class JITRenderer:
                     primitive_list.append(primitive)
             self.set_primitive(scene, node_list, primitive_list)
             scene.reset_meshes_updated()
+            self._active_node_signature = active_node_signature
         else:
             # TODO: more efficient pose update
             for i, node in enumerate(self.node_list):
@@ -979,10 +990,16 @@ class JITRenderer:
         floor_tex=0,
         env_idx=-1,
         markers_only=False,
+        excluded_nodes=None,
     ):
         self.load_programs(renderer, flags, program_flags)
         if self._forward_pass is None:
             self.gen_func_ptr()
+        excluded_mask = None
+        if excluded_nodes:
+            excluded_mask = np.asarray([node in excluded_nodes for node in self.node_list], dtype=bool)
+            saved_excluded_indices = self.n_indices[excluded_mask].copy()
+            self.n_indices[excluded_mask] = 0
         # Temporarily hide markers for non-debug offscreen cameras by setting their
         # index count to 0, so draw calls render nothing for these nodes.
         if flags & RenderFlags.SKIP_MARKERS:
@@ -1028,11 +1045,18 @@ class JITRenderer:
             self.n_indices[marker_mask] = saved_n_indices
         if markers_only:
             self.n_indices[non_marker_mask] = saved_non_marker_indices
+        if excluded_mask is not None:
+            self.n_indices[excluded_mask] = saved_excluded_indices
 
-    def shadow_mapping_pass(self, renderer, V, P, flags, program_flags, env_idx=-1):
+    def shadow_mapping_pass(self, renderer, V, P, flags, program_flags, env_idx=-1, excluded_nodes=None):
         self.load_programs(renderer, flags, program_flags)
         if self._shadow_mapping_pass is None:
             self.gen_func_ptr()
+        excluded_mask = None
+        if excluded_nodes:
+            excluded_mask = np.asarray([node in excluded_nodes for node in self.node_list], dtype=bool)
+            saved_excluded_indices = self.n_indices[excluded_mask].copy()
+            self.n_indices[excluded_mask] = 0
         with self._env_filtered_culling(env_idx):
             self._shadow_mapping_pass(
                 self.vao_id,
@@ -1050,11 +1074,27 @@ class JITRenderer:
                 self.env_active,
                 self.gl.wrapper_instance,
             )
+        if excluded_mask is not None:
+            self.n_indices[excluded_mask] = saved_excluded_indices
 
-    def point_shadow_mapping_pass(self, renderer, light_matrix, light_pos, flags, program_flags, env_idx=-1):
+    def point_shadow_mapping_pass(
+        self,
+        renderer,
+        light_matrix,
+        light_pos,
+        flags,
+        program_flags,
+        env_idx=-1,
+        excluded_nodes=None,
+    ):
         self.load_programs(renderer, flags, program_flags)
         if self._point_shadow_mapping_pass is None:
             self.gen_func_ptr()
+        excluded_mask = None
+        if excluded_nodes:
+            excluded_mask = np.asarray([node in excluded_nodes for node in self.node_list], dtype=bool)
+            saved_excluded_indices = self.n_indices[excluded_mask].copy()
+            self.n_indices[excluded_mask] = 0
         with self._env_filtered_culling(env_idx):
             self._point_shadow_mapping_pass(
                 self.vao_id,
@@ -1072,6 +1112,8 @@ class JITRenderer:
                 self.env_active,
                 self.gl.wrapper_instance,
             )
+        if excluded_mask is not None:
+            self.n_indices[excluded_mask] = saved_excluded_indices
 
     def update_normal(self, node, vertices):
         primitive = node.mesh.primitives[0]
@@ -1087,29 +1129,79 @@ class JITRenderer:
                 self.gen_func_ptr()
             return self._update_normal_flat(vertices.reshape((-1, 3, 3)))
 
-    def update_buffer(self, buffer_id, data):
-        """Queue a single buffer update to be flushed during the next render pass."""
-        self._buffer[buffer_id] = data
+    def reset_buffer_upload_stats(self, render_pass):
+        self.last_buffer_upload_stats = {
+            "render_pass": render_pass,
+            "actual_buffer_upload_count": 0,
+            "actual_buffer_upload_bytes": 0,
+            "actual_inactive_buffer_upload_count": 0,
+            "actual_inactive_buffer_upload_bytes": 0,
+            "skipped_inactive_buffer_count": 0,
+            "skipped_inactive_buffer_bytes": 0,
+        }
 
-    def flush_buffer(self):
-        """Upload all queued buffer updates to the GPU and clear the queue."""
+    def update_buffer(self, buffer_id, data, *, node=None, buffer_name=None):
+        """Queue one buffer update, retaining node identity for pass-exclusive flushing."""
+        if (node is None) != (buffer_name is None):
+            raise ValueError("node and buffer_name must either both be provided or both be omitted")
+        key = (node, buffer_name) if node is not None else (None, int(buffer_id))
+        self._buffer[key] = (int(buffer_id), data, node, buffer_name)
+
+    def discard_buffer_updates_for_node(self, node):
+        for key, (_buffer_id, _data, queued_node, _buffer_name) in tuple(self._buffer.items()):
+            if queued_node is node:
+                del self._buffer[key]
+
+    def flush_buffer(self, *, active_nodes=None, excluded_nodes=None, render_pass="rgb"):
+        """Upload queued updates for active nodes and report bytes from the actual GL path."""
         if not self._buffer:
-            return
+            return self.last_buffer_upload_stats
 
-        updates = np.zeros((len(self._buffer), 3), dtype=np.int64)
-        buffers = []
-        for idx, (id, data) in enumerate(self._buffer.items()):
+        active_nodes = None if active_nodes is None else frozenset(active_nodes)
+        excluded_nodes = frozenset() if excluded_nodes is None else frozenset(excluded_nodes)
+        accepted = []
+        skipped_count = 0
+        skipped_bytes = 0
+        for buffer_id, data, node, buffer_name in self._buffer.values():
             buffer = np.ascontiguousarray(data, dtype=np.float32)
+            inactive = node is not None and (
+                node in excluded_nodes or (active_nodes is not None and node not in active_nodes)
+            )
+            if inactive:
+                skipped_count += 1
+                skipped_bytes += int(buffer.nbytes)
+                continue
+            if node is not None:
+                buffer_id = node.mesh.primitives[0].get_buffer_id(buffer_name)
+                if buffer_id < 0:
+                    raise RuntimeError(
+                        f"Active render node has no allocated {buffer_name!r} buffer after context update."
+                    )
+            accepted.append((buffer_id, buffer))
+
+        updates = np.zeros((len(accepted), 3), dtype=np.int64)
+        buffers = []
+        for idx, (buffer_id, buffer) in enumerate(accepted):
             buffers.append(buffer)
 
-            updates[idx, 0] = id
+            updates[idx, 0] = buffer_id
             updates[idx, 1] = 4 * buffer.size
             updates[idx, 2] = buffer.ctypes.data
 
-        if self._update_buffer_fn is None:
-            self.gen_func_ptr()
-        self._update_buffer_fn(updates, self.gl.wrapper_instance)
+        if accepted:
+            if self._update_buffer_fn is None:
+                self.gen_func_ptr()
+            self._update_buffer_fn(updates, self.gl.wrapper_instance)
         self._buffer.clear()
+        stats = self.last_buffer_upload_stats
+        if stats.get("render_pass") != render_pass:
+            self.reset_buffer_upload_stats(render_pass)
+            stats = self.last_buffer_upload_stats
+        stats["actual_buffer_upload_count"] += len(accepted)
+        stats["actual_buffer_upload_bytes"] += sum(buffer.nbytes for _, buffer in accepted)
+        stats["skipped_inactive_buffer_count"] += skipped_count
+        stats["skipped_inactive_buffer_bytes"] += skipped_bytes
+        return stats
 
     def read_depth_buf(self, weight, height, z_near, z_far):
         if self._read_depth_buf is None:

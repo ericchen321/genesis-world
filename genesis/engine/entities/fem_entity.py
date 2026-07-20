@@ -212,6 +212,11 @@ class FEMEntity(Entity):
         backend_mu, backend_lam = hmu._surface_lame2d_from_e_nu(backend_E, backend_nu)
         thickness_by_triangle = np.asarray(material_data.thickness, dtype=np.float64)[face_remap]
         area_density_by_triangle = np.asarray(material_data.area_density, dtype=np.float64)[face_remap]
+        labels_by_triangle = (
+            None
+            if material_data.labels is None
+            else np.asarray(material_data.labels, dtype=gs.np_int)[face_remap]
+        )
 
         p0 = vertices[faces[:, 0]]
         p1 = vertices[faces[:, 1]]
@@ -266,6 +271,7 @@ class FEMEntity(Entity):
             "lambda_by_triangle": backend_lam,
             "mu_by_triangle": backend_mu,
             "thickness_by_triangle": thickness_by_triangle,
+            "labels": labels_by_triangle,
             "area_density_by_triangle": area_density_by_triangle,
             "area_by_triangle": area_by_triangle,
             "mass_by_triangle": mass_by_triangle,
@@ -475,12 +481,21 @@ class FEMEntity(Entity):
 
             self.set_muscle_direction(muscle_direction)
 
-    def get_state(self):
+    def get_state(self, *, track_grad=True):
+        """Return the current FEM state.
+
+        Parameters
+        ----------
+        track_grad : bool, optional
+            Register the returned state for backward propagation. Diagnostic/read-only
+            callers may disable registration to avoid retaining state tensors.
+        """
         state = FEMEntityState(self, self._sim.cur_step_global)
         self.get_frame(self._sim.cur_substep_local, state.pos, state.vel, state.active)
 
         # we store all queried states to track gradient flow
-        self._queried_states.append(state)
+        if track_grad:
+            self._queried_states.append(state)
 
         return state
 
@@ -1400,6 +1415,21 @@ class FEMEntity(Entity):
     def surface_triangle_tet_indices(self):
         """Tetrahedron owner index for each surface triangle."""
         return self._surface_el_np
+
+    @property
+    def surface_primitive_part_labels(self):
+        """Fixed part label for each rendered boundary triangle."""
+        if self._surface_heterogeneous_backend_arrays is not None:
+            labels = self._surface_heterogeneous_backend_arrays.get("labels")
+            if labels is None:
+                gs.raise_exception("Surface heterogeneous material is missing tri_part_labels.")
+            return np.asarray(labels, dtype=gs.np_int)
+        if self._heterogeneous_material_np is None or self._heterogeneous_material_np.labels is None:
+            gs.raise_exception("Volumetric heterogeneous material is missing tet_part_labels.")
+        owners = np.asarray(self.surface_triangle_tet_indices, dtype=np.int64)
+        if owners.shape != (self.n_surfaces,) or np.any((owners < 0) | (owners >= self.n_elements)):
+            gs.raise_exception("FEM surface triangle owner indices are invalid for part segmentation.")
+        return np.asarray(self._heterogeneous_material_np.labels, dtype=gs.np_int)[owners]
 
     @property
     def boundary_vertex_indices(self):

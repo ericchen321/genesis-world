@@ -4,15 +4,22 @@ from pathlib import Path
 
 import igl
 import numpy as np
+import pytest
+import torch
 from PIL import Image
 
+from genesis.ext import pyrender
+from genesis.live import visual_telemetry
 from genesis.live.session import GenesisLiveSession
 from genesis.live.visual_telemetry import (
     ANCHOR_DEBUG_BOX_COLOR,
     CONTROLLER_DEBUG_BOX_COLOR,
     DEBUG_BOX_WIREFRAME_RADIUS,
     GENESIS_NATIVE_DEBUG_CAMERA_RENDERER,
+    _entity_positions,
+    _triptych_camera_pose,
 )
+from genesis.vis.rasterizer_context import RasterizerContext, SegmentationColorMap
 
 _TWO_TET_VERTS = np.array(
     [
@@ -63,7 +70,146 @@ def _assert_vec3(values):
     assert all(np.isfinite(float(value)) for value in values)
 
 
-def test_rgb_triptych_writes_panels_stitched_metadata_and_visible_overlays(tmp_path):
+def test_triptych_camera_poses_follow_physical_z_up_frame():
+    bbox_min = np.array([-2.0, -1.0, -0.25], dtype=np.float32)
+    bbox_max = np.array([2.0, 3.0, 1.25], dtype=np.float32)
+    center = (bbox_min + bbox_max) * 0.5
+
+    poses = {label: _triptych_camera_pose(label, bbox_min, bbox_max) for label in ("top", "northeast", "southwest")}
+    positions = {label: np.asarray(pose["pos"], dtype=np.float32) for label, pose in poses.items()}
+
+    profile_offset = positions["top"] - center
+    assert profile_offset[1] > 0.0
+    np.testing.assert_allclose(profile_offset[[0, 2]], (0.0, 0.0), atol=1e-6)
+    np.testing.assert_allclose(poses["top"]["up"], (0.0, 0.0, -1.0), atol=1e-6)
+
+    for label in ("northeast", "southwest"):
+        assert positions[label][2] > bbox_max[2]
+
+    northeast_xy = positions["northeast"][:2] - center[:2]
+    southwest_xy = positions["southwest"][:2] - center[:2]
+    np.testing.assert_allclose(northeast_xy, -southwest_xy, atol=1e-6)
+    assert np.all(northeast_xy > 0.0)
+    assert np.all(southwest_xy < 0.0)
+
+
+def test_part_segmentation_context_boxes_reuse_stable_indexed_nodes():
+    class FakeJit:
+        def __init__(self):
+            self.updates = []
+            self.discarded = []
+
+        def update_buffer(self, buffer_id, data, **kwargs):
+            self.updates.append((buffer_id, np.asarray(data).copy(), kwargs))
+
+        def discard_buffer_updates_for_node(self, node):
+            self.discarded.append(node)
+
+    context = RasterizerContext.__new__(RasterizerContext)
+    context._scene = pyrender.Scene()
+    context.jit = FakeJit()
+    context.part_segmentation_context_nodes = {}
+    context._part_segmentation_context_vertex_counts = {}
+    context._part_segmentation_context_colors = {}
+    context._part_segmentation_context_seg_keys = {}
+    context.last_part_segmentation_context_update = {}
+    context.segmentation_only_nodes = set()
+    context.seg_node_map = {}
+    context.seg_color_map = SegmentationColorMap()
+    context.part_segmentation_palette_by_idxc = {}
+    context.add_node = lambda mesh: context._scene.add(mesh)
+    context.remove_node = context._scene.remove_node
+
+    initial = [
+        {"kind": "fixture", "controller_id": "anchor", "bounds": [[0, 0, 0], [1, 1, 1]], "color": [1, 2, 3]},
+        {"kind": "probe", "controller_id": "probe", "bounds": [[2, 2, 2], [3, 3, 3]], "color": [4, 5, 6]},
+    ]
+    context.replace_part_segmentation_context_boxes(initial)
+    nodes = dict(context.part_segmentation_context_nodes)
+    old_positions = {
+        key: node.mesh.primitives[0].positions.copy() for key, node in context.part_segmentation_context_nodes.items()
+    }
+    probe_seg_key = context._part_segmentation_context_seg_keys[("probe", "probe")]
+    probe_seg_idxc = context.seg_color_map.key_map[probe_seg_key]
+    assert context.last_part_segmentation_context_update == {
+        "context_node_create_count": 2,
+        "context_node_reuse_count": 0,
+        "context_node_remove_count": 0,
+        "context_position_upload_bytes": 0,
+        "context_wireframe_vertex_count": 192,
+        "context_wireframe_triangle_count": 288,
+    }
+    assert all(node.mesh.primitives[0].indices is not None for node in nodes.values())
+    assert all(node.mesh.primitives[0].positions.shape == (96, 3) for node in nodes.values())
+    assert all(node.mesh.primitives[0].indices.shape == (144, 3) for node in nodes.values())
+
+    moved = [
+        {**initial[0], "bounds": [[0.5, 0, 0], [1.5, 1, 1]]},
+        {**initial[1], "bounds": [[2, 2.5, 2], [3, 3.5, 3]]},
+    ]
+    context.replace_part_segmentation_context_boxes(moved)
+    assert context.part_segmentation_context_nodes == nodes
+    assert context.last_part_segmentation_context_update == {
+        "context_node_create_count": 0,
+        "context_node_reuse_count": 2,
+        "context_node_remove_count": 0,
+        "context_position_upload_bytes": 2304,
+        "context_wireframe_vertex_count": 192,
+        "context_wireframe_triangle_count": 288,
+    }
+    assert len(context.jit.updates) == 2
+    for key, node in nodes.items():
+        assert not np.array_equal(node.mesh.primitives[0].positions, old_positions[key])
+    assert {update[2]["node"] for update in context.jit.updates} == set(nodes.values())
+    assert all(update[2]["buffer_name"] == "pos" for update in context.jit.updates)
+
+    context.replace_part_segmentation_context_boxes(moved[:1])
+    assert context.part_segmentation_context_nodes[("fixture", "anchor")] is nodes[("fixture", "anchor")]
+    assert context.last_part_segmentation_context_update == {
+        "context_node_create_count": 0,
+        "context_node_reuse_count": 1,
+        "context_node_remove_count": 1,
+        "context_position_upload_bytes": 1152,
+        "context_wireframe_vertex_count": 96,
+        "context_wireframe_triangle_count": 144,
+    }
+    assert context.jit.discarded == [nodes[("probe", "probe")]]
+    assert probe_seg_idxc not in context.part_segmentation_palette_by_idxc
+    assert probe_seg_key not in context.seg_color_map.key_map
+
+
+def test_fem_state_default_tracks_but_telemetry_position_query_does_not(tmp_path):
+    session = GenesisLiveSession(
+        scene_config_path=str(_write_scene_config(tmp_path)),
+        start_paused=True,
+        output_dir=str(tmp_path / "outputs"),
+    )
+    entity = session.entities["body"]
+    entity._queried_states.clear()
+
+    tracked_state = entity.get_state()
+    step = entity._sim.cur_step_global
+    assert step in entity._queried_states
+    assert tracked_state in entity._queried_states[step]
+
+    entity._queried_states.clear()
+    positions = _entity_positions(entity)
+    assert positions.shape == (entity.n_vertices, 3)
+    assert entity._queried_states.states == {}
+
+
+def test_rgb_triptych_writes_panels_stitched_metadata_and_visible_overlays(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+):
+    render_grad_states = []
+    original_render_camera_rgb = visual_telemetry._render_camera_rgb
+
+    def render_camera_rgb_without_grad(*args, **kwargs):
+        render_grad_states.append(torch.is_grad_enabled())
+        return original_render_camera_rgb(*args, **kwargs)
+
+    monkeypatch.setattr(visual_telemetry, "_render_camera_rgb", render_camera_rgb_without_grad)
     session = GenesisLiveSession(
         scene_config_path=str(_write_scene_config(tmp_path)),
         start_paused=True,
@@ -108,6 +254,7 @@ def test_rgb_triptych_writes_panels_stitched_metadata_and_visible_overlays(tmp_p
         "northeast": True,
         "southwest": True,
     }
+    assert render_grad_states == [False, False, False]
     assert metadata["panel_order"] == ["top", "northeast", "southwest"]
     assert set(metadata["panel_paths"]) == {"top", "northeast", "southwest"}
     assert Path(metadata["metadata_path"]).exists()

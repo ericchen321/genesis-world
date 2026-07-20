@@ -14,6 +14,7 @@ MAX_MESSAGE_BYTES = 64 * 1024 * 1024
 BASE_CAPABILITIES = (
     "pause_resume_reset",
     "rgb_triptych_telemetry",
+    "part_segmentation_triptych_telemetry",
     "frame_metadata",
     "geometry_context",
     "fused_observation",

@@ -116,7 +116,18 @@ class Renderer(object):
     def point_size(self, value):
         self._point_size = float(value)
 
-    def render(self, scene, flags, seg_node_map=None, *, is_first_pass=True, force_skip_shadows=False):
+    def render(
+        self,
+        scene,
+        flags,
+        seg_node_map=None,
+        *,
+        is_first_pass=True,
+        force_skip_shadows=False,
+        excluded_nodes=None,
+        active_nodes=None,
+        render_pass="rgb",
+    ):
         """Render a scene with the given set of flags.
 
         Parameters
@@ -142,13 +153,17 @@ class Renderer(object):
         """
         # Update context with meshes and textures
         if is_first_pass:
-            self._update_context(scene, flags)
-            all_ready = self.jit.update(scene)
+            self._update_context(scene, flags, active_nodes=active_nodes, excluded_nodes=excluded_nodes)
+            all_ready = self.jit.update(scene, active_nodes=active_nodes, excluded_nodes=excluded_nodes)
 
             # Flush queued buffer updates AFTER jit.update(scene) so that new
             # nodes created by set_primitive -> _add_to_context already have
             # their GPU buffers allocated and can receive the data.
-            self.jit.flush_buffer()
+            self.jit.flush_buffer(
+                active_nodes=active_nodes,
+                excluded_nodes=excluded_nodes,
+                render_pass=render_pass,
+            )
 
             if not all_ready:
                 # Shadow textures not yet initialized - skip this frame to avoid
@@ -181,15 +196,33 @@ class Renderer(object):
                         take_pass = True
                     if take_pass:
                         if isinstance(ln.light, PointLight):
-                            self._point_shadow_mapping_pass(scene, ln, flags, env_idx=env_idx)
+                            self._point_shadow_mapping_pass(
+                                scene,
+                                ln,
+                                flags,
+                                env_idx=env_idx,
+                                excluded_nodes=excluded_nodes,
+                            )
                         else:
-                            self._shadow_mapping_pass(scene, ln, flags, env_idx=env_idx)
+                            self._shadow_mapping_pass(
+                                scene,
+                                ln,
+                                flags,
+                                env_idx=env_idx,
+                                excluded_nodes=excluded_nodes,
+                            )
                         glBindFramebuffer(GL_FRAMEBUFFER, 0)
 
             if flags & RenderFlags.REFLECTIVE_FLOOR:
                 self._floor_pass(scene, flags, env_idx=env_idx)
 
-            retval = self._forward_pass(scene, flags, seg_node_map=seg_node_map, env_idx=env_idx)
+            retval = self._forward_pass(
+                scene,
+                flags,
+                seg_node_map=seg_node_map,
+                env_idx=env_idx,
+                excluded_nodes=excluded_nodes,
+            )
             if retval is not None:
                 if retval_list is None:
                     retval_list = tuple([val] for val in retval)
@@ -379,7 +412,7 @@ class Renderer(object):
             env_idx=env_idx,
         )
 
-    def _forward_pass(self, scene, flags, seg_node_map=None, env_idx=-1):
+    def _forward_pass(self, scene, flags, seg_node_map=None, env_idx=-1, excluded_nodes=None):
         # Set up viewport for render
         self._configure_forward_pass_viewport(flags)
 
@@ -405,7 +438,7 @@ class Renderer(object):
         floor_tex = self._floor_texture_color._texid if flags & RenderFlags.REFLECTIVE_FLOOR else 0
         screen_size = np.array([self.viewport_width, self.viewport_height], np.float32)
 
-        common_kwargs = dict(env_idx=env_idx)
+        common_kwargs = dict(env_idx=env_idx, excluded_nodes=excluded_nodes)
         if flags & RenderFlags.SEG:
             color_list = np.zeros((len(self.jit.node_list), 3), np.float32)
             for i, node in enumerate(self.jit.node_list):
@@ -488,7 +521,7 @@ class Renderer(object):
         self.jit.pbr_mat[marker_mask] = saved_pbr_mat
         self.jit.render_flags[marker_mask, 0] = saved_blend_flags
 
-    def _point_shadow_mapping_pass(self, scene, light_node, flags, env_idx=-1):
+    def _point_shadow_mapping_pass(self, scene, light_node, flags, env_idx=-1, excluded_nodes=None):
         light = light_node.light
         position = scene.get_pose(light_node)[:3, 3]
         camera = light._get_shadow_camera(scene.scale)
@@ -499,10 +532,16 @@ class Renderer(object):
         self._configure_point_shadow_mapping_viewport(light, flags)
 
         self.jit.point_shadow_mapping_pass(
-            self, light_matrix, position, flags, ProgramFlags.POINT_SHADOW, env_idx=env_idx
+            self,
+            light_matrix,
+            position,
+            flags,
+            ProgramFlags.POINT_SHADOW,
+            env_idx=env_idx,
+            excluded_nodes=excluded_nodes,
         )
 
-    def _shadow_mapping_pass(self, scene, light_node, flags, env_idx=-1):
+    def _shadow_mapping_pass(self, scene, light_node, flags, env_idx=-1, excluded_nodes=None):
         light = light_node.light
 
         # Set up viewport for render
@@ -511,7 +550,15 @@ class Renderer(object):
         # Set up camera matrices
         V, P = self._get_light_cam_matrices(scene, light_node, flags)
 
-        self.jit.shadow_mapping_pass(self, V, P, flags, ProgramFlags.NONE, env_idx=env_idx)
+        self.jit.shadow_mapping_pass(
+            self,
+            V,
+            P,
+            flags,
+            ProgramFlags.NONE,
+            env_idx=env_idx,
+            excluded_nodes=excluded_nodes,
+        )
 
     def _normal_pass(self, scene, flags, env_idx=-1):
         # Set up viewport for render
@@ -669,39 +716,53 @@ class Renderer(object):
     # Context Management
     ###########################################################################
 
-    def _update_context(self, scene, flags):
-        # Get existing and new meshes
-        scene_meshes_new = scene.meshes.copy()
+    def _update_context(self, scene, flags, *, active_nodes=None, excluded_nodes=None):
+        # Allocate only meshes participating in this pass. Already-allocated meshes stay resident
+        # until they leave the scene, avoiding cross-camera ownership churn.
+        excluded_nodes = frozenset() if excluded_nodes is None else frozenset(excluded_nodes)
+        active_nodes = None if active_nodes is None else frozenset(active_nodes)
+        scene_meshes_all = scene.meshes.copy()
+        scene_meshes_active = {
+            node.mesh
+            for node in scene.mesh_nodes
+            if node not in excluded_nodes and (active_nodes is None or node in active_nodes)
+        }
         scene_meshes_old = self._meshes
 
         # Remove from context old meshes that are now irrelevant
-        for mesh in scene_meshes_old - scene_meshes_new:
+        for mesh in scene_meshes_old - scene_meshes_all:
             for p in mesh.primitives:
                 p.delete()
 
-        # Update set of meshes right away, so that the context can be cleaned up correctly in case of failure
-        self._meshes = scene_meshes_new
+        # Track resident resources. Exclusion suppresses allocation for this pass but does not evict
+        # a mesh that another camera/pass may still own.
+        self._meshes = (scene_meshes_old & scene_meshes_all) | scene_meshes_active
 
         # Add new meshes to context
-        for mesh in scene_meshes_new - scene_meshes_old:
+        for mesh in scene_meshes_active - scene_meshes_old:
             for p in mesh.primitives:
                 p._add_to_context()
 
         # Update mesh textures
         mesh_textures = set()
-        for m in scene_meshes_new:
+        for m in scene_meshes_active:
             for p in m.primitives:
                 mesh_textures |= p.material.textures
+
+        resident_mesh_textures = set()
+        for m in self._meshes:
+            for p in m.primitives:
+                resident_mesh_textures |= p.material.textures
 
         # Add new textures to context
         for texture in mesh_textures - self._mesh_textures:
             texture._add_to_context()
 
         # Remove old textures from context
-        for texture in self._mesh_textures - mesh_textures:
+        for texture in self._mesh_textures - resident_mesh_textures:
             texture.delete()
 
-        self._mesh_textures = mesh_textures.copy()
+        self._mesh_textures = (self._mesh_textures & resident_mesh_textures) | mesh_textures
 
         shadow_textures = set()
         for l in scene.lights:
