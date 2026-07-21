@@ -89,6 +89,34 @@ def _native_constraint_slice(scene, entity):
 
 
 @pytest.mark.required
+@pytest.mark.parametrize(("enable_floor", "expected_to_move_down"), ((True, False), (False, True)))
+def test_legacy_fem_floor_can_be_disabled(enable_floor, expected_to_move_down, show_viewer):
+    scene = gs.Scene(
+        sim_options=gs.options.SimOptions(dt=0.01, substeps=1, gravity=(0.0, 0.0, 0.0)),
+        fem_options=gs.options.FEMOptions(enable_floor=enable_floor),
+        coupler_options=gs.options.LegacyCouplerOptions(),
+        show_viewer=show_viewer,
+        show_FPS=False,
+    )
+    body = scene.add_entity(
+        morph=gs.morphs.Box(size=(0.1, 0.1, 0.1), pos=(0.0, 0.0, -0.5)),
+        material=gs.materials.FEM.Elastic(E=1.0e4, rho=1000.0),
+    )
+    scene.build()
+    assert scene.fem_solver.enable_floor is enable_floor
+
+    body.set_velocity((0.0, 0.0, -0.5))
+    initial_z = float(body.get_state().pos[..., 2].mean())
+    scene.step(update_visualizer=False)
+    final_z = float(body.get_state().pos[..., 2].mean())
+
+    if expected_to_move_down:
+        assert final_z < initial_z - 1.0e-4
+    else:
+        assert final_z > initial_z - 1.0e-3
+
+
+@pytest.mark.required
 def test_interior_tetrahedralized_vertex(cube_verts_and_faces, box_obj_path, show_viewer):
     """
     Test tetrahedralization of a FEM entity with a small maxvolume value that introduces

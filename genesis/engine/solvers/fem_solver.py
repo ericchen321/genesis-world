@@ -32,6 +32,7 @@ class FEMSolver(Solver):
 
         # options
         self._floor_height = options.floor_height
+        self._enable_floor = options.enable_floor
         self._damping = options.damping
         self._use_implicit_solver = options.use_implicit_solver
         self._n_newton_iterations = options.n_newton_iterations
@@ -1482,6 +1483,10 @@ class FEMSolver(Solver):
     @property
     def floor_height(self):
         return self._floor_height
+
+    @property
+    def enable_floor(self):
+        return self._enable_floor
 
     @property
     def damping(self):

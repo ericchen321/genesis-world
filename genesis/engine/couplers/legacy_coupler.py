@@ -687,17 +687,19 @@ class LegacyCoupler(RBC):
                             self.fem_solver.elements_v[f + 1, iv, i_b].vel = vel_fem_sv
 
                 # boundary condition
-                for j in qd.static(range(3)):
-                    iv = self.fem_solver.surface[i_s].tri2v[j]
-                    _, self.fem_solver.elements_v[f + 1, iv, i_b].vel = self.fem_solver.boundary.impose_pos_vel(
-                        self.fem_solver.elements_v[f, iv, i_b].pos, self.fem_solver.elements_v[f + 1, iv, i_b].vel
-                    )
+                if qd.static(self.fem_solver.enable_floor):
+                    for j in qd.static(range(3)):
+                        iv = self.fem_solver.surface[i_s].tri2v[j]
+                        _, self.fem_solver.elements_v[f + 1, iv, i_b].vel = self.fem_solver.boundary.impose_pos_vel(
+                            self.fem_solver.elements_v[f, iv, i_b].pos,
+                            self.fem_solver.elements_v[f + 1, iv, i_b].vel,
+                        )
 
     def fem_hydroelastic(self, f: qd.i32):
         # Floor contact
-
-        # collision detection
-        self.fem_solver.floor_hydroelastic_detection(f)
+        if qd.static(self.fem_solver.enable_floor):
+            # collision detection
+            self.fem_solver.floor_hydroelastic_detection(f)
 
     @qd.kernel
     def sph_rigid(

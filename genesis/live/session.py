@@ -102,7 +102,9 @@ class GenesisLiveSession:
             morph_type = morph_cfg.get("type")
             material_type = material_cfg.get("type", "elastic")
             if entity_cfg.get("part_segmentation") is not None:
-                self._validate_part_segmentation_contract(entity_cfg["part_segmentation"], entity_index=index)
+                entity_cfg["part_segmentation"] = self._validate_part_segmentation_contract(
+                    entity_cfg["part_segmentation"], entity_index=index
+                )
             if morph_type == "surface_mesh":
                 if material_type not in {"surface_shell", "cloth"}:
                     raise GenesisLiveError(
@@ -134,7 +136,7 @@ class GenesisLiveSession:
                         details={"entity_index": index, "material_type": material_type},
                     )
 
-    def _validate_part_segmentation_contract(self, config: Any, *, entity_index: int) -> None:
+    def _validate_part_segmentation_contract(self, config: Any, *, entity_index: int) -> dict[str, Any]:
         if not isinstance(config, dict):
             raise GenesisLiveError(
                 "invalid_part_segmentation",
@@ -196,7 +198,12 @@ class GenesisLiveSession:
         if len(set(part_ids)) != len(part_ids) or set(np.unique(labels).tolist()) != set(part_ids):
             raise GenesisLiveError("invalid_part_segmentation", "part ids must exactly cover primitive labels")
         context_palette = config["context_palette"]
-        if not isinstance(context_palette, dict) or set(context_palette) != {"background", "ground", "fixture", "probe"}:
+        active_context_keys = {"background", "fixture", "probe"}
+        archived_context_keys = active_context_keys | {"ground"}
+        if not isinstance(context_palette, dict):
+            raise GenesisLiveError("invalid_part_segmentation", "context_palette has invalid categories")
+        context_keys = set(context_palette)
+        if context_keys != active_context_keys and context_keys != archived_context_keys:
             raise GenesisLiveError("invalid_part_segmentation", "context_palette has invalid categories")
         context_colors = {}
         for kind, raw_color in context_palette.items():
@@ -218,6 +225,12 @@ class GenesisLiveSession:
                 "context palette colors conflict with asset part colors",
                 details={"conflicts": conflicts},
             )
+        normalized = dict(config)
+        normalized["context_palette"] = {
+            kind: list(context_colors[kind]) for kind in ("background", "fixture", "probe")
+        }
+        return normalized
+
     def _validate_surface_obj_faces(self, mesh_file: str | Path, *, entity_index: int) -> np.ndarray:
         path = Path(mesh_file)
         if path.suffix.lower() != ".obj":
@@ -348,6 +361,7 @@ class GenesisLiveSession:
         sim_options = self._scene_config.get("sim_options", {})
         fem_options = {"enable_vertex_constraints": True}
         fem_options.update(self._scene_config.get("fem_options", {}))
+        fem_options["enable_floor"] = False
         scene_kwargs = {
             "show_viewer": False,
             "sim_options": gs.options.SimOptions(**sim_options),

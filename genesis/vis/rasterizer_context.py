@@ -149,7 +149,6 @@ class RasterizerContext:
         self._part_segmentation_context_colors = dict()
         self._part_segmentation_context_seg_keys = dict()
         self.last_part_segmentation_context_update = {}
-        self.part_segmentation_floor_nodes = dict()
         self.part_segmentation_indexed_counts = dict()
         self.segmentation_only_nodes = set()
         self.rgb_only_nodes = set()
@@ -233,7 +232,6 @@ class RasterizerContext:
             self.external_nodes,
             self.part_segmentation_nodes,
             self.part_segmentation_context_nodes,
-            self.part_segmentation_floor_nodes,
         ):
             for external_node in node_registry.values():
                 self.remove_node(external_node)
@@ -247,7 +245,6 @@ class RasterizerContext:
         self._part_segmentation_context_colors.clear()
         self._part_segmentation_context_seg_keys.clear()
         self.last_part_segmentation_context_update.clear()
-        self.part_segmentation_floor_nodes.clear()
         self.part_segmentation_indexed_counts.clear()
         self.segmentation_only_nodes.clear()
         self.rgb_only_nodes.clear()
@@ -1063,48 +1060,6 @@ class RasterizerContext:
                                 self.part_segmentation_palette_by_idxc[seg_idxc] = np.asarray(
                                     parts[part_id]["part_color_rgb"], dtype=np.uint8
                                 )
-            self._create_fem_floor_segmentation_proxy(vertices_all)
-
-    def _create_fem_floor_segmentation_proxy(self, vertices_all):
-        configured = [
-            entity
-            for entity in self.sim.fem_solver.entities
-            if getattr(entity, "_part_segmentation_config", None) is not None
-        ]
-        if not configured:
-            return
-        palette = configured[0]._part_segmentation_config["context_palette"]
-        for entity in configured[1:]:
-            if entity._part_segmentation_config["context_palette"] != palette:
-                gs.raise_exception("All diagnostic FEM entities must share the same context palette.")
-        positions = np.asarray(vertices_all[:, 0], dtype=np.float32)
-        xy_min = positions[:, :2].min(axis=0)
-        xy_max = positions[:, :2].max(axis=0)
-        center = (xy_min + xy_max) * 0.5
-        extent = np.maximum(xy_max - xy_min, 1.0) * 3.0
-        floor_height = float(self.sim.fem_solver.floor_height)
-        vertices = np.asarray(
-            [
-                [center[0] - extent[0] * 0.5, center[1] - extent[1] * 0.5, floor_height],
-                [center[0] + extent[0] * 0.5, center[1] - extent[1] * 0.5, floor_height],
-                [center[0] + extent[0] * 0.5, center[1] + extent[1] * 0.5, floor_height],
-                [center[0] - extent[0] * 0.5, center[1] + extent[1] * 0.5, floor_height],
-            ],
-            dtype=np.float32,
-        )
-        faces = np.asarray([[0, 1, 2], [0, 2, 3]], dtype=np.int64)
-        mesh = trimesh.Trimesh(vertices, faces, process=False)
-        render_mesh = pyrender.Mesh.from_trimesh(mesh, smooth=True, double_sided=True)
-        primitive = render_mesh.primitives[0]
-        if primitive.indices is None or primitive.positions.shape[0] != 4 or primitive.indices.shape != (2, 3):
-            gs.raise_exception("FEM floor segmentation proxy must remain an indexed two-triangle quad.")
-        node = self.add_node(render_mesh)
-        self.part_segmentation_floor_nodes["fem_floor"] = node
-        self.segmentation_only_nodes.add(node)
-        seg_key = ("hag4r_context", "ground", "fem_floor")
-        self.create_node_seg(seg_key, node)
-        seg_idxc = self.seg_color_map.key_map[seg_key]
-        self.part_segmentation_palette_by_idxc[seg_idxc] = np.asarray(palette["ground"], dtype=np.uint8)
 
     def update_fem(self, render_pass="rgb"):
         if self.sim.fem_solver.is_active:

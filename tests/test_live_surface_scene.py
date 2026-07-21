@@ -57,6 +57,8 @@ def _write_surface_scene_config(
     *,
     material_type: str = "surface_shell",
     heterogeneous: bool | dict = False,
+    part_segmentation: bool = False,
+    archived_palette: bool = False,
     obj_text: str = _SURFACE_OBJ,
 ) -> Path:
     material = {
@@ -68,6 +70,7 @@ def _write_surface_scene_config(
         "bending_stiffness": 0.0,
         "friction_mu": 0.1,
     }
+    material_path = None
     if heterogeneous:
         if heterogeneous is True:
             material_path = tmp_path / "surface_materials.npz"
@@ -78,6 +81,7 @@ def _write_surface_scene_config(
     config = {
         "backend": "cuda",
         "sim_options": {"dt": 0.001, "gravity": [0.0, 0.0, 0.0]},
+        "fem_options": {"enable_floor": True},
         "coupler_options": {
             "contact_enable": False,
             "enable_rigid_ground_contact": False,
@@ -91,6 +95,37 @@ def _write_surface_scene_config(
             }
         ],
     }
+    if part_segmentation:
+        if material_path is None:
+            raise ValueError("surface part-segmentation fixture requires heterogeneous=True")
+        part_colors = np.asarray(
+            [[20 + 20 * index, 210 - 10 * index, 60 + index] for index in range(8)],
+            dtype=np.uint8,
+        )
+        palette_path = tmp_path / "surface_part_palette.npz"
+        np.savez(palette_path, part_colors=part_colors)
+        context_palette = {
+            "background": [0, 0, 0],
+            "fixture": [41, 110, 255],
+            "probe": [255, 89, 41],
+        }
+        if archived_palette:
+            context_palette["ground"] = [96, 96, 96]
+        config["entities"][0]["part_segmentation"] = {
+            "primitive_labels_file": str(material_path),
+            "primitive_labels_key": "tri_part_labels",
+            "palette_file": str(palette_path),
+            "palette_key": "part_colors",
+            "parts": [
+                {
+                    "part_id": int(part_id),
+                    "part_name": f"part_{part_id}",
+                    "part_color_rgb": part_colors[part_id].tolist(),
+                }
+                for part_id in _TWO_TRI_LABELS
+            ],
+            "context_palette": context_palette,
+        }
     config_path = tmp_path / "surface_scene.json"
     config_path.write_text(json.dumps(config), encoding="utf-8")
     return config_path
@@ -373,6 +408,53 @@ def test_surface_scene_does_not_call_volumetric_path(monkeypatch, tmp_path, back
         entity = session.entities["surface"]
         assert entity.morph.__class__.__name__ == "Mesh"
         assert entity.material.__class__.__name__ == "Cloth"
+        assert session.scene.fem_solver.enable_floor is False
+        assert all(candidate.morph.__class__.__name__ != "Plane" for candidate in session.scene.entities)
+        assert session.scene.sim.coupler._ipc_ground_contacts == {}
+        session.scene.step()
+        assert session.scene.sim.coupler._ipc_ground_contacts == {}
+    finally:
+        gs.destroy()
+
+
+@pytest.mark.parametrize("backend", [None])
+@pytest.mark.parametrize("archived_palette", [False, True])
+def test_surface_part_segmentation_capture_has_no_visual_ground(tmp_path, archived_palette, backend):
+    del backend
+    _require_surface_backend()
+    try:
+        session = GenesisLiveSession(
+            scene_config_path=str(
+                _write_surface_scene_config(
+                    tmp_path,
+                    heterogeneous=True,
+                    part_segmentation=True,
+                    archived_palette=archived_palette,
+                )
+            ),
+            output_dir=str(tmp_path / "outputs"),
+        )
+        expected_palette = {
+            "background": [0, 0, 0],
+            "fixture": [41, 110, 255],
+            "probe": [255, 89, 41],
+        }
+        entity = session.entities["surface"]
+        assert entity._part_segmentation_config["context_palette"] == expected_palette
+        assert session.scene.fem_solver.enable_floor is False
+        assert all(candidate.morph.__class__.__name__ != "Plane" for candidate in session.scene.entities)
+        assert session.scene.sim.coupler._ipc_ground_contacts == {}
+
+        context = session.scene.visualizer._context
+        assert not hasattr(context, "part_segmentation_floor_nodes")
+        assert all("ground" not in key and "floor" not in key for key in map(str, context.seg_color_map.key_map))
+        metadata = session.visual_telemetry.capture_part_segmentation_triptych(session, frame_index=0)
+        assert metadata["context_palette"] == expected_palette
+        assert metadata["performance"]["active_context_node_count"] == 0
+        for panel_path in metadata["panel_paths"].values():
+            with Image.open(panel_path) as image:
+                pixels = np.asarray(image.convert("RGB"))
+            assert not np.any(np.all(pixels == np.asarray([96, 96, 96], dtype=np.uint8), axis=-1))
     finally:
         gs.destroy()
 

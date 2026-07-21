@@ -475,7 +475,7 @@ class VisualTelemetry:
             actual_upload_stats = dict(context.jit.last_buffer_upload_stats)
             active_part_nodes = len(context.part_segmentation_nodes) if mode == "part_segmentation_triptych" else 0
             active_context_nodes = (
-                len(context.part_segmentation_floor_nodes) + len(context.part_segmentation_context_nodes)
+                len(context.part_segmentation_context_nodes)
                 if mode == "part_segmentation_triptych"
                 else 0
             )

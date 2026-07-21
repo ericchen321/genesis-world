@@ -35,7 +35,7 @@ def _write_scene_config(tmp_path: Path) -> Path:
     igl.writeMESH(str(mesh_path), _TWO_TET_VERTS, _TWO_TETS, np.empty((0, 3), dtype=np.int64))
     config = {
         "sim_options": {"dt": 0.001},
-        "fem_options": {"enable_vertex_constraints": True},
+        "fem_options": {"enable_vertex_constraints": True, "enable_floor": True},
         "entities": [
             {
                 "name": "body",
@@ -130,6 +130,7 @@ def test_live_session_lifecycle_and_box_action(tmp_path):
     assert "live_box_controller_actions" in handshake["capabilities"]
     assert session.status()["current_step"] == 0
     assert session.status()["paused"]
+    assert session.scene.fem_solver.enable_floor is False
 
     geometry = session.dispatch("geometry.context.get", {"entity": "body"})
     assert geometry["representation"] == "volumetric"
@@ -210,6 +211,25 @@ def test_live_session_lifecycle_and_box_action(tmp_path):
     release = session.dispatch("probe.apply", {"action": "probe_release", "controller_id": "diag_box"})
     assert not release["probe"]["controller_state"]["active"]
     assert session.dispatch("sim.reset", {})["current_step"] == 0
+
+
+def test_live_session_forces_floor_off_and_allows_below_floor_downward_motion(tmp_path):
+    config_path = _write_scene_config(tmp_path)
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    config["sim_options"]["gravity"] = [0.0, 0.0, 0.0]
+    config["fem_options"]["enable_floor"] = True
+    config["entities"][0]["anchors"] = []
+    config["entities"][0]["morph"]["pos"] = [0.0, 0.0, -2.0]
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+
+    session = GenesisLiveSession(scene_config_path=str(config_path), start_paused=True)
+    entity = session.entities["body"]
+    assert session.scene.fem_solver.enable_floor is False
+    entity.set_velocity((0.0, 0.0, -0.5))
+    initial_z = float(entity.get_state().pos[..., 2].mean())
+    session.scene.step(update_visualizer=False)
+    final_z = float(entity.get_state().pos[..., 2].mean())
+    assert final_z < initial_z - 1.0e-5
 
 
 def test_live_session_rejects_unsupported_visual_modes(tmp_path):

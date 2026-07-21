@@ -815,6 +815,8 @@ class FEMOptions(Options):
         Damping factor. Defaults to 0.0.
     floor_height : float, optional
         Height of the floor in meters. If none, it will inherit from `SimOptions`. Defaults to None.
+    enable_floor : bool, optional
+        Whether to apply the FEM floor boundary. Defaults to True.
     use_implicit_solver : bool, optional
         Whether to use the implicit solver. Defaults to False.
         Implicit solver is a more stable solver for FEM. It can be used with a large time step.
@@ -844,6 +846,7 @@ class FEMOptions(Options):
     gravity: Vec3FType | None = None
     damping: NonNegativeFloat = 0.0
     floor_height: float | None = None
+    enable_floor: StrictBool = True
     use_implicit_solver: StrictBool = False
     n_newton_iterations: PositiveInt = 1
     n_pcg_iterations: PositiveInt = 500

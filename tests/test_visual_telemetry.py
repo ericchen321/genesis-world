@@ -55,6 +55,38 @@ def _write_scene_config(tmp_path: Path) -> Path:
     return config_path
 
 
+def _write_part_segmentation_scene_config(tmp_path: Path, *, archived_palette: bool) -> Path:
+    config_path = _write_scene_config(tmp_path)
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    labels_path = tmp_path / "primitive_labels.npz"
+    palette_path = tmp_path / "part_palette.npz"
+    np.savez(
+        labels_path,
+        tet_E_nu=np.asarray([[1.0e5, 0.3], [1.0e5, 0.3]], dtype=np.float32),
+        tet_density=np.asarray([1000.0, 1000.0], dtype=np.float32),
+        tet_part_labels=np.asarray([0, 0], dtype=np.int32),
+    )
+    np.savez(palette_path, part_colors=np.asarray([[0, 255, 0]], dtype=np.uint8))
+    context_palette = {
+        "background": [0, 0, 0],
+        "fixture": [41, 110, 255],
+        "probe": [255, 89, 41],
+    }
+    if archived_palette:
+        context_palette["ground"] = [96, 96, 96]
+    config["entities"][0]["material"]["heterogeneous"] = {"file": str(labels_path)}
+    config["entities"][0]["part_segmentation"] = {
+        "primitive_labels_file": str(labels_path),
+        "primitive_labels_key": "tet_part_labels",
+        "palette_file": str(palette_path),
+        "palette_key": "part_colors",
+        "parts": [{"part_id": 0, "part_name": "body", "part_color_rgb": [0, 255, 0]}],
+        "context_palette": context_palette,
+    }
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+    return config_path
+
+
 def _assert_png_record(record):
     path = Path(record["path"])
     assert path.exists()
@@ -176,6 +208,33 @@ def test_part_segmentation_context_boxes_reuse_stable_indexed_nodes():
     assert context.jit.discarded == [nodes[("probe", "probe")]]
     assert probe_seg_idxc not in context.part_segmentation_palette_by_idxc
     assert probe_seg_key not in context.seg_color_map.key_map
+
+
+@pytest.mark.parametrize("archived_palette", [False, True])
+def test_part_segmentation_is_floor_free_and_normalizes_archived_palette(tmp_path, archived_palette):
+    session = GenesisLiveSession(
+        scene_config_path=str(_write_part_segmentation_scene_config(tmp_path, archived_palette=archived_palette)),
+        start_paused=True,
+        output_dir=str(tmp_path / "outputs"),
+    )
+    expected_palette = {
+        "background": [0, 0, 0],
+        "fixture": [41, 110, 255],
+        "probe": [255, 89, 41],
+    }
+    assert session.entities["body"]._part_segmentation_config["context_palette"] == expected_palette
+
+    context = session.scene.visualizer._context
+    assert not hasattr(context, "part_segmentation_floor_nodes")
+    assert all("ground" not in key and "floor" not in key for key in map(str, context.seg_color_map.key_map))
+
+    metadata = session.visual_telemetry.capture_part_segmentation_triptych(session, frame_index=0)
+    assert metadata["context_palette"] == expected_palette
+    assert metadata["performance"]["active_context_node_count"] == 1
+    for panel_path in metadata["panel_paths"].values():
+        with Image.open(panel_path) as image:
+            pixels = np.asarray(image.convert("RGB"))
+        assert not np.any(np.all(pixels == np.asarray([96, 96, 96], dtype=np.uint8), axis=-1))
 
 
 def test_fem_state_default_tracks_but_telemetry_position_query_does_not(tmp_path):
