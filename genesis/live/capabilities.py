@@ -242,7 +242,11 @@ def surface_position_constraint_status(surface_status: dict[str, Any] | None = N
     }
 
 
-def capability_report(required_capabilities: Iterable[str] = ()) -> dict[str, Any]:
+def capability_report(
+    required_capabilities: Iterable[str] = (),
+    *,
+    diagnostic_scene: bool = False,
+) -> dict[str, Any]:
     surface_status = surface_backend_status()
     surface_heterogeneous_status = surface_heterogeneous_backend_status(surface_status)
     surface_position_constraint = surface_position_constraint_status(surface_status)
@@ -250,6 +254,7 @@ def capability_report(required_capabilities: Iterable[str] = ()) -> dict[str, An
         bool(surface_status["available"]),
         bool(surface_heterogeneous_status["available"]),
         bool(surface_position_constraint["available"]),
+        diagnostic_scene=diagnostic_scene,
     )
     required = tuple(str(capability) for capability in required_capabilities)
     missing_required = [capability for capability in required if capability not in capabilities]

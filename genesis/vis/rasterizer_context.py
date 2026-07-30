@@ -981,31 +981,35 @@ class RasterizerContext:
                     surf_idx = np.ascontiguousarray(surf_idx)
                     triangles_reindexed = inv.reshape(triangles.shape)
                     for idx in self.rendered_envs_idx:
-                        vertices = vertices_all[fem_entity.v_start : fem_entity.v_start + fem_entity.n_vertices, idx]
-                        uvs = uvs_all[fem_entity.v_start : fem_entity.v_start + fem_entity.n_vertices]
+                        entity_vertices = vertices_all[
+                            fem_entity.v_start : fem_entity.v_start + fem_entity.n_vertices, idx
+                        ]
                         node_key = (idx, fem_entity.uid)
-                        self._fem_surface_vertex_indices[node_key] = surf_idx.copy()
-                        vertices = vertices[surf_idx]
-                        uvs = uvs[surf_idx]
+                        rgb_node = None
+                        if not bool(getattr(fem_entity, "_rgb_visualization_disabled", False)):
+                            self._fem_surface_vertex_indices[node_key] = surf_idx.copy()
+                            vertices = entity_vertices[surf_idx]
+                            uvs = uvs_all[fem_entity.v_start : fem_entity.v_start + fem_entity.n_vertices][surf_idx]
+                            mesh = trimesh.Trimesh(vertices, triangles_reindexed, process=False)
+                            mesh.visual = mu.surface_uvs_to_trimesh_visual(
+                                fem_entity.surface, uvs=uvs, n_verts=fem_entity.n_surface_vertices
+                            )
+                            self.add_static_node(
+                                fem_entity,
+                                pyrender.Mesh.from_trimesh(
+                                    mesh,
+                                    smooth=fem_entity.surface.smooth,
+                                    double_sided=fem_entity.surface.double_sided,
+                                ),
+                                i_b=idx,
+                            )
+                            rgb_node = self.static_nodes[node_key]
 
-                        mesh = trimesh.Trimesh(vertices, triangles_reindexed, process=False)
-                        mesh.visual = mu.surface_uvs_to_trimesh_visual(
-                            fem_entity.surface, uvs=uvs, n_verts=fem_entity.n_surface_vertices
-                        )
-                        self.add_static_node(
-                            fem_entity,
-                            pyrender.Mesh.from_trimesh(
-                                mesh,
-                                smooth=fem_entity.surface.smooth,
-                                double_sided=fem_entity.surface.double_sided,
-                            ),
-                            i_b=idx,
-                        )
-                        rgb_node = self.static_nodes[node_key]
                         part_config = getattr(fem_entity, "_part_segmentation_config", None)
                         if part_config is not None:
-                            self.remove_node_seg(rgb_node)
-                            self.rgb_only_nodes.add(rgb_node)
+                            if rgb_node is not None:
+                                self.remove_node_seg(rgb_node)
+                                self.rgb_only_nodes.add(rgb_node)
                             labels = np.asarray(fem_entity.surface_primitive_part_labels, dtype=np.int64)
                             if labels.shape != (triangles.shape[0],):
                                 gs.raise_exception(
@@ -1018,9 +1022,6 @@ class RasterizerContext:
                                 gs.raise_exception(
                                     f"FEM entity {fem_entity.uid} surface labels reference unknown part ids {unknown}."
                                 )
-                            entity_vertices = vertices_all[
-                                fem_entity.v_start : fem_entity.v_start + fem_entity.n_vertices, idx
-                            ]
                             for part_id in sorted(parts):
                                 part_triangles = triangles[labels == part_id]
                                 if part_triangles.shape[0] == 0:
@@ -1030,10 +1031,10 @@ class RasterizerContext:
                                 part_faces = np.ascontiguousarray(part_inverse.reshape((-1, 3)), dtype=np.int64)
                                 mesh = trimesh.Trimesh(entity_vertices[part_vertices], part_faces, process=False)
                                 part_mesh = pyrender.Mesh.from_trimesh(
-                                        mesh,
-                                        smooth=True,
-                                        double_sided=fem_entity.surface.double_sided,
-                                    )
+                                    mesh,
+                                    smooth=True,
+                                    double_sided=fem_entity.surface.double_sided,
+                                )
                                 primitive = part_mesh.primitives[0]
                                 if primitive.indices is None or primitive.vertex_mapping is not None:
                                     gs.raise_exception(
@@ -1112,6 +1113,8 @@ class RasterizerContext:
             uploaded_bytes = 0
             active_nodes = 0
             for fem_entity in self.sim.fem_solver.entities:
+                if bool(getattr(fem_entity, "_rgb_visualization_disabled", False)):
+                    continue
                 if fem_entity.surface.vis_mode == "visual":
                     for idx in self.rendered_envs_idx:
                         node_key = (idx, fem_entity.uid)

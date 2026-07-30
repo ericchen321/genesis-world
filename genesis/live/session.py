@@ -4,6 +4,7 @@ import json
 import threading
 import time
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
@@ -23,8 +24,28 @@ from .capabilities import capability_report, surface_backend_status
 from .protocol import PROTOCOL, GenesisLiveError, error_response, ok_response
 from .snapshots import controller_snapshots, fused_observation, geometry_context
 from .visual_telemetry import GENESIS_NATIVE_DEBUG_CAMERA_RENDERER, VisualTelemetry
+from .visual_overlay import (
+    VISUAL_OVERLAY_REST_ATOL_M,
+    VisualOverlaySpec,
+    load_visual_overlay_assets,
+    validate_visual_overlay_spec,
+)
 
 DEFAULT_RENDER_EVERY_STEPS = 10
+
+
+def is_agentic_diagnostics_scene_config(scene_config: dict[str, Any]) -> bool:
+    """Whether this config is governed by the agentic diagnostics contract."""
+    return "agentic_diagnostics" in scene_config
+
+
+@dataclass
+class VisualOverlayRecord:
+    physical_entity_name: str
+    physical_entity: Any
+    visual_entity: Any
+    physics_vertex_indices: np.ndarray
+    visual_rest_vertices_m: np.ndarray
 
 
 class GenesisLiveSession:
@@ -54,6 +75,10 @@ class GenesisLiveSession:
         self.scene = None
         self.entities = {}
         self.context_entities = {}
+        self.visual_overlays: dict[str, VisualOverlayRecord] = {}
+        self._visual_overlay_last_sync_step: int | None = None
+        self._visual_overlay_last_sync_seconds: float | None = None
+        self._validated_visual_overlay_specs: dict[int, VisualOverlaySpec] = {}
         self.visual_telemetry = VisualTelemetry(self._resolve_output_dir())
         self.build_scene()
 
@@ -92,7 +117,19 @@ class GenesisLiveSession:
         return backend
 
     def _validate_scene_config_before_build(self, scene_config: dict[str, Any]) -> None:
-        for index, entity_cfg in enumerate(scene_config.get("entities", [])):
+        raw_entities = scene_config.get("entities", [])
+        if is_agentic_diagnostics_scene_config(scene_config) and any(
+            isinstance(entity_cfg, dict) and entity_cfg.get("visual_overlay") is not None
+            for entity_cfg in raw_entities
+        ):
+            raise GenesisLiveError(
+                "texture_overlay_not_supported_in_diagnostics",
+                "visual_overlay is not supported in agentic diagnostics scenes",
+            )
+
+        visual_overlay_specs: dict[int, VisualOverlaySpec] = {}
+        entity_name_counts: dict[str, int] = {}
+        for index, entity_cfg in enumerate(raw_entities):
             if not isinstance(entity_cfg, dict):
                 raise GenesisLiveError("invalid_scene_config", "entity entries must be JSON objects")
             morph_cfg = entity_cfg.get("morph", {})
@@ -101,6 +138,11 @@ class GenesisLiveSession:
                 raise GenesisLiveError("invalid_scene_config", "entity morph and material entries must be JSON objects")
             morph_type = morph_cfg.get("type")
             material_type = material_cfg.get("type", "elastic")
+            visual_overlay_spec = validate_visual_overlay_spec(entity_cfg, entity_index=index)
+            if visual_overlay_spec is not None:
+                visual_overlay_specs[index] = visual_overlay_spec
+            entity_name = str(entity_cfg.get("name") or f"entity_{index}")
+            entity_name_counts[entity_name] = entity_name_counts.get(entity_name, 0) + 1
             if entity_cfg.get("part_segmentation") is not None:
                 entity_cfg["part_segmentation"] = self._validate_part_segmentation_contract(
                     entity_cfg["part_segmentation"], entity_index=index
@@ -135,6 +177,18 @@ class GenesisLiveSession:
                         "tet_mesh morph requires material.type='elastic' for this feature",
                         details={"entity_index": index, "material_type": material_type},
                     )
+        duplicate_overlay_owner_names = sorted(
+            spec.entity_name
+            for spec in visual_overlay_specs.values()
+            if entity_name_counts[spec.entity_name] > 1
+        )
+        if duplicate_overlay_owner_names:
+            raise GenesisLiveError(
+                "invalid_visual_overlay",
+                "visual_overlay owner names must be unique",
+                details={"entity_name": duplicate_overlay_owner_names[0]},
+            )
+        self._validated_visual_overlay_specs = visual_overlay_specs
 
     def _validate_part_segmentation_contract(self, config: Any, *, entity_index: int) -> dict[str, Any]:
         if not isinstance(config, dict):
@@ -351,6 +405,9 @@ class GenesisLiveSession:
         requires_surface_backend = self._scene_requires_surface_backend(self._scene_config)
         backend = self._scene_requested_backend(self._scene_config)
         self._ensure_genesis_initialized(backend, requires_surface_backend=requires_surface_backend)
+        self.visual_overlays = {}
+        self._visual_overlay_last_sync_step = None
+        self._visual_overlay_last_sync_seconds = None
         self.visual_telemetry.reset_triptych_cameras()
         if self.scene is not None:
             self.scene.destroy()
@@ -389,9 +446,57 @@ class GenesisLiveSession:
                 entity._part_segmentation_config = dict(entity_cfg["part_segmentation"])
             self.entities[name] = entity
             pending_anchors.append((entity, entity_cfg.get("anchors", [])))
+            overlay_spec = self._validated_visual_overlay_specs.get(index)
+            if overlay_spec is not None:
+                assets = load_visual_overlay_assets(overlay_spec)
+                entity._rgb_visualization_disabled = True
+                try:
+                    visual_entity = self.scene.add_entity(
+                        morph=gs.morphs.MeshSet(
+                            files=(assets.mesh,),
+                            fixed=True,
+                            enable_custom_vverts=True,
+                        ),
+                        material=gs.materials.Kinematic(use_visual_raycasting=False),
+                        name=f"{name}__visual_overlay",
+                    )
+                except (gs.GenesisException, TypeError, ValueError) as exc:
+                    raise GenesisLiveError(
+                        "invalid_visual_overlay",
+                        "failed to build visual_overlay entity",
+                        details={
+                            "entity_index": overlay_spec.entity_index,
+                            "entity_name": overlay_spec.entity_name,
+                        },
+                    ) from exc
+                self.visual_overlays[name] = VisualOverlayRecord(
+                    physical_entity_name=name,
+                    physical_entity=entity,
+                    visual_entity=visual_entity,
+                    physics_vertex_indices=assets.physics_vertex_indices,
+                    visual_rest_vertices_m=assets.visual_rest_vertices_m,
+                )
 
         self.visual_telemetry.register_triptych_cameras(self)
-        self.scene.build()
+        try:
+            self.scene.build()
+        except gs.GenesisException as exc:
+            if not self.visual_overlays:
+                raise
+            owner_name = next(iter(self.visual_overlays))
+            spec = next(
+                candidate
+                for candidate in self._validated_visual_overlay_specs.values()
+                if candidate.entity_name == owner_name
+            )
+            raise GenesisLiveError(
+                "invalid_visual_overlay",
+                "failed to build scene with visual_overlay",
+                details={
+                    "entity_index": spec.entity_index,
+                    "entity_name": owner_name,
+                },
+            ) from exc
         for entity, anchors in pending_anchors:
             if anchors:
                 name = next(name for name, candidate in self.entities.items() if candidate is entity)
@@ -404,6 +509,12 @@ class GenesisLiveSession:
                         details={"entity": name, "error": str(exc)},
                     ) from exc
         self.current_step = 0
+        if self.visual_overlays:
+            self._validate_fem_state(checked_at="after_build")
+            self._sync_visual_overlays(
+                checked_at="after_build",
+                require_rest_alignment=True,
+            )
         self.paused = self.start_paused
         self.running = False
         self.last_frame_index = None
@@ -490,7 +601,7 @@ class GenesisLiveSession:
         coupler_type = None
         if self.scene is not None and getattr(self.scene, "sim", None) is not None:
             coupler_type = self.scene.sim.coupler.__class__.__name__
-        return {
+        result = {
             "protocol": PROTOCOL,
             "session_id": self.session_id,
             "paused": bool(self.paused),
@@ -505,12 +616,26 @@ class GenesisLiveSession:
             "coupler_type": coupler_type,
             "surface_scene": self._scene_requires_surface_backend(self._scene_config),
         }
+        if self.visual_overlays:
+            result.update(
+                {
+                    "visual_overlay_count": len(self.visual_overlays),
+                    "visual_overlay_last_sync_step": self._visual_overlay_last_sync_step,
+                    "visual_overlay_last_sync_seconds": self._visual_overlay_last_sync_seconds,
+                }
+            )
+        return result
 
     def backend_requirements(self) -> dict[str, Any]:
-        return capability_report()["backend_requirements"]
+        return self._scene_capability_report()["backend_requirements"]
+
+    def _scene_capability_report(self) -> dict[str, Any]:
+        return capability_report(
+            diagnostic_scene=is_agentic_diagnostics_scene_config(self._scene_config),
+        )
 
     def handshake(self) -> dict[str, Any]:
-        report = capability_report()
+        report = self._scene_capability_report()
         return {
             "protocol": PROTOCOL,
             "session_id": self.session_id,
@@ -563,6 +688,8 @@ class GenesisLiveSession:
         if method == "geometry.context.get":
             entity_name, entity = self.entity_by_name(str(params["entity"])) if "entity" in params else self.default_entity()
             return geometry_context(entity, entity_name=entity_name)
+        if method == "visual_overlay.trace.get":
+            return self.visual_overlay_trace(params)
         if method == "probe.action.register":
             return self.actions.register(params)
         if method == "probe.apply":
@@ -590,6 +717,7 @@ class GenesisLiveSession:
                 self.scene.step()
                 self.current_step += 1
                 self._validate_fem_state(checked_at="after_step")
+                self._sync_visual_overlays(checked_at="after_step")
                 if render_every_steps is not None and (local_step_index + 1) % render_every_steps == 0:
                     visual_frames.append(
                         self._capture_visual_request(
@@ -673,15 +801,100 @@ class GenesisLiveSession:
                 details=self._invalid_fem_state_details(entity_name, positions, checked_at=checked_at),
             )
 
+    def _sync_visual_overlays(
+        self,
+        *,
+        checked_at: str,
+        require_rest_alignment: bool = False,
+    ) -> None:
+        if not self.visual_overlays:
+            return
+        from genesis.utils.misc import tensor_to_array
+
+        started_at = time.perf_counter()
+        for record in self.visual_overlays.values():
+            binding = record.physics_vertex_indices
+            rest_vertices = record.visual_rest_vertices_m
+            if (
+                binding.dtype != np.dtype(np.int64)
+                or binding.ndim != 1
+                or len(binding) != len(rest_vertices)
+                or np.any(binding < 0)
+            ):
+                raise GenesisLiveError(
+                    "invalid_visual_overlay",
+                    "visual_overlay binding is malformed during synchronization",
+                    details={"entity_name": record.physical_entity_name, "checked_at": checked_at},
+                )
+            physical_positions = self._entity_positions_for_validation(
+                record.physical_entity_name,
+                record.physical_entity,
+                checked_at=checked_at,
+            )
+            if np.any(binding >= len(physical_positions)):
+                raise GenesisLiveError(
+                    "invalid_visual_overlay",
+                    "visual_overlay binding exceeds the physical FEM vertex range",
+                    details={"entity_name": record.physical_entity_name, "checked_at": checked_at},
+                )
+            visual_positions = np.ascontiguousarray(physical_positions[binding], dtype=np.float32)
+            if require_rest_alignment:
+                max_error = float(np.max(np.abs(visual_positions - rest_vertices)))
+                if not np.isfinite(max_error) or max_error >= VISUAL_OVERLAY_REST_ATOL_M:
+                    raise GenesisLiveError(
+                        "invalid_visual_overlay",
+                        "visual_overlay rest vertices do not align with the physical FEM",
+                        details={
+                            "entity_name": record.physical_entity_name,
+                            "checked_at": checked_at,
+                            "max_error_m": max_error,
+                        },
+                    )
+            try:
+                record.visual_entity.set_vverts(visual_positions)
+                if require_rest_alignment:
+                    synced_vertices = np.asarray(tensor_to_array(record.visual_entity.get_vverts()), dtype=np.float32)
+                    if synced_vertices.ndim == 3 and synced_vertices.shape[0] == 1:
+                        synced_vertices = synced_vertices[0]
+                    if synced_vertices.shape != rest_vertices.shape:
+                        raise ValueError("visual entity returned an unexpected logical vertex shape")
+                    max_readback_error = float(np.max(np.abs(synced_vertices - rest_vertices)))
+                    if (
+                        not np.isfinite(max_readback_error)
+                        or max_readback_error >= VISUAL_OVERLAY_REST_ATOL_M
+                    ):
+                        raise ValueError("visual entity rest-position readback is misaligned")
+            except (gs.GenesisException, TypeError, ValueError) as exc:
+                raise GenesisLiveError(
+                    "invalid_visual_overlay",
+                    "failed to synchronize visual_overlay vertices",
+                    details={"entity_name": record.physical_entity_name, "checked_at": checked_at},
+                ) from exc
+        self._visual_overlay_last_sync_step = int(self.current_step)
+        self._visual_overlay_last_sync_seconds = float(time.perf_counter() - started_at)
+
     def _validate_visual_request(self, visual):
         if visual is None:
             return
         if not isinstance(visual, dict):
             raise GenesisLiveError("invalid_visual_request", "diagnostic_visual must be an object")
         mode = visual.get("mode", "rgb_triptych")
-        if mode in {"depth", "depth_triptych", "von_mises", "von_mises_triptych"}:
+        if mode in {"depth", "depth_triptych", "normal", "normal_triptych"}:
+            if not self.visual_overlays:
+                raise GenesisLiveError(
+                    "unsupported_visual_mode",
+                    f"{mode} requires a generic scene with visual_overlay",
+                )
+        elif mode in {"von_mises", "von_mises_triptych"}:
             raise GenesisLiveError("unsupported_visual_mode", f"{mode} is not supported by this migration feature")
-        if mode not in {"rgb_triptych", "part_segmentation_triptych"}:
+        if mode not in {
+            "rgb_triptych",
+            "depth",
+            "depth_triptych",
+            "normal",
+            "normal_triptych",
+            "part_segmentation_triptych",
+        }:
             raise GenesisLiveError("unsupported_visual_mode", f"unsupported diagnostic visual mode: {mode}")
         if mode == "part_segmentation_triptych" and any(
             getattr(entity, "_part_segmentation_config", None) is None for entity in self.entities.values()
@@ -714,6 +927,10 @@ class GenesisLiveSession:
         mode = visual.get("mode", "rgb_triptych")
         handlers = {
             "rgb_triptych": self.visual_telemetry.capture_rgb_triptych,
+            "depth": self.visual_telemetry.capture_depth_triptych,
+            "depth_triptych": self.visual_telemetry.capture_depth_triptych,
+            "normal": self.visual_telemetry.capture_normal_triptych,
+            "normal_triptych": self.visual_telemetry.capture_normal_triptych,
             "part_segmentation_triptych": self.visual_telemetry.capture_part_segmentation_triptych,
         }
         metadata = handlers[mode](self, frame_index=frame_index)
@@ -721,6 +938,88 @@ class GenesisLiveSession:
         metadata["render_every_steps"] = int(render_every_steps)
         self.last_frame_index = int(metadata["stitched"]["frame_index"])
         return metadata
+
+    def visual_overlay_trace(self, params: dict[str, Any]) -> dict[str, Any]:
+        from genesis.utils.misc import tensor_to_array
+
+        if not self.visual_overlays:
+            raise GenesisLiveError(
+                "visual_overlay_unavailable",
+                "visual_overlay trace requires a generic scene with visual_overlay",
+            )
+        requested_entity = params.get("entity")
+        if requested_entity is None:
+            if len(self.visual_overlays) != 1:
+                raise GenesisLiveError(
+                    "invalid_visual_overlay_trace",
+                    "visual_overlay trace entity is required when multiple overlays exist",
+                )
+            entity_name = next(iter(self.visual_overlays))
+        else:
+            entity_name = str(requested_entity)
+        record = self.visual_overlays.get(entity_name)
+        if record is None:
+            raise GenesisLiveError(
+                "invalid_visual_overlay_trace",
+                f"unknown visual_overlay owner: {entity_name}",
+            )
+
+        physical_positions = self._entity_positions_for_validation(
+            entity_name,
+            record.physical_entity,
+            checked_at="visual_overlay_trace",
+        )
+        visual_positions = np.asarray(
+            tensor_to_array(record.visual_entity.get_vverts()),
+            dtype=np.float32,
+        )
+        if visual_positions.ndim == 3 and visual_positions.shape[0] == 1:
+            visual_positions = visual_positions[0]
+        if visual_positions.shape != record.visual_rest_vertices_m.shape:
+            raise GenesisLiveError(
+                "invalid_visual_overlay",
+                "visual_overlay trace readback has an unexpected shape",
+                details={
+                    "entity": entity_name,
+                    "shape": list(visual_positions.shape),
+                    "expected_shape": list(record.visual_rest_vertices_m.shape),
+                },
+            )
+        binding = record.physics_vertex_indices
+        expected = physical_positions[binding]
+        binding_errors = np.max(np.abs(visual_positions - expected), axis=1)
+        unique_indices, counts = np.unique(binding, return_counts=True)
+        duplicate_physics_indices = unique_indices[counts > 1]
+        max_duplicate_error = 0.0
+        duplicate_visual_vertex_count = 0
+        duplicate_samples = []
+        for physics_index in duplicate_physics_indices:
+            visual_indices = np.flatnonzero(binding == physics_index)
+            duplicate_visual_vertex_count += len(visual_indices)
+            positions = visual_positions[visual_indices]
+            group_error = float(np.max(np.abs(positions - positions[0])))
+            max_duplicate_error = max(max_duplicate_error, group_error)
+            if len(duplicate_samples) < 16:
+                duplicate_samples.append(
+                    {
+                        "physics_vertex_index": int(physics_index),
+                        "visual_vertex_indices": visual_indices.astype(int).tolist(),
+                        "max_pairwise_error_m": group_error,
+                    }
+                )
+        return {
+            "schema_version": "genesis-live-visual-overlay-trace-v1",
+            "entity": entity_name,
+            "current_step": int(self.current_step),
+            "physics_vertex_count": int(len(physical_positions)),
+            "visual_vertex_count": int(len(visual_positions)),
+            "binding_count": int(len(binding)),
+            "max_binding_error_m": float(np.max(binding_errors)) if len(binding_errors) else 0.0,
+            "duplicate_physics_vertex_count": int(len(duplicate_physics_indices)),
+            "duplicate_visual_vertex_count": int(duplicate_visual_vertex_count),
+            "max_seam_duplicate_error_m": float(max_duplicate_error),
+            "duplicate_samples": duplicate_samples,
+        }
 
     def _visual_result_from_frames(
         self,
@@ -733,7 +1032,14 @@ class GenesisLiveSession:
         if visual is None:
             return {"requested": False}
         mode = visual.get("mode", "rgb_triptych")
-        human_mode = "part segmentation triptych" if mode == "part_segmentation_triptych" else "RGB triptych"
+        human_mode = {
+            "rgb_triptych": "RGB triptych",
+            "depth": "depth triptych",
+            "depth_triptych": "depth triptych",
+            "normal": "normal triptych",
+            "normal_triptych": "normal triptych",
+            "part_segmentation_triptych": "part segmentation triptych",
+        }[mode]
         if not frames:
             return {
                 "requested": True,

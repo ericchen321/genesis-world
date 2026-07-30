@@ -13,11 +13,27 @@ MAX_MESSAGE_BYTES = 64 * 1024 * 1024
 
 BASE_CAPABILITIES = (
     "pause_resume_reset",
+    "deformable_textured_visual_overlay",
     "rgb_triptych_telemetry",
+    "visual_overlay_depth_normal_triptych_telemetry",
+    "visual_overlay_vertex_trace",
     "part_segmentation_triptych_telemetry",
     "frame_metadata",
     "geometry_context",
     "fused_observation",
+)
+
+# Agentic diagnostics use the same live server, but their scene contract rejects
+# visual_overlay.  Keep that unsupported feature set explicit so diagnostic
+# evidence cannot imply a textured visual overlay influenced its observations.
+TEXTURED_VISUAL_OVERLAY_CAPABILITIES = (
+    "deformable_textured_visual_overlay",
+    "visual_overlay_depth_normal_triptych_telemetry",
+    "visual_overlay_vertex_trace",
+)
+
+DIAGNOSTIC_BASE_CAPABILITIES = tuple(
+    capability for capability in BASE_CAPABILITIES if capability not in TEXTURED_VISUAL_OVERLAY_CAPABILITIES
 )
 
 VOLUMETRIC_CAPABILITIES = (
@@ -52,6 +68,8 @@ def capabilities_for_report(
     surface_backend_available: bool,
     surface_heterogeneous_backend_available: bool = False,
     surface_position_constraint_available: bool = False,
+    *,
+    diagnostic_scene: bool = False,
 ) -> tuple[str, ...]:
     capabilities = list(VOLUMETRIC_CAPABILITIES)
     if surface_backend_available:
@@ -60,7 +78,7 @@ def capabilities_for_report(
         capabilities.extend(SURFACE_POSITION_CONSTRAINT_CAPABILITIES)
     if surface_heterogeneous_backend_available:
         capabilities.extend(SURFACE_HETEROGENEOUS_CAPABILITIES)
-    capabilities.extend(BASE_CAPABILITIES)
+    capabilities.extend(DIAGNOSTIC_BASE_CAPABILITIES if diagnostic_scene else BASE_CAPABILITIES)
     return tuple(capabilities)
 
 

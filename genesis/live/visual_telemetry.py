@@ -219,6 +219,86 @@ def _render_camera_rgb(camera: Any, *, label: str, force_render: bool) -> np.nda
     return _normalize_camera_rgb(rgb, label=label, camera=camera)
 
 
+def _camera_scalar_array(value: Any, *, label: str, camera: Any) -> np.ndarray:
+    from genesis.utils.misc import tensor_to_array
+
+    array = np.asarray(tensor_to_array(value), dtype=np.float32)
+    if array.ndim == 3 and array.shape[0] == 1:
+        array = array[0]
+    expected_width, expected_height = camera.res
+    if array.shape != (expected_height, expected_width):
+        raise ValueError(
+            f"Genesis debug camera {label!r} returned scalar shape {array.shape}, "
+            f"expected {(expected_height, expected_width)}"
+        )
+    return array
+
+
+def _render_camera_depth(camera: Any, *, label: str, force_render: bool) -> np.ndarray:
+    _rgb, depth, _seg, _normal = camera.render(
+        rgb=False,
+        depth=True,
+        segmentation=False,
+        normal=False,
+        force_render=force_render,
+        render_pass="rgb",
+    )
+    if depth is None:
+        raise ValueError(f"Genesis debug camera {label!r} did not return depth data")
+    array = _camera_scalar_array(depth, label=label, camera=camera)
+    valid = np.isfinite(array) & (array > float(camera.near)) & (
+        array < float(camera.far) * (1.0 - 1.0e-3)
+    )
+    image = np.zeros((*array.shape, 3), dtype=np.uint8)
+    if np.any(valid):
+        minimum = float(np.min(array[valid]))
+        maximum = float(np.max(array[valid]))
+        if maximum > minimum:
+            normalized = 1.0 - (array[valid] - minimum) / (maximum - minimum)
+        else:
+            normalized = np.ones(int(np.count_nonzero(valid)), dtype=np.float32)
+        values = np.rint(255.0 * np.clip(normalized, 0.0, 1.0)).astype(np.uint8)
+        image[valid] = values[:, None]
+    return image
+
+
+def _render_camera_normal(camera: Any, *, label: str, force_render: bool) -> np.ndarray:
+    from genesis.utils.misc import tensor_to_array
+
+    _rgb, depth, _seg, normal = camera.render(
+        rgb=False,
+        depth=True,
+        segmentation=False,
+        normal=True,
+        force_render=force_render,
+        render_pass="rgb",
+    )
+    if depth is None or normal is None:
+        raise ValueError(f"Genesis debug camera {label!r} did not return depth/normal data")
+    depth_array = _camera_scalar_array(depth, label=label, camera=camera)
+    array = np.asarray(tensor_to_array(normal))
+    if array.ndim == 4 and array.shape[0] == 1:
+        array = array[0]
+    expected_width, expected_height = camera.res
+    if array.shape != (expected_height, expected_width, 3):
+        raise ValueError(
+            f"Genesis debug camera {label!r} returned normal shape {array.shape}, "
+            f"expected {(expected_height, expected_width, 3)}"
+        )
+    if np.issubdtype(array.dtype, np.floating):
+        array = np.asarray(array, dtype=np.float32)
+        if float(np.nanmin(array)) < 0.0:
+            array = 0.5 * (array + 1.0)
+        image = np.rint(255.0 * np.clip(array, 0.0, 1.0)).astype(np.uint8)
+    else:
+        image = np.clip(array, 0, 255).astype(np.uint8)
+    valid = np.isfinite(depth_array) & (depth_array > float(camera.near)) & (
+        depth_array < float(camera.far) * (1.0 - 1.0e-3)
+    )
+    image[~valid] = 0
+    return np.ascontiguousarray(image)
+
+
 def _render_camera_part_segmentation(camera: Any, *, label: str, force_render: bool, context: Any) -> np.ndarray:
     _rgb, _depth, segmentation, _normal = camera.render(
         rgb=False,
@@ -362,7 +442,12 @@ class VisualTelemetry:
 
     @torch.no_grad()
     def capture_triptych(self, session, *, mode: str, frame_index: int | None = None) -> dict[str, Any]:
-        if mode not in {"rgb_triptych", "part_segmentation_triptych"}:
+        if mode not in {
+            "rgb_triptych",
+            "depth_triptych",
+            "normal_triptych",
+            "part_segmentation_triptych",
+        }:
             raise ValueError(f"Unsupported diagnostic triptych mode: {mode}")
         if frame_index is None:
             frame_index = int(session.current_step)
@@ -407,6 +492,10 @@ class VisualTelemetry:
                 render_started = time.perf_counter()
                 if mode == "rgb_triptych":
                     image = _render_camera_rgb(camera, label=label, force_render=panel_index == 0)
+                elif mode == "depth_triptych":
+                    image = _render_camera_depth(camera, label=label, force_render=panel_index == 0)
+                elif mode == "normal_triptych":
+                    image = _render_camera_normal(camera, label=label, force_render=panel_index == 0)
                 else:
                     image = _render_camera_part_segmentation(
                         camera,
@@ -416,7 +505,12 @@ class VisualTelemetry:
                     )
                 panel_render_seconds.append(time.perf_counter() - render_started)
 
-                prefix = "rgb" if mode == "rgb_triptych" else "part_segmentation"
+                prefix = {
+                    "rgb_triptych": "rgb",
+                    "depth_triptych": "depth",
+                    "normal_triptych": "normal",
+                    "part_segmentation_triptych": "part_segmentation",
+                }[mode]
                 path = self.output_dir / f"png_{prefix}_panels" / label / f"frame_{frame_index:06d}.png"
                 path.parent.mkdir(parents=True, exist_ok=True)
                 png_started = time.perf_counter()
@@ -573,6 +667,12 @@ class VisualTelemetry:
 
     def capture_rgb_triptych(self, session, *, frame_index: int | None = None) -> dict[str, Any]:
         return self.capture_triptych(session, mode="rgb_triptych", frame_index=frame_index)
+
+    def capture_depth_triptych(self, session, *, frame_index: int | None = None) -> dict[str, Any]:
+        return self.capture_triptych(session, mode="depth_triptych", frame_index=frame_index)
+
+    def capture_normal_triptych(self, session, *, frame_index: int | None = None) -> dict[str, Any]:
+        return self.capture_triptych(session, mode="normal_triptych", frame_index=frame_index)
 
     def capture_part_segmentation_triptych(self, session, *, frame_index: int | None = None) -> dict[str, Any]:
         return self.capture_triptych(session, mode="part_segmentation_triptych", frame_index=frame_index)

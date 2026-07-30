@@ -14,6 +14,7 @@ from PIL import Image
 
 import genesis as gs
 from genesis.live.protocol import PROTOCOL, GenesisLiveError, recv_json, send_json
+from genesis.live.server import GenesisLiveServer
 from genesis.live.session import GenesisLiveSession
 from genesis.live.visual_telemetry import GENESIS_NATIVE_DEBUG_CAMERA_RENDERER
 
@@ -369,6 +370,35 @@ def test_live_server_subprocess_ready_handshake_status_and_close(tmp_path):
         if proc.poll() is None:
             proc.terminate()
             proc.wait(timeout=30)
+
+
+def test_diagnostic_live_ready_and_handshake_hide_textured_overlay_capabilities(tmp_path):
+    config_path = _write_scene_config(tmp_path)
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    config["agentic_diagnostics"] = {"mode": "structured_live_diagnostic"}
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+    ready_path = tmp_path / "diagnostic_ready.json"
+    server = GenesisLiveServer(
+        host="127.0.0.1",
+        port=0,
+        ready_file=str(ready_path),
+        scene_config_path=str(config_path),
+        start_paused=True,
+    )
+
+    server.write_ready()
+    ready = json.loads(ready_path.read_text(encoding="utf-8"))
+    handshake = server.session.handshake()
+    forbidden = {
+        "deformable_textured_visual_overlay",
+        "visual_overlay_depth_normal_triptych_telemetry",
+        "visual_overlay_vertex_trace",
+    }
+
+    assert forbidden.isdisjoint(ready["capabilities"])
+    assert forbidden.isdisjoint(handshake["capabilities"])
+    assert ready["capabilities"] == handshake["capabilities"]
+    assert "part_segmentation_triptych_telemetry" in ready["capabilities"]
 
 
 def test_live_package_does_not_contain_removed_server_protocol_names():
