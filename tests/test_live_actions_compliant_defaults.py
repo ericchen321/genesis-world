@@ -90,6 +90,7 @@ def test_live_box_ee_native_uses_backend_owned_compliant_stiffness():
 
     result = actions.apply_probe_action(session, _valid_box_action())
 
+    assert actions.BOX_EE_NATIVE_FEM_COMPLIANT_STIFFNESS == pytest.approx(0.095)
     assert result["selected_vertex_count"] == 2
     assert session.controllers["diag_box"].controller_id == "diag_box"
     call = _CapturedController.calls[-1]
