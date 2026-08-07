@@ -9,7 +9,7 @@ from genesis.engine.controllers.box_end_effector import BoxEndEffectorController
 from .protocol import GenesisLiveError
 
 
-BOX_EE_NATIVE_FEM_COMPLIANT_STIFFNESS = 0.095
+BOX_EE_NATIVE_FEM_COMPLIANT_STIFFNESS = 0.1
 BOX_EE_IPC_SURFACE_COMPLIANT_STRENGTH_RATE = 100.0
 BOX_EE_COMPLIANCE_OVERRIDE_KEYS = frozenset(
     {
