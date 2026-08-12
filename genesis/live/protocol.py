@@ -10,6 +10,7 @@ from typing import Any
 PROTOCOL = "genesis-live-v1"
 HEADER_STRUCT = struct.Struct(">I")
 MAX_MESSAGE_BYTES = 64 * 1024 * 1024
+ANCHOR_RELATIVE_PROBE_MEASUREMENT_CAPABILITY = "anchor_relative_probe_measurement_telemetry"
 
 BASE_CAPABILITIES = (
     "pause_resume_reset",
@@ -41,6 +42,7 @@ VOLUMETRIC_CAPABILITIES = (
     "heterogeneous_fem_material_arrays",
     "static_box_anchors",
     "live_box_controller_actions",
+    ANCHOR_RELATIVE_PROBE_MEASUREMENT_CAPABILITY,
 )
 
 SURFACE_CAPABILITIES = (
@@ -53,9 +55,7 @@ SURFACE_POSITION_CONSTRAINT_CAPABILITIES = (
     "surface_live_box_controller_actions",
 )
 
-SURFACE_HETEROGENEOUS_CAPABILITIES = (
-    "heterogeneous_surface_material_arrays",
-)
+SURFACE_HETEROGENEOUS_CAPABILITIES = ("heterogeneous_surface_material_arrays",)
 
 SURFACE_BACKEND_CAPABILITIES = (
     SURFACE_CAPABILITIES + SURFACE_POSITION_CONSTRAINT_CAPABILITIES + SURFACE_HETEROGENEOUS_CAPABILITIES

@@ -11,6 +11,20 @@ from genesis.utils import spatial_selection as su
 
 DEFAULT_BOX_EE_SPEED = 0.6
 DEFAULT_MAX_DISTANCE_SCALE = 1.0
+MOTION_AXIS_VECTORS = {
+    "+X": (1.0, 0.0, 0.0),
+    "-X": (-1.0, 0.0, 0.0),
+    "+Y": (0.0, 1.0, 0.0),
+    "-Y": (0.0, -1.0, 0.0),
+    "+Z": (0.0, 0.0, 1.0),
+    "-Z": (0.0, 0.0, -1.0),
+}
+
+
+def motion_axis_vector(motion_axis: str) -> np.ndarray:
+    if not isinstance(motion_axis, str) or motion_axis not in MOTION_AXIS_VECTORS:
+        gs.raise_exception(f"motion_axis must be one of {tuple(MOTION_AXIS_VECTORS)}, got {motion_axis!r}.")
+    return np.asarray(MOTION_AXIS_VECTORS[motion_axis], dtype=_float_dtype())
 
 
 def _float_dtype():
@@ -148,6 +162,7 @@ class BoxEndEffectorState:
     env_local_box: np.ndarray
     selected_vertices: np.ndarray
     target_positions: np.ndarray
+    motion_axis: str = "+Y"
     displacement: np.ndarray = field(default_factory=lambda: np.zeros(3, dtype=_float_dtype()))
     selection_tolerance: float = 0.0
     duration_steps: int = 0
@@ -173,6 +188,7 @@ class BoxEndEffectorState:
             "selected_vertices": self.selected_vertices.tolist(),
             "selected_vertex_count": self.selected_vertex_count,
             "target_positions": self.target_positions.tolist(),
+            "motion_axis": self.motion_axis,
             "displacement": self.displacement.tolist(),
             "selection_tolerance": float(self.selection_tolerance),
             "duration_steps": int(self.duration_steps),
@@ -368,10 +384,12 @@ class BoxEndEffectorController:
         mask = constraints.is_constrained.to_numpy()[global_vertices, env_idx].astype(bool)
         self._preexisting_constraint_mask = mask
         self._preexisting_constraint_targets = constraints.target_pos.to_numpy()[global_vertices[mask], env_idx].copy()
-        self._preexisting_constraint_soft = constraints.is_soft_constraint.to_numpy()[global_vertices[mask], env_idx].astype(
-            bool
-        )
-        self._preexisting_constraint_stiffness = constraints.stiffness.to_numpy()[global_vertices[mask], env_idx].astype(
+        self._preexisting_constraint_soft = constraints.is_soft_constraint.to_numpy()[
+            global_vertices[mask], env_idx
+        ].astype(bool)
+        self._preexisting_constraint_stiffness = constraints.stiffness.to_numpy()[
+            global_vertices[mask], env_idx
+        ].astype(
             _float_dtype(),
             copy=True,
         )
@@ -502,9 +520,10 @@ class BoxEndEffectorController:
             gs.raise_exception(f"BoxEE motion dt must be positive, got {dt}.")
         return float(dt)
 
-    def move_positive_y(
+    def move_cardinal_axis(
         self,
         *,
+        motion_axis: str,
         distance_scale: float,
         duration_steps: int,
         speed: float = DEFAULT_BOX_EE_SPEED,
@@ -516,15 +535,14 @@ class BoxEndEffectorController:
         if self._state.motion_active:
             gs.raise_exception(f"BoxEE controller '{self.controller_id}' already has an active motion.")
         if not np.isfinite(distance_scale) or distance_scale <= 0.0 or distance_scale > max_distance_scale:
-            gs.raise_exception(
-                f"distance_scale must be finite and in (0, {max_distance_scale}], got {distance_scale}."
-            )
+            gs.raise_exception(f"distance_scale must be finite and in (0, {max_distance_scale}], got {distance_scale}.")
         if not np.isfinite(speed) or speed <= 0.0:
             gs.raise_exception(f"speed must be positive, got {speed}.")
         if int(duration_steps) <= 0:
             gs.raise_exception(f"duration_steps must be positive, got {duration_steps}.")
 
         dt = self._scene_dt(dt)
+        direction = motion_axis_vector(motion_axis)
         mins, maxs = su.aabb_bounds(self._state.env_local_box)
         reference_extent = float(np.max(maxs - mins))
         distance = float(distance_scale * reference_extent)
@@ -532,6 +550,7 @@ class BoxEndEffectorController:
             gs.raise_exception("distance_scale and AABB max extent must produce a positive move distance.")
 
         self._motion_start_targets = _copy_float_array(self._state.target_positions)
+        self._motion_direction = direction
         self._motion_distance = distance
         self._motion_moved_distance = 0.0
         self._motion_speed = float(speed)
@@ -543,6 +562,7 @@ class BoxEndEffectorController:
             env_local_box=_copy_float_array(self._state.env_local_box),
             selected_vertices=_copy_int_array(self._state.selected_vertices),
             target_positions=_copy_float_array(self._state.target_positions),
+            motion_axis=motion_axis,
             displacement=np.zeros(3, dtype=_float_dtype()),
             selection_tolerance=float(self._state.selection_tolerance),
             duration_steps=int(duration_steps),
@@ -556,6 +576,25 @@ class BoxEndEffectorController:
             optional=self._state.optional,
         )
         return self._state
+
+    def move_positive_y(
+        self,
+        *,
+        distance_scale: float,
+        duration_steps: int,
+        speed: float = DEFAULT_BOX_EE_SPEED,
+        max_distance_scale: float = DEFAULT_MAX_DISTANCE_SCALE,
+        dt: float | None = None,
+    ) -> BoxEndEffectorState:
+        """Compatibility wrapper for callers that predate signed-axis motion."""
+        return self.move_cardinal_axis(
+            motion_axis="+Y",
+            distance_scale=distance_scale,
+            duration_steps=duration_steps,
+            speed=speed,
+            max_distance_scale=max_distance_scale,
+            dt=dt,
+        )
 
     def move_positive_y_immediate(
         self,
@@ -605,6 +644,7 @@ class BoxEndEffectorController:
             env_local_box=_copy_float_array(self._state.env_local_box),
             selected_vertices=_copy_int_array(self._state.selected_vertices),
             target_positions=_copy_float_array(targets),
+            motion_axis=self._state.motion_axis,
             displacement=displacement,
             selection_tolerance=float(self._state.selection_tolerance),
             duration_steps=int(self._state.duration_steps),
@@ -621,11 +661,12 @@ class BoxEndEffectorController:
             self._clear_motion()
         return self._state
 
-    def grasp_and_move_positive_y(
+    def grasp_and_move_cardinal_axis(
         self,
         aabb_box,
         *,
         frame: str = "env_local",
+        motion_axis: str,
         distance_scale: float,
         duration_steps: int,
         speed: float = DEFAULT_BOX_EE_SPEED,
@@ -647,11 +688,42 @@ class BoxEndEffectorController:
         )
         if state.selected_vertex_count == 0:
             return state
-        return self.move_positive_y(
+        return self.move_cardinal_axis(
+            motion_axis=motion_axis,
             distance_scale=distance_scale,
             duration_steps=duration_steps,
             speed=speed,
             max_distance_scale=max_distance_scale,
+        )
+
+    def grasp_and_move_positive_y(
+        self,
+        aabb_box,
+        *,
+        frame: str = "env_local",
+        distance_scale: float,
+        duration_steps: int,
+        speed: float = DEFAULT_BOX_EE_SPEED,
+        max_distance_scale: float = DEFAULT_MAX_DISTANCE_SCALE,
+        optional: bool = False,
+        is_soft_constraint: bool = False,
+        stiffness: float = 0.0,
+        selection_tolerance: float | None = None,
+        atol: float | None = None,
+    ) -> BoxEndEffectorState:
+        return self.grasp_and_move_cardinal_axis(
+            aabb_box,
+            frame=frame,
+            motion_axis="+Y",
+            distance_scale=distance_scale,
+            duration_steps=duration_steps,
+            speed=speed,
+            max_distance_scale=max_distance_scale,
+            optional=optional,
+            is_soft_constraint=is_soft_constraint,
+            stiffness=stiffness,
+            selection_tolerance=selection_tolerance,
+            atol=atol,
         )
 
     def release(self) -> BoxEndEffectorState:
@@ -676,6 +748,7 @@ class BoxEndEffectorController:
             env_local_box=_copy_float_array(self._state.env_local_box),
             selected_vertices=np.empty((0,), dtype=gs.np_int if gs._initialized else np.int32),
             target_positions=_empty_targets(),
+            motion_axis=self._state.motion_axis,
             displacement=_copy_float_array(self._state.displacement),
             selection_tolerance=float(self._state.selection_tolerance),
             duration_steps=self._state.duration_steps,

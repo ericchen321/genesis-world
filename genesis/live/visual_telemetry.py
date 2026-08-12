@@ -18,6 +18,7 @@ PANEL_SIZE = (256, 256)
 GENESIS_NATIVE_DEBUG_CAMERA_RENDERER = "genesis_native_debug_camera_renderer"
 ANCHOR_DEBUG_BOX_COLOR = (0.16, 0.43, 1.0, 1.0)
 CONTROLLER_DEBUG_BOX_COLOR = (1.0, 0.35, 0.16, 1.0)
+CONTROLLER_DEBUG_AXIS_COLOR = (1.0, 0.35, 0.16, 1.0)
 DEBUG_BOX_WIREFRAME_RADIUS = 0.004
 
 
@@ -75,7 +76,9 @@ def _triptych_world_bounds(session, boxes: list[np.ndarray] | None = None) -> tu
     return bbox_min - pad, bbox_max + pad
 
 
-def _triptych_camera_pose(label: str, bbox_min: np.ndarray, bbox_max: np.ndarray) -> dict[str, tuple[float, float, float]]:
+def _triptych_camera_pose(
+    label: str, bbox_min: np.ndarray, bbox_max: np.ndarray
+) -> dict[str, tuple[float, float, float]]:
     if label not in PANEL_ORDER:
         raise ValueError(f"Unsupported RGB triptych panel label: {label}")
 
@@ -246,9 +249,7 @@ def _render_camera_depth(camera: Any, *, label: str, force_render: bool) -> np.n
     if depth is None:
         raise ValueError(f"Genesis debug camera {label!r} did not return depth data")
     array = _camera_scalar_array(depth, label=label, camera=camera)
-    valid = np.isfinite(array) & (array > float(camera.near)) & (
-        array < float(camera.far) * (1.0 - 1.0e-3)
-    )
+    valid = np.isfinite(array) & (array > float(camera.near)) & (array < float(camera.far) * (1.0 - 1.0e-3))
     image = np.zeros((*array.shape, 3), dtype=np.uint8)
     if np.any(valid):
         minimum = float(np.min(array[valid]))
@@ -292,8 +293,10 @@ def _render_camera_normal(camera: Any, *, label: str, force_render: bool) -> np.
         image = np.rint(255.0 * np.clip(array, 0.0, 1.0)).astype(np.uint8)
     else:
         image = np.clip(array, 0, 255).astype(np.uint8)
-    valid = np.isfinite(depth_array) & (depth_array > float(camera.near)) & (
-        depth_array < float(camera.far) * (1.0 - 1.0e-3)
+    valid = (
+        np.isfinite(depth_array)
+        & (depth_array > float(camera.near))
+        & (depth_array < float(camera.far) * (1.0 - 1.0e-3))
     )
     image[~valid] = 0
     return np.ascontiguousarray(image)
@@ -369,10 +372,12 @@ class VisualTelemetry:
         self.output_dir = Path(output_dir)
         self.triptych_cameras: dict[str, Any] = {}
         self._triptych_debug_marker_handles: list[Any] = []
+        self._measurement_camera_baseline: dict[str, Any] | None = None
 
     def reset_triptych_cameras(self) -> None:
         self.triptych_cameras.clear()
         self._triptych_debug_marker_handles.clear()
+        self._measurement_camera_baseline = None
 
     def register_triptych_cameras(self, session) -> None:
         self.reset_triptych_cameras()
@@ -399,6 +404,51 @@ class VisualTelemetry:
             raise ValueError(f"RGB triptych camera is not registered for panel {label!r}")
         return self.triptych_cameras[label]
 
+    def freeze_triptych_for_measurement(self, session, tracker) -> None:
+        """Freeze one episode's camera poses before motion starts.
+
+        The sweep is a runtime controller bound, not a model-facing value; it
+        is intentionally retained only in the Genesis trace/artifact metadata.
+        """
+        if self._measurement_camera_baseline is not None:
+            raise ValueError("A measurement camera baseline already exists for this live episode")
+        controller = session.controllers.get(tracker.controller_id)
+        if controller is None:
+            raise ValueError("Cannot freeze a measurement camera without its live controller")
+        state = controller.state
+        sweep_box = np.asarray(state.env_local_box, dtype=np.float32).copy()
+        # At baseline the applied displacement is zero; use the controller's
+        # already-resolved full runtime distance to cover the complete sweep.
+        axis_vectors = {
+            "+X": (1.0, 0.0, 0.0),
+            "-X": (-1.0, 0.0, 0.0),
+            "+Y": (0.0, 1.0, 0.0),
+            "-Y": (0.0, -1.0, 0.0),
+            "+Z": (0.0, 0.0, 1.0),
+            "-Z": (0.0, 0.0, -1.0),
+        }
+        motion_axis = state.motion_axis
+        if motion_axis not in axis_vectors:
+            raise ValueError(f"measurement controller has unsupported motion_axis {motion_axis!r}")
+        displacement = np.asarray(axis_vectors[motion_axis], dtype=np.float32) * float(state.distance)
+        sweep_box[:3] = np.minimum(sweep_box[:3], sweep_box[:3] + displacement)
+        sweep_box[3:] = np.maximum(sweep_box[3:], sweep_box[3:] + displacement)
+        anchor_boxes = [
+            np.asarray(record.env_local_box, dtype=np.float32)
+            for record in session.anchor_records.get(tracker.entity_name, [])
+        ]
+        bbox_min, bbox_max = _triptych_world_bounds(session, anchor_boxes + [sweep_box])
+        poses = {label: _triptych_camera_pose(label, bbox_min, bbox_max) for label in PANEL_ORDER}
+        for label, pose in poses.items():
+            self.triptych_camera(label).set_pose(pos=pose["pos"], lookat=pose["lookat"], up=pose["up"])
+        self._measurement_camera_baseline = {
+            "measurement_id": tracker.measurement_id,
+            "bounds": np.concatenate((bbox_min, bbox_max)).astype(float).tolist(),
+            "sweep_box": sweep_box.astype(float).tolist(),
+            "motion_axis": motion_axis,
+            "poses": poses,
+        }
+
     def _clear_triptych_debug_markers(self, session) -> None:
         if session.scene is None:
             self._triptych_debug_marker_handles.clear()
@@ -422,6 +472,25 @@ class VisualTelemetry:
                 wireframe_radius=DEBUG_BOX_WIREFRAME_RADIUS,
             )
             self._triptych_debug_marker_handles.append(handle)
+            motion_axis = record.get("motion_axis")
+            if record.get("kind") == "live_box_controller" and motion_axis in {"+X", "-X", "+Y", "-Y", "+Z", "-Z"}:
+                axis_vectors = {
+                    "+X": (1.0, 0.0, 0.0),
+                    "-X": (-1.0, 0.0, 0.0),
+                    "+Y": (0.0, 1.0, 0.0),
+                    "-Y": (0.0, -1.0, 0.0),
+                    "+Z": (0.0, 0.0, 1.0),
+                    "-Z": (0.0, 0.0, -1.0),
+                }
+                center = bounds.mean(axis=0)
+                length = max(float(np.max(bounds[1] - bounds[0])) * 0.75, 0.01)
+                axis_handle = session.scene.draw_debug_arrow(
+                    center,
+                    np.asarray(axis_vectors[motion_axis], dtype=np.float32) * length,
+                    radius=DEBUG_BOX_WIREFRAME_RADIUS,
+                    color=CONTROLLER_DEBUG_AXIS_COLOR,
+                )
+                self._triptych_debug_marker_handles.append(axis_handle)
             marker_records.append(
                 {
                     "index": int(index),
@@ -433,6 +502,8 @@ class VisualTelemetry:
                     "displacement": record.get("displacement"),
                     "moved_distance": record.get("moved_distance"),
                     "motion_active": record.get("motion_active"),
+                    "motion_axis": motion_axis,
+                    "motion_axis_label": motion_axis,
                     "color": list(color),
                     "wireframe": True,
                     "wireframe_radius": DEBUG_BOX_WIREFRAME_RADIUS,
@@ -455,7 +526,16 @@ class VisualTelemetry:
         controller_records = controller_overlay_records(session.controllers)
         overlays = _render_overlay_records(anchor_records + controller_records)
         boxes = _boxes_from_overlays(overlays)
-        bbox_min, bbox_max = _triptych_world_bounds(session, boxes)
+        frozen_baseline = self._measurement_camera_baseline
+        if frozen_baseline is None:
+            bbox_min, bbox_max = _triptych_world_bounds(session, boxes)
+        else:
+            frozen = np.asarray(frozen_baseline["bounds"], dtype=np.float32)
+            for box in boxes:
+                candidate = np.asarray(box, dtype=np.float32)
+                if np.any(candidate[:3] < frozen[:3]) or np.any(candidate[3:] > frozen[3:]):
+                    raise ValueError("measurement candidate falls outside frozen camera coverage; refusing to reframe")
+            bbox_min, bbox_max = frozen[:3], frozen[3:]
 
         marker_records = []
         panel_records = []
@@ -487,8 +567,13 @@ class VisualTelemetry:
                 camera = self.triptych_camera(label)
                 if not bool(camera.debug):
                     raise ValueError(f"Diagnostic triptych camera {label!r} is not a debug camera")
-                pose = _triptych_camera_pose(label, bbox_min, bbox_max)
-                camera.set_pose(pos=pose["pos"], lookat=pose["lookat"], up=pose["up"])
+                pose = (
+                    frozen_baseline["poses"][label]
+                    if frozen_baseline is not None
+                    else _triptych_camera_pose(label, bbox_min, bbox_max)
+                )
+                if frozen_baseline is None:
+                    camera.set_pose(pos=pose["pos"], lookat=pose["lookat"], up=pose["up"])
                 render_started = time.perf_counter()
                 if mode == "rgb_triptych":
                     image = _render_camera_rgb(camera, label=label, force_render=panel_index == 0)
@@ -569,9 +654,7 @@ class VisualTelemetry:
             actual_upload_stats = dict(context.jit.last_buffer_upload_stats)
             active_part_nodes = len(context.part_segmentation_nodes) if mode == "part_segmentation_triptych" else 0
             active_context_nodes = (
-                len(context.part_segmentation_context_nodes)
-                if mode == "part_segmentation_triptych"
-                else 0
+                len(context.part_segmentation_context_nodes) if mode == "part_segmentation_triptych" else 0
             )
             indexed_parts = [
                 {
@@ -603,12 +686,8 @@ class VisualTelemetry:
                     "mode": mode,
                     "camera_model": "pinhole",
                     "debug_camera": True,
-                    "panel_camera_models": {
-                        record["label"]: record["camera"]["model"] for record in panel_records
-                    },
-                    "panel_debug_cameras": {
-                        record["label"]: record["camera"]["debug"] for record in panel_records
-                    },
+                    "panel_camera_models": {record["label"]: record["camera"]["model"] for record in panel_records},
+                    "panel_debug_cameras": {record["label"]: record["camera"]["debug"] for record in panel_records},
                     "panel_size": list(PANEL_SIZE),
                 },
                 "geometry": {
@@ -644,9 +723,7 @@ class VisualTelemetry:
                     )
                     if mode == "part_segmentation_triptych"
                     else 0,
-                    "segmentation_render_count": len(PANEL_ORDER)
-                    if mode == "part_segmentation_triptych"
-                    else 0,
+                    "segmentation_render_count": len(PANEL_ORDER) if mode == "part_segmentation_triptych" else 0,
                     "panel_raster_seconds": panel_render_seconds,
                     "stitch_seconds": stitch_seconds,
                     "png_encode_write_seconds": png_encode_write_seconds,

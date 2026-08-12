@@ -3,7 +3,11 @@ import numpy as np
 import pytest
 
 import genesis as gs
-from genesis.engine.controllers.box_end_effector import BoxEndEffectorController, apply_static_box_anchors
+from genesis.engine.controllers.box_end_effector import (
+    BoxEndEffectorController,
+    apply_static_box_anchors,
+    motion_axis_vector,
+)
 from genesis.utils.spatial_selection import aabb_to_env_local, select_vertices_in_aabb
 from genesis.utils.misc import tensor_to_array
 
@@ -206,6 +210,52 @@ def test_box_ee_move_updates_constraint_targets_deterministically(tmp_path):
     np.testing.assert_allclose(_constraint_target(scene, entity, 3), np.array([0.0, 0.05, 1.0]), atol=1e-6)
     assert state.moved_distance == pytest.approx(0.05)
     assert not state.motion_active
+
+
+@pytest.mark.parametrize(
+    ("axis", "expected"),
+    (
+        ("+X", [1.0, 0.0, 0.0]),
+        ("-X", [-1.0, 0.0, 0.0]),
+        ("+Y", [0.0, 1.0, 0.0]),
+        ("-Y", [0.0, -1.0, 0.0]),
+        ("+Z", [0.0, 0.0, 1.0]),
+        ("-Z", [0.0, 0.0, -1.0]),
+    ),
+)
+def test_box_ee_motion_axis_is_signed_cardinal(axis, expected):
+    np.testing.assert_allclose(motion_axis_vector(axis), np.asarray(expected, dtype=gs.np_float))
+
+
+def test_box_ee_motion_axis_rejects_raw_vector_or_unknown_axis():
+    with pytest.raises(gs.GenesisException, match="motion_axis"):
+        motion_axis_vector([1.0, 0.0, 0.0])
+    with pytest.raises(gs.GenesisException, match="motion_axis"):
+        motion_axis_vector("+Q")
+
+
+@pytest.mark.parametrize(
+    ("axis", "direction"),
+    (
+        ("+X", [1.0, 0.0, 0.0]),
+        ("-X", [-1.0, 0.0, 0.0]),
+        ("+Y", [0.0, 1.0, 0.0]),
+        ("-Y", [0.0, -1.0, 0.0]),
+        ("+Z", [0.0, 0.0, 1.0]),
+        ("-Z", [0.0, 0.0, -1.0]),
+    ),
+)
+def test_box_ee_cardinal_motion_moves_only_on_requested_signed_component(tmp_path, axis, direction):
+    scene, entity = _build_two_tet_scene(tmp_path)
+    controller = BoxEndEffectorController(entity)
+    controller.grasp([-0.05, -0.05, 0.95, 0.05, 0.05, 1.05])
+    state = controller.move_cardinal_axis(motion_axis=axis, distance_scale=0.5, duration_steps=12, speed=0.6)
+    state = controller.advance_motion(steps=12)
+
+    expected = np.asarray([0.0, 0.0, 1.0], dtype=gs.np_float) + np.asarray(direction, dtype=gs.np_float) * 0.05
+    assert state.motion_axis == axis
+    np.testing.assert_allclose(state.displacement, np.asarray(direction, dtype=gs.np_float) * 0.05, atol=1e-6)
+    np.testing.assert_allclose(_constraint_target(scene, entity, 3), expected, atol=1e-6)
 
 
 def test_box_ee_motion_uses_speed_and_duration_steps(tmp_path):

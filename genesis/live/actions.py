@@ -22,6 +22,7 @@ BOX_EE_COMPLIANCE_OVERRIDE_KEYS = frozenset(
         "is_soft_constraint",
     }
 )
+BOX_EE_DIRECTION_ALIAS_KEYS = frozenset({"direction", "direction_vector", "motion_vector", "axis_vector", "vector"})
 
 
 class ActionRegistry:
@@ -68,6 +69,22 @@ def _reject_compliance_override_keys(params: dict[str, Any], controller_spec: di
         )
 
 
+def _validated_motion_axis(params: dict[str, Any], controller_spec: dict[str, Any]) -> str:
+    offenders = sorted(
+        [f"controllers[0].{key}" for key in BOX_EE_DIRECTION_ALIAS_KEYS if key in controller_spec]
+        + [f"params.{key}" for key in BOX_EE_DIRECTION_ALIAS_KEYS if key in params]
+    )
+    if offenders:
+        raise GenesisLiveError(
+            "invalid_controller_request",
+            "box controller accepts only motion_axis; remove direction alias field(s): " + ", ".join(offenders),
+        )
+    axis = controller_spec.get("motion_axis")
+    if not isinstance(axis, str) or axis not in {"+X", "-X", "+Y", "-Y", "+Z", "-Z"}:
+        raise GenesisLiveError("invalid_controller_request", "box controller requires one signed cardinal motion_axis")
+    return axis
+
+
 def _box_ee_compliant_policy(entity) -> tuple[bool, float]:
     from genesis.engine.couplers import IPCCoupler
     from genesis.engine.materials.FEM.cloth import Cloth as ClothMaterial
@@ -100,6 +117,7 @@ def apply_probe_action(session, params: dict[str, Any]) -> dict[str, Any]:
         distance_scale = controller_spec.get("distance_scale")
         if distance_scale is None:
             raise GenesisLiveError("invalid_controller_request", "box controller requires distance_scale")
+        motion_axis = _validated_motion_axis(params, controller_spec)
         duration_steps = int(params.get("duration_steps", controller_spec.get("duration_steps", 1)))
         box_tolerance = None
         if isinstance(aabb_box, dict):
@@ -116,9 +134,10 @@ def apply_probe_action(session, params: dict[str, Any]) -> dict[str, Any]:
         frame = aabb_box.get("frame", "env_local") if isinstance(aabb_box, dict) else "env_local"
         is_soft_constraint, compliance_value = _box_ee_compliant_policy(entity)
         try:
-            state = controller.grasp_and_move_positive_y(
+            state = controller.grasp_and_move_cardinal_axis(
                 aabb_box,
                 frame=frame,
+                motion_axis=motion_axis,
                 distance_scale=float(distance_scale),
                 duration_steps=duration_steps,
                 speed=float(controller_spec.get("speed", params.get("speed", 0.6))),
@@ -138,6 +157,16 @@ def apply_probe_action(session, params: dict[str, Any]) -> dict[str, Any]:
                 details={"action": action, "entity": entity_name, "controller_id": controller_id},
             ) from exc
         session.controllers[controller_id] = controller
+        measurement = params.get("measurement")
+        if measurement is not None:
+            if not isinstance(measurement, dict):
+                raise GenesisLiveError("invalid_probe_measurement", "measurement lineage must be an object")
+            session.begin_probe_measurement(
+                measurement=measurement,
+                entity_name=entity_name,
+                controller_id=controller_id,
+                target_vertices=state.selected_vertices,
+            )
         return {
             "action": action,
             "entity": entity_name,
@@ -145,6 +174,7 @@ def apply_probe_action(session, params: dict[str, Any]) -> dict[str, Any]:
             "controller_state": state.to_dict(),
             "selected_vertex_count": state.selected_vertex_count,
             "selected_vertices": state.selected_vertices.tolist(),
+            "motion_axis": state.motion_axis,
         }
 
     if action == "probe_release":
@@ -155,6 +185,7 @@ def apply_probe_action(session, params: dict[str, Any]) -> dict[str, Any]:
         if controller is None:
             raise GenesisLiveError("unknown_controller", f"unknown controller: {controller_id}")
         state = controller.release()
+        session.release_probe_measurement(controller_id)
         session.controllers.pop(controller_id, None)
         return {"action": action, "controller_id": controller_id, "controller_state": state.to_dict()}
 

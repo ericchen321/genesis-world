@@ -13,9 +13,19 @@ import pytest
 from PIL import Image
 
 import genesis as gs
-from genesis.live.protocol import PROTOCOL, GenesisLiveError, recv_json, send_json
+from genesis.engine.controllers.box_end_effector import BoxAnchorRecord
+from genesis.live.capabilities import capability_report
+from genesis.live.protocol import (
+    ANCHOR_RELATIVE_PROBE_MEASUREMENT_CAPABILITY,
+    MAX_MESSAGE_BYTES,
+    PROTOCOL,
+    GenesisLiveError,
+    encode_frame,
+    recv_json,
+    send_json,
+)
 from genesis.live.server import GenesisLiveServer
-from genesis.live.session import GenesisLiveSession
+from genesis.live.session import GenesisLiveSession, ProbeMeasurementTracker
 from genesis.live.visual_telemetry import GENESIS_NATIVE_DEBUG_CAMERA_RENDERER
 
 _TWO_TET_VERTS = np.array(
@@ -29,6 +39,158 @@ _TWO_TET_VERTS = np.array(
     dtype=np.float64,
 )
 _TWO_TETS = np.array([[0, 1, 2, 3], [0, 2, 1, 4]], dtype=np.int64)
+
+
+def _measurement_session_with_anchors(anchors: list[BoxAnchorRecord]) -> GenesisLiveSession:
+    entity = object()
+    session = GenesisLiveSession.__new__(GenesisLiveSession)
+    session.entities = {"body": entity}
+    session.anchor_records = {"body": anchors}
+    session.probe_measurements = {}
+    session.controllers = {}
+    session.visual_telemetry = SimpleNamespace(freeze_triptych_for_measurement=lambda *_: None)
+    session._entity_positions_for_validation = lambda *_args, **_kwargs: _TWO_TET_VERTS
+    return session
+
+
+def _measurement_anchor(anchor_id: str, selected_vertices: list[int]) -> BoxAnchorRecord:
+    box = np.array([-0.1, -0.1, -0.1, 0.1, 0.1, 0.1], dtype=np.float64)
+    return BoxAnchorRecord(
+        anchor_id=anchor_id,
+        frame="env_local",
+        source_box=box.copy(),
+        env_local_box=box.copy(),
+        selected_vertices=np.asarray(selected_vertices, dtype=np.int64),
+    )
+
+
+def test_probe_measurement_matches_canonical_static_anchor_id_and_release():
+    anchor_id = "brim_midspan_from_front_band"
+    session = _measurement_session_with_anchors([_measurement_anchor(anchor_id, [0])])
+
+    tracker = session.begin_probe_measurement(
+        measurement={"measurement_id": "measurement_0001", "anchor_id": anchor_id},
+        entity_name="body",
+        controller_id="controller_1",
+        target_vertices=np.array([1], dtype=np.int64),
+    )
+    session.release_probe_measurement("controller_1")
+
+    assert tracker.anchor_id == anchor_id
+    assert tracker.phase == "post_release"
+
+
+def test_probe_measurement_rejects_conflicting_static_anchor_matches():
+    anchor_id = "brim_midspan_from_front_band"
+    session = _measurement_session_with_anchors(
+        [_measurement_anchor(anchor_id, [0]), _measurement_anchor(anchor_id, [1])]
+    )
+
+    with pytest.raises(GenesisLiveError, match="exactly one non-empty matching static anchor") as exc_info:
+        session.begin_probe_measurement(
+            measurement={"measurement_id": "measurement_0001", "anchor_id": anchor_id},
+            entity_name="body",
+            controller_id="controller_1",
+            target_vertices=np.array([2], dtype=np.int64),
+        )
+
+    assert exc_info.value.code == "invalid_probe_measurement"
+    assert exc_info.value.details["matches"] == 2
+
+
+def test_non_y_live_apply_passes_runtime_selected_vertices_to_tracker(tmp_path):
+    session = GenesisLiveSession(
+        scene_config_path=str(_write_scene_config(tmp_path)), start_paused=True, output_dir=str(tmp_path / "outputs")
+    )
+    response = session.dispatch(
+        "probe.apply",
+        {
+            "action": "box_ee_grasp_and_move",
+            "entity": "body",
+            "duration_steps": 12,
+            "measurement": {"measurement_id": "non_y_measurement", "anchor_id": "bottom_pin", "motion_axis": "-X"},
+            "controllers": [
+                {
+                    "controller_id": "non_y_box",
+                    "aabb_box": {"frame": "env_local", "box": [-0.05, -0.05, 0.95, 0.05, 0.05, 1.05]},
+                    "distance_scale": 0.5,
+                    "motion_axis": "-X",
+                }
+            ],
+        },
+    )
+    selected = response["probe"]["selected_vertices"]
+    tracker = session.probe_measurements["non_y_measurement"]
+
+    assert selected == [3]
+    assert tracker.target_vertices.tolist() == selected
+    assert session.controllers["non_y_box"].state.motion_axis == "-X"
+    session.dispatch("sim.resume", {"steps": 12})
+    assert tracker.samples[-1]["controller_lineage"]["motion_axis"] == "-X"
+
+
+def test_probe_measurement_socket_payload_is_bounded_and_keeps_large_trace_private(tmp_path):
+    target_vertices = np.arange(1, 100_001, dtype=np.int64)
+    positions = np.zeros((100_001, 3), dtype=np.float64)
+    entity = object()
+    controller = SimpleNamespace(
+        snapshot=lambda: {
+            "displacement": [0.0, 0.01, 0.0],
+            "distance": 0.01,
+            "moved_distance": 0.01,
+            "duration_steps": 32,
+            "estimated_motion_steps": 32,
+            "active": True,
+            "motion_active": True,
+            "selected_vertices": target_vertices.tolist(),
+            "target_positions": positions[target_vertices].tolist(),
+        }
+    )
+    sampling_session = SimpleNamespace(
+        entities={"body": entity},
+        controllers={"controller_1": controller},
+        current_step=1,
+        _entity_positions_for_validation=lambda *_args, **_kwargs: positions,
+    )
+    tracker = ProbeMeasurementTracker(
+        measurement_id="measurement_0001",
+        entity_name="body",
+        entity=entity,
+        controller_id="controller_1",
+        anchor_id="brim_midspan_from_front_band",
+        target_vertices=target_vertices,
+        anchor_vertices=np.array([0], dtype=np.int64),
+        baseline_target_centroid=np.zeros(3),
+        baseline_anchor_centroid=np.zeros(3),
+        baseline_relative=np.zeros(3),
+        lineage={},
+    )
+    tracker.sample(sampling_session)
+    tracker.samples *= 1_000
+
+    session = GenesisLiveSession.__new__(GenesisLiveSession)
+    session.output_dir = str(tmp_path)
+    session.probe_measurements = {tracker.measurement_id: tracker}
+    payload = session._probe_measurement_payload()
+    encoded_response = encode_frame({"ok": True, "data": {"probe_measurement": payload}})
+
+    assert len(encoded_response) < 4_096
+    assert len(encoded_response) < MAX_MESSAGE_BYTES
+    assert b"target_vertices" not in encoded_response
+    assert b"samples" not in encoded_response
+    assert b"target_positions" not in encoded_response
+    artifact_path = tmp_path / payload["private_trace_ref"]["relative_path"]
+    private_trace = json.loads(artifact_path.read_text(encoding="utf-8"))
+    assert private_trace["target_vertices"] == target_vertices.tolist()
+    assert len(private_trace["samples"]) == 1_000
+    assert "target_positions" not in private_trace["samples"][0]["controller_lineage"]
+
+
+def test_probe_measurement_capability_is_reported_and_requireable():
+    report = capability_report((ANCHOR_RELATIVE_PROBE_MEASUREMENT_CAPABILITY,), diagnostic_scene=True)
+
+    assert ANCHOR_RELATIVE_PROBE_MEASUREMENT_CAPABILITY in report["capabilities"]
+    assert report["missing_required_capabilities"] == []
 
 
 def _write_scene_config(tmp_path: Path) -> Path:
@@ -129,6 +291,7 @@ def test_live_session_lifecycle_and_box_action(tmp_path):
     handshake = session.dispatch("session.handshake", {})
     assert handshake["protocol"] == PROTOCOL
     assert "live_box_controller_actions" in handshake["capabilities"]
+    assert ANCHOR_RELATIVE_PROBE_MEASUREMENT_CAPABILITY in handshake["capabilities"]
     assert session.status()["current_step"] == 0
     assert session.status()["paused"]
     assert session.scene.fem_solver.enable_floor is False
@@ -156,6 +319,7 @@ def test_live_session_lifecycle_and_box_action(tmp_path):
                     "controller_id": "diag_box",
                     "aabb_box": {"frame": "env_local", "box": [-0.05, -0.05, 0.95, 0.05, 0.05, 1.05]},
                     "distance_scale": 0.5,
+                    "motion_axis": "+Y",
                 }
             ],
         },
@@ -163,6 +327,7 @@ def test_live_session_lifecycle_and_box_action(tmp_path):
     assert action["probe"]["selected_vertex_count"] == 1
     action_state = action["probe"]["controller_state"]
     assert action_state["speed"] == pytest.approx(0.6)
+    assert action_state["motion_axis"] == "+Y"
     assert action_state["motion_active"] is True
     assert action_state["moved_distance"] == pytest.approx(0.0)
     assert action_state["displacement"] == pytest.approx([0.0, 0.0, 0.0])
@@ -346,6 +511,7 @@ def test_live_server_subprocess_ready_handshake_status_and_close(tmp_path):
         assert ready["start_paused"] is True
         assert ready["scene_config_path"] == str(config_path)
         assert "live_box_controller_actions" in ready["capabilities"]
+        assert ANCHOR_RELATIVE_PROBE_MEASUREMENT_CAPABILITY in ready["capabilities"]
 
         with socket.create_connection((ready["host"], ready["port"]), timeout=30.0) as sock:
             handshake = _request(sock, "session.handshake", request_id="hello")
@@ -399,6 +565,7 @@ def test_diagnostic_live_ready_and_handshake_hide_textured_overlay_capabilities(
     assert forbidden.isdisjoint(handshake["capabilities"])
     assert ready["capabilities"] == handshake["capabilities"]
     assert "part_segmentation_triptych_telemetry" in ready["capabilities"]
+    assert ANCHOR_RELATIVE_PROBE_MEASUREMENT_CAPABILITY in ready["capabilities"]
 
 
 def test_live_package_does_not_contain_removed_server_protocol_names():

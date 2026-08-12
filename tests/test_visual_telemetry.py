@@ -1,6 +1,7 @@
 import hashlib
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import igl
 import numpy as np
@@ -32,6 +33,51 @@ _TWO_TET_VERTS = np.array(
     dtype=np.float64,
 )
 _TWO_TETS = np.array([[0, 1, 2, 3], [0, 2, 1, 4]], dtype=np.int64)
+
+
+@pytest.mark.parametrize(
+    ("axis", "expected_min", "expected_max"),
+    (
+        ("+X", [0.0, 0.0, 0.0], [3.0, 2.0, 3.0]),
+        ("-X", [-2.0, 0.0, 0.0], [1.0, 2.0, 3.0]),
+        ("+Y", [0.0, 0.0, 0.0], [1.0, 4.0, 3.0]),
+        ("-Y", [0.0, -2.0, 0.0], [1.0, 2.0, 3.0]),
+        ("+Z", [0.0, 0.0, 0.0], [1.0, 2.0, 5.0]),
+        ("-Z", [0.0, 0.0, -2.0], [1.0, 2.0, 3.0]),
+    ),
+)
+def test_measurement_camera_sweep_covers_each_signed_axis(monkeypatch, tmp_path, axis, expected_min, expected_max):
+    class FakeCamera:
+        def __init__(self):
+            self.poses = []
+
+        def set_pose(self, **pose):
+            self.poses.append(pose)
+
+    def bounds(_session, boxes):
+        joined = np.vstack(boxes)
+        return joined[:, :3].min(axis=0), joined[:, 3:].max(axis=0)
+
+    monkeypatch.setattr(visual_telemetry, "_triptych_world_bounds", bounds)
+    monkeypatch.setattr(
+        visual_telemetry,
+        "_triptych_camera_pose",
+        lambda _label, _mins, _maxs: {"pos": (1.0, 1.0, 1.0), "lookat": (0.0, 0.0, 0.0), "up": (0.0, 1.0, 0.0)},
+    )
+    telemetry = visual_telemetry.VisualTelemetry(tmp_path / "outputs")
+    telemetry.triptych_cameras = {label: FakeCamera() for label in visual_telemetry.PANEL_ORDER}
+    state = SimpleNamespace(env_local_box=np.asarray([0.0, 0.0, 0.0, 1.0, 2.0, 3.0]), distance=2.0, motion_axis=axis)
+    session = SimpleNamespace(controllers={"controller": SimpleNamespace(state=state)}, anchor_records={"body": []})
+    tracker = SimpleNamespace(controller_id="controller", measurement_id="measurement", entity_name="body")
+
+    telemetry.freeze_triptych_for_measurement(session, tracker)
+
+    baseline = telemetry._measurement_camera_baseline
+    assert baseline["motion_axis"] == axis
+    assert baseline["sweep_box"][:3] == pytest.approx(expected_min)
+    assert baseline["sweep_box"][3:] == pytest.approx(expected_max)
+    for camera in telemetry.triptych_cameras.values():
+        assert len(camera.poses) == 1
 
 
 def _write_scene_config(tmp_path: Path) -> Path:
@@ -286,6 +332,7 @@ def test_rgb_triptych_writes_panels_stitched_metadata_and_visible_overlays(
                     "controller_id": "diag_box",
                     "aabb_box": {"frame": "env_local", "box": [-0.05, -0.05, 0.95, 0.05, 0.05, 1.05]},
                     "distance_scale": 0.5,
+                    "motion_axis": "+Y",
                 }
             ],
         },

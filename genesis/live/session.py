@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import threading
 import time
@@ -48,6 +49,139 @@ class VisualOverlayRecord:
     visual_rest_vertices_m: np.ndarray
 
 
+@dataclass
+class ProbeMeasurementTracker:
+    """Private, append-only FEM target-to-anchor measurement for one probe."""
+
+    measurement_id: str
+    entity_name: str
+    entity: Any
+    controller_id: str
+    anchor_id: str
+    target_vertices: np.ndarray
+    anchor_vertices: np.ndarray
+    baseline_target_centroid: np.ndarray
+    baseline_anchor_centroid: np.ndarray
+    baseline_relative: np.ndarray
+    lineage: dict[str, Any]
+    phase: str = "under_load"
+    samples: list[dict[str, Any]] | None = None
+    under_load_endpoint: dict[str, Any] | None = None
+    post_release_endpoint: dict[str, Any] | None = None
+    valid: bool = True
+    failure_reason: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.samples is None:
+            self.samples = []
+
+    def _fail(self, reason: str) -> None:
+        self.valid = False
+        self.failure_reason = reason
+        raise GenesisLiveError(
+            "probe_measurement_invalid",
+            "anchor-relative probe measurement is invalid: " + reason,
+            details={"measurement_id": self.measurement_id, "reason": reason},
+        )
+
+    def sample(self, session: "GenesisLiveSession") -> dict[str, Any]:
+        if not self.valid:
+            self._fail(self.failure_reason or "tracker was already invalid")
+        if self.entity_name not in session.entities or session.entities[self.entity_name] is not self.entity:
+            self._fail("entity lineage changed")
+        if self.target_vertices.ndim != 1 or self.anchor_vertices.ndim != 1:
+            self._fail("vertex identity arrays have invalid shape")
+        positions = session._entity_positions_for_validation(
+            self.entity_name, self.entity, checked_at="probe_measurement"
+        )
+        if (
+            self.target_vertices.size == 0
+            or self.anchor_vertices.size == 0
+            or np.any(self.target_vertices < 0)
+            or np.any(self.anchor_vertices < 0)
+            or np.any(self.target_vertices >= positions.shape[0])
+            or np.any(self.anchor_vertices >= positions.shape[0])
+        ):
+            self._fail("selected vertex identity no longer agrees with FEM state")
+        target_centroid = np.mean(positions[self.target_vertices], axis=0)
+        anchor_centroid = np.mean(positions[self.anchor_vertices], axis=0)
+        relative = target_centroid - anchor_centroid
+        displacement = relative - self.baseline_relative
+        if not all(np.all(np.isfinite(value)) for value in (target_centroid, anchor_centroid, relative, displacement)):
+            self._fail("non-finite target or anchor centroid")
+        controller = session.controllers.get(self.controller_id)
+        controller_state = controller.snapshot() if controller is not None else None
+        controller_lineage = None
+        if isinstance(controller_state, dict):
+            controller_displacement = controller_state.get("displacement")
+            controller_lineage = {
+                "displacement_env_local_m": [float(value) for value in controller_displacement]
+                if isinstance(controller_displacement, list) and len(controller_displacement) == 3
+                else None,
+                "distance_m": float(controller_state["distance"]),
+                "moved_distance_m": float(controller_state["moved_distance"]),
+                "duration_steps": int(controller_state["duration_steps"]),
+                "estimated_motion_steps": int(controller_state["estimated_motion_steps"]),
+                "motion_axis": controller_state.get("motion_axis"),
+                "active": bool(controller_state["active"]),
+                "motion_active": bool(controller_state["motion_active"]),
+            }
+        sample = {
+            "sample_index": len(self.samples),
+            "simulation_step": int(session.current_step),
+            "phase": self.phase,
+            "target_centroid_env_local_m": target_centroid.astype(float).tolist(),
+            "anchor_centroid_env_local_m": anchor_centroid.astype(float).tolist(),
+            "relative_env_local_m": relative.astype(float).tolist(),
+            "displacement_vector_env_local_m": displacement.astype(float).tolist(),
+            "magnitude_m": float(np.linalg.norm(displacement)),
+            "controller_lineage": controller_lineage,
+        }
+        self.samples.append(sample)
+        endpoint = dict(sample)
+        if self.phase == "under_load":
+            self.under_load_endpoint = endpoint
+        else:
+            self.post_release_endpoint = endpoint
+        return endpoint
+
+    def to_dict(self) -> dict[str, Any]:
+        residual = None
+        if self.post_release_endpoint is not None:
+            residual = self.post_release_endpoint["displacement_vector_env_local_m"]
+        return {
+            "measurement_id": self.measurement_id,
+            "frame": "env_local",
+            "entity": self.entity_name,
+            "controller_id": self.controller_id,
+            "anchor_id": self.anchor_id,
+            "lineage": dict(self.lineage),
+            "target_vertices": self.target_vertices.astype(int).tolist(),
+            "anchor_vertices": self.anchor_vertices.astype(int).tolist(),
+            "target_vertex_count": int(self.target_vertices.size),
+            "anchor_vertex_count": int(self.anchor_vertices.size),
+            "baseline_target_centroid_env_local_m": self.baseline_target_centroid.astype(float).tolist(),
+            "baseline_anchor_centroid_env_local_m": self.baseline_anchor_centroid.astype(float).tolist(),
+            "baseline_relative_env_local_m": self.baseline_relative.astype(float).tolist(),
+            "samples": list(self.samples),
+            "under_load_endpoint": self.under_load_endpoint,
+            "post_release_endpoint": self.post_release_endpoint,
+            "release_residual_vector_env_local_m": residual,
+            "valid": self.valid,
+            "failure_reason": self.failure_reason,
+        }
+
+    def public_endpoint(self) -> dict[str, Any] | None:
+        endpoint = self.under_load_endpoint if self.phase == "under_load" else self.post_release_endpoint
+        if endpoint is None or not self.valid:
+            return None
+        return {
+            "phase": self.phase,
+            "vector_env_local_m": list(endpoint["displacement_vector_env_local_m"]),
+            "magnitude_m": float(endpoint["magnitude_m"]),
+        }
+
+
 class GenesisLiveSession:
     def __init__(
         self,
@@ -64,6 +198,7 @@ class GenesisLiveSession:
         self.actions = ActionRegistry()
         self.controllers = {}
         self.anchor_records = {}
+        self.probe_measurements: dict[str, ProbeMeasurementTracker] = {}
         self.last_request_id = None
         self.last_frame_index = None
         self.fatal_error = None
@@ -119,8 +254,7 @@ class GenesisLiveSession:
     def _validate_scene_config_before_build(self, scene_config: dict[str, Any]) -> None:
         raw_entities = scene_config.get("entities", [])
         if is_agentic_diagnostics_scene_config(scene_config) and any(
-            isinstance(entity_cfg, dict) and entity_cfg.get("visual_overlay") is not None
-            for entity_cfg in raw_entities
+            isinstance(entity_cfg, dict) and entity_cfg.get("visual_overlay") is not None for entity_cfg in raw_entities
         ):
             raise GenesisLiveError(
                 "texture_overlay_not_supported_in_diagnostics",
@@ -178,9 +312,7 @@ class GenesisLiveSession:
                         details={"entity_index": index, "material_type": material_type},
                     )
         duplicate_overlay_owner_names = sorted(
-            spec.entity_name
-            for spec in visual_overlay_specs.values()
-            if entity_name_counts[spec.entity_name] > 1
+            spec.entity_name for spec in visual_overlay_specs.values() if entity_name_counts[spec.entity_name] > 1
         )
         if duplicate_overlay_owner_names:
             raise GenesisLiveError(
@@ -228,13 +360,18 @@ class GenesisLiveSession:
                 details={"entity_index": entity_index, "error": str(exc)},
             ) from exc
         if labels.ndim != 1 or not np.issubdtype(labels.dtype, np.integer) or np.any(labels < 0):
-            raise GenesisLiveError("invalid_part_segmentation", "primitive labels must be a non-negative integer vector")
+            raise GenesisLiveError(
+                "invalid_part_segmentation", "primitive labels must be a non-negative integer vector"
+            )
         if colors.ndim != 2 or colors.shape[1] != 3 or not np.all(np.isfinite(colors)):
             raise GenesisLiveError("invalid_part_segmentation", "part palette must contain finite RGB rows")
         colors_u8 = np.rint(colors).astype(np.int64)
         if not np.allclose(colors, colors_u8, atol=1e-6, rtol=0.0) or np.any((colors_u8 < 0) | (colors_u8 > 255)):
             raise GenesisLiveError("invalid_part_segmentation", "part palette RGB values must be integers in [0, 255]")
-        if np.any(np.all(colors_u8 == 0, axis=1)) or len({tuple(row) for row in colors_u8.tolist()}) != colors_u8.shape[0]:
+        if (
+            np.any(np.all(colors_u8 == 0, axis=1))
+            or len({tuple(row) for row in colors_u8.tolist()}) != colors_u8.shape[0]
+        ):
             raise GenesisLiveError("invalid_part_segmentation", "part palette colors must be unique and non-black")
         parts = config["parts"]
         if not isinstance(parts, list) or not parts:
@@ -263,7 +400,9 @@ class GenesisLiveSession:
         for kind, raw_color in context_palette.items():
             color = np.asarray(raw_color)
             if color.shape != (3,) or not np.issubdtype(color.dtype, np.integer):
-                raise GenesisLiveError("invalid_part_segmentation", f"context color {kind!r} must be an integer RGB triplet")
+                raise GenesisLiveError(
+                    "invalid_part_segmentation", f"context color {kind!r} must be an integer RGB triplet"
+                )
             if np.any((color < 0) | (color > 255)):
                 raise GenesisLiveError("invalid_part_segmentation", f"context color {kind!r} must be in [0, 255]")
             context_colors[kind] = tuple(int(value) for value in color)
@@ -414,6 +553,7 @@ class GenesisLiveSession:
         self.controllers.clear()
         self.actions.clear()
         self.anchor_records.clear()
+        self.probe_measurements.clear()
 
         sim_options = self._scene_config.get("sim_options", {})
         fem_options = {"enable_vertex_constraints": True}
@@ -555,11 +695,7 @@ class GenesisLiveSession:
     def _build_material(self, material_cfg: dict[str, Any]):
         material_type = material_cfg.get("type", "elastic")
         if material_type == "elastic":
-            kwargs = {
-                key: material_cfg[key]
-                for key in ("E", "nu", "rho", "friction_mu")
-                if key in material_cfg
-            }
+            kwargs = {key: material_cfg[key] for key in ("E", "nu", "rho", "friction_mu") if key in material_cfg}
             heterogeneous = material_cfg.get("heterogeneous")
             if heterogeneous is not None:
                 kwargs["heterogeneous"] = gs.materials.FEM.HeterogeneousMaterial(**heterogeneous)
@@ -686,7 +822,9 @@ class GenesisLiveSession:
         if method == "sim.resume":
             return self.resume(params)
         if method == "geometry.context.get":
-            entity_name, entity = self.entity_by_name(str(params["entity"])) if "entity" in params else self.default_entity()
+            entity_name, entity = (
+                self.entity_by_name(str(params["entity"])) if "entity" in params else self.default_entity()
+            )
             return geometry_context(entity, entity_name=entity_name)
         if method == "visual_overlay.trace.get":
             return self.visual_overlay_trace(params)
@@ -698,6 +836,96 @@ class GenesisLiveSession:
         if method == "observation.fused":
             return fused_observation(self)
         raise GenesisLiveError("unknown_method", f"unknown live method: {method}")
+
+    def begin_probe_measurement(
+        self, *, measurement: dict[str, Any], entity_name: str, controller_id: str, target_vertices: np.ndarray
+    ) -> ProbeMeasurementTracker:
+        measurement_id = str(measurement.get("measurement_id", "")).strip()
+        anchor_id = str(measurement.get("anchor_id", "")).strip()
+        if not measurement_id or not anchor_id:
+            raise GenesisLiveError("invalid_probe_measurement", "measurement_id and anchor_id are required")
+        if measurement_id in self.probe_measurements:
+            raise GenesisLiveError("invalid_probe_measurement", "measurement_id is already active")
+        entity = self.entities.get(entity_name)
+        records = self.anchor_records.get(entity_name, [])
+        anchors = [record for record in records if record.anchor_id == anchor_id and record.selected_vertex_count > 0]
+        if len(anchors) != 1:
+            raise GenesisLiveError(
+                "invalid_probe_measurement",
+                "measurement requires exactly one non-empty matching static anchor",
+                details={
+                    "measurement_id": measurement_id,
+                    "entity": entity_name,
+                    "anchor_id": anchor_id,
+                    "matches": len(anchors),
+                },
+            )
+        positions = self._entity_positions_for_validation(entity_name, entity, checked_at="probe_measurement_baseline")
+        target_vertices = np.asarray(target_vertices, dtype=np.int64).reshape(-1)
+        anchor_vertices = np.asarray(anchors[0].selected_vertices, dtype=np.int64).reshape(-1)
+        if target_vertices.size == 0 or np.any(target_vertices < 0) or np.any(target_vertices >= positions.shape[0]):
+            raise GenesisLiveError(
+                "invalid_probe_measurement", "runtime target selection is invalid for measurement baseline"
+            )
+        if np.any(anchor_vertices < 0) or np.any(anchor_vertices >= positions.shape[0]):
+            raise GenesisLiveError(
+                "invalid_probe_measurement", "runtime anchor selection is invalid for measurement baseline"
+            )
+        target_centroid = np.mean(positions[target_vertices], axis=0)
+        anchor_centroid = np.mean(positions[anchor_vertices], axis=0)
+        if not np.all(np.isfinite(target_centroid)) or not np.all(np.isfinite(anchor_centroid)):
+            raise GenesisLiveError("invalid_probe_measurement", "measurement baseline centroids are non-finite")
+        tracker = ProbeMeasurementTracker(
+            measurement_id=measurement_id,
+            entity_name=entity_name,
+            entity=entity,
+            controller_id=controller_id,
+            anchor_id=anchor_id,
+            target_vertices=target_vertices,
+            anchor_vertices=anchor_vertices,
+            baseline_target_centroid=target_centroid.copy(),
+            baseline_anchor_centroid=anchor_centroid.copy(),
+            baseline_relative=(target_centroid - anchor_centroid).copy(),
+            lineage={key: value for key, value in measurement.items() if key not in {"measurement_id", "anchor_id"}},
+        )
+        self.probe_measurements[measurement_id] = tracker
+        self.visual_telemetry.freeze_triptych_for_measurement(self, tracker)
+        return tracker
+
+    def release_probe_measurement(self, controller_id: str) -> None:
+        trackers = [tracker for tracker in self.probe_measurements.values() if tracker.controller_id == controller_id]
+        if not trackers:
+            return
+        active = [tracker for tracker in trackers if tracker.valid]
+        if len(active) != 1:
+            raise GenesisLiveError("invalid_probe_measurement", "release requires exactly one active probe measurement")
+        active[0].phase = "post_release"
+
+    def _sample_probe_measurements(self) -> None:
+        for tracker in list(self.probe_measurements.values()):
+            tracker.sample(self)
+
+    def _probe_measurement_payload(self) -> dict[str, Any] | None:
+        if not self.probe_measurements:
+            return None
+        tracker = next(reversed(self.probe_measurements.values()))
+        trace = tracker.to_dict()
+        encoded_trace = json.dumps(trace, separators=(",", ":"), sort_keys=True).encode("utf-8")
+        digest = hashlib.sha256(encoded_trace).hexdigest()
+        relative_path = Path("private_probe_measurements") / f"{digest}.json"
+        artifact_path = self._resolve_output_dir() / relative_path
+        artifact_path.parent.mkdir(parents=True, exist_ok=True)
+        artifact_path.write_bytes(encoded_trace)
+        return {
+            "private_trace_ref": {
+                "schema_version": "genesis-probe-measurement-trace-ref-v1",
+                "measurement_id": tracker.measurement_id,
+                "relative_path": str(relative_path),
+                "sha256": digest,
+                "byte_count": len(encoded_trace),
+            },
+            "endpoint": tracker.public_endpoint(),
+        }
 
     def resume(self, params: dict[str, Any]) -> dict[str, Any]:
         steps = int(params.get("steps", params.get("duration_steps", 1)))
@@ -717,6 +945,7 @@ class GenesisLiveSession:
                 self.scene.step()
                 self.current_step += 1
                 self._validate_fem_state(checked_at="after_step")
+                self._sample_probe_measurements()
                 self._sync_visual_overlays(checked_at="after_step")
                 if render_every_steps is not None and (local_step_index + 1) % render_every_steps == 0:
                     visual_frames.append(
@@ -740,7 +969,11 @@ class GenesisLiveSession:
         finally:
             self.running = False
             self.paused = True
-        return {"steps": steps, "status": self.status(), "visual_telemetry": visual_result}
+        result = {"steps": steps, "status": self.status(), "visual_telemetry": visual_result}
+        measurement = self._probe_measurement_payload()
+        if measurement is not None:
+            result["probe_measurement"] = measurement
+        return result
 
     def _entity_positions_for_validation(self, entity_name: str, entity, *, checked_at: str) -> np.ndarray:
         from genesis.utils.misc import tensor_to_array
@@ -785,9 +1018,7 @@ class GenesisLiveSession:
             "nonfinite_scalar_count": int(positions.size - np.count_nonzero(finite_mask)),
             "finite_min": float(np.min(finite_values)) if finite_values.size else None,
             "finite_max": float(np.max(finite_values)) if finite_values.size else None,
-            "first_nonfinite_vertex_index": int(nonfinite_vertex_indices[0])
-            if nonfinite_vertex_indices.size
-            else None,
+            "first_nonfinite_vertex_index": int(nonfinite_vertex_indices[0]) if nonfinite_vertex_indices.size else None,
         }
 
     def _validate_fem_state(self, *, checked_at: str) -> None:
@@ -859,10 +1090,7 @@ class GenesisLiveSession:
                     if synced_vertices.shape != rest_vertices.shape:
                         raise ValueError("visual entity returned an unexpected logical vertex shape")
                     max_readback_error = float(np.max(np.abs(synced_vertices - rest_vertices)))
-                    if (
-                        not np.isfinite(max_readback_error)
-                        or max_readback_error >= VISUAL_OVERLAY_REST_ATOL_M
-                    ):
+                    if not np.isfinite(max_readback_error) or max_readback_error >= VISUAL_OVERLAY_REST_ATOL_M:
                         raise ValueError("visual entity rest-position readback is misaligned")
             except (gs.GenesisException, TypeError, ValueError) as exc:
                 raise GenesisLiveError(
@@ -908,9 +1136,13 @@ class GenesisLiveSession:
     def _visual_render_every_steps(self, visual) -> int | None:
         if visual is None:
             return None
-        render_every_steps = visual.get("render_every_steps", visual.get("capture_every_n_steps", DEFAULT_RENDER_EVERY_STEPS))
+        render_every_steps = visual.get(
+            "render_every_steps", visual.get("capture_every_n_steps", DEFAULT_RENDER_EVERY_STEPS)
+        )
         if isinstance(render_every_steps, bool) or not isinstance(render_every_steps, int) or render_every_steps <= 0:
-            raise GenesisLiveError("invalid_visual_request", "diagnostic_visual.render_every_steps must be a positive integer")
+            raise GenesisLiveError(
+                "invalid_visual_request", "diagnostic_visual.render_every_steps must be a positive integer"
+            )
         return int(render_every_steps)
 
     def _capture_visual_request(
