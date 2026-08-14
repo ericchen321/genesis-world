@@ -1,3 +1,4 @@
+from dataclasses import replace
 from typing import TYPE_CHECKING
 import math
 
@@ -11,6 +12,23 @@ import genesis.utils.array_class as array_class
 import genesis.utils.geom as gu
 from genesis.constants import IntEnum
 from genesis.engine.bvh import AABB, LBVH, FEMSurfaceTetLBVH, RigidTetLBVH
+from genesis.engine.rigid_fem_contact import (
+    RigidFEMContactBatch,
+    RigidFEMContactMode,
+    RigidFEMContactNotReadyError,
+    RigidFEMContactOwnershipReceipt,
+    RigidFEMContactUnavailableError,
+    RigidFEMWhitelistEntry,
+    RigidFEMWhitelistReceipt,
+)
+from genesis.engine.solver_health import (
+    FEMSubstepSafetyExtrema,
+    ImplicitFEMSubstepHealth,
+    PositiveJFeasibleStep,
+    SAPSubstepSolverHealth,
+    SolverHealthNotReadyError,
+    SolverHealthUnavailableError,
+)
 from genesis.options.solvers import SAPCouplerOptions
 from genesis.repr_base import RBC
 
@@ -50,6 +68,95 @@ COS_ANGLE_THRESHOLD = math.cos(math.pi * 5.0 / 8.0)
 
 # An estimate of the maximum number of contact pairs per AABB query.
 MAX_N_QUERY_RESULT_PER_AABB = 32
+DEVELOPMENT_POSITIVE_J_FLOOR = 0.20
+DEVELOPMENT_POSITIVE_J_SCHEDULE_LENGTH = 8
+
+
+def _build_rigid_fem_face_whitelist(rigid_solver):
+    """Resolve material link filters to a closed rigid-face mask and receipt."""
+    face_enabled = np.zeros((rigid_solver.n_faces,), dtype=np.bool_)
+    entries = []
+    for entity in rigid_solver.entities:
+        links = tuple(entity.links)
+        links_by_name = {}
+        for link in links:
+            links_by_name.setdefault(link.name, []).append(link)
+
+        requested = entity.material.coup_collision_links
+        if not entity.material.enable_coup_collision:
+            selected_links = ()
+        elif requested is None:
+            selected_links = links
+        else:
+            selected = []
+            for name in requested:
+                matches = links_by_name.get(name, ())
+                if len(matches) != 1:
+                    gs.raise_exception(
+                        f"SAP `coup_collision_links` name {name!r} on rigid entity {entity.name!r} "
+                        f"resolved {len(matches)} times; expected exactly once."
+                    )
+                selected.append(matches[0])
+            selected_links = tuple(selected)
+
+        resolved_geoms = []
+        entity_enabled_faces = 0
+        for link in selected_links:
+            for geom in link.geoms:
+                if geom.face_start < 0 or geom.face_end > rigid_solver.n_faces:
+                    gs.raise_exception("Rigid geom face range is outside the SAP face mask.")
+                face_enabled[geom.face_start : geom.face_end] = True
+                resolved_geoms.append(geom.idx)
+                entity_enabled_faces += geom.n_faces
+        entries.append(
+            RigidFEMWhitelistEntry(
+                rigid_entity_idx=entity.idx,
+                rigid_entity_name=entity.name,
+                collision_enabled=bool(entity.material.enable_coup_collision),
+                requested_link_names=None if requested is None else tuple(requested),
+                resolved_link_indices=tuple(link.idx for link in selected_links),
+                resolved_link_names=tuple(link.name for link in selected_links),
+                resolved_geom_indices=tuple(resolved_geoms),
+                enabled_face_count=entity_enabled_faces,
+                total_face_count=entity.n_faces,
+            )
+        )
+    receipt = RigidFEMWhitelistReceipt(
+        entries=tuple(entries),
+        enabled_face_count=int(np.count_nonzero(face_enabled)),
+        total_face_count=rigid_solver.n_faces,
+        face_enabled_by_index={index: bool(enabled) for index, enabled in enumerate(face_enabled)},
+    )
+    return face_enabled, receipt
+
+
+def _rigid_fem_contact_sort_order(
+    env_idx,
+    rigid_entity_idx,
+    rigid_link_idx,
+    rigid_geom_idx,
+    fem_entity_idx,
+    fem_element_idx_local,
+    rigid_face_idx,
+    point_m,
+):
+    """Return the canonical public order, including the internal face tie-break."""
+    return np.asarray(
+        sorted(
+            range(len(env_idx)),
+            key=lambda row: (
+                int(env_idx[row]),
+                int(rigid_entity_idx[row]),
+                int(rigid_link_idx[row]),
+                int(rigid_geom_idx[row]),
+                int(fem_entity_idx[row]),
+                int(fem_element_idx_local[row]),
+                int(rigid_face_idx[row]),
+                *map(float, point_m[row]),
+            ),
+        ),
+        dtype=np.int64,
+    )
 
 
 class FEMFloorContactType(IntEnum):
@@ -177,6 +284,21 @@ class SAPCoupler(RBC):
         self._linesearch_max_step_size = options.linesearch_max_step_size
         self._hydroelastic_stiffness = options.hydroelastic_stiffness
         self._point_contact_stiffness = options.point_contact_stiffness
+        self._enable_qualification_post_final_sap_health = options.enable_qualification_post_final_sap_health
+        self._enable_development_positive_j_feasible_step = options.enable_development_positive_j_feasible_step
+        self._enable_completed_solver_health = options.enable_completed_solver_health
+        self._enable_development_positive_j_alpha_one_only = (
+            options.enable_development_positive_j_alpha_one_only
+        )
+        self._enable_development_direct_replay_finger_contact_flags = (
+            options.enable_development_direct_replay_finger_contact_flags
+        )
+        self._development_direct_replay_finger_contact_flags = None
+        self._development_direct_replay_finger_link_indices = None
+        self._last_completed_solver_health: SAPSubstepSolverHealth | None = None
+        self._legacy_sap_health_fields = None
+        self._post_final_sap_health_fields = None
+        self._last_contact_overflow = False
         if gs.qd_float == qd.f32:
             gs.raise_exception(
                 "SAPCoupler does not support 32bits precision. Please specify precision='64' when initializing Genesis."
@@ -205,6 +327,8 @@ class SAPCoupler(RBC):
                 "Must be one of 'vert' or 'none'."
             )
         self._enable_rigid_fem_contact = options.enable_rigid_fem_contact
+        self._rigid_fem_contact_completed = None
+        self._rigid_fem_whitelist_receipt = None
 
         if options.rigid_rigid_contact_type == "tet":
             self._rigid_rigid_contact_type = RigidRigidContactType.TET
@@ -278,18 +402,53 @@ class SAPCoupler(RBC):
                 self._init_equality_constraint()
 
         if self._enable_rigid_fem_contact:
+            face_enabled, self._rigid_fem_whitelist_receipt = _build_rigid_fem_face_whitelist(self.rigid_solver)
+            self.rigid_fem_face_enabled = qd.field(gs.qd_bool, shape=(self.rigid_solver.n_faces,))
+            self.rigid_fem_face_enabled.from_numpy(face_enabled)
             self.rigid_fem_contact = RigidFemTriTetContactHandler(self.sim)
             self.contact_handlers.append(self.rigid_fem_contact)
+            if self._enable_development_direct_replay_finger_contact_flags:
+                links_by_name = {}
+                for link in self.rigid_solver.links:
+                    links_by_name.setdefault(link.name, []).append(link)
+                selected = []
+                for name in ("g2_left_link", "g2_right_link"):
+                    matches = links_by_name.get(name, ())
+                    if len(matches) != 1:
+                        gs.raise_exception(
+                            "development direct-replay finger contact flags require exactly one "
+                            f"rigid link named {name!r}; found {len(matches)}"
+                        )
+                    selected.append(int(matches[0].idx))
+                self._development_direct_replay_finger_link_indices = tuple(selected)
+                self._development_direct_replay_finger_contact_flags = qd.field(
+                    gs.qd_int, shape=(self.sim._B, 2), needs_grad=False
+                )
+        elif self._enable_development_direct_replay_finger_contact_flags:
+            gs.raise_exception(
+                "development direct-replay finger contact flags require SAP rigid--FEM contact"
+            )
 
         self._init_bvh()
         if init_tet_tables:
             self._init_tet_tables()
         self._init_sap_fields()
+        if (
+            self._enable_development_positive_j_feasible_step
+            and not self._enable_development_positive_j_alpha_one_only
+        ):
+            if not self.fem_solver.is_active:
+                gs.raise_exception("development positive-J feasible step requires an active FEM solver")
+            self._init_development_positive_j_feasible_step_fields()
         self._init_pcg_fields()
         self._init_linesearch_fields()
 
     def reset(self, envs_idx=None):
-        pass
+        self._rigid_fem_contact_completed = None
+        self._last_completed_solver_health = None
+        self._last_contact_overflow = False
+        self._legacy_sap_health_fields = None
+        self._post_final_sap_health_fields = None
 
     def _init_tet_tables(self):
         # Lookup table for marching tetrahedra edges
@@ -412,10 +571,12 @@ class SAPCoupler(RBC):
                     grad[i_e] += grad_i * self.rigid_pressure_field[i_v0]
 
     def _init_bvh(self):
-        if self._enable_fem_self_tet_contact:
+        if self._enable_fem_self_tet_contact or self._enable_rigid_fem_contact:
             self.fem_surface_tet_aabb = AABB(self.fem_solver._B, self.fem_solver.n_surface_elements)
             self.fem_surface_tet_bvh = FEMSurfaceTetLBVH(
-                self.fem_solver, self.fem_surface_tet_aabb, max_n_query_result_per_aabb=MAX_N_QUERY_RESULT_PER_AABB
+                self.fem_solver,
+                self.fem_surface_tet_aabb,
+                max_n_query_result_per_aabb=MAX_N_QUERY_RESULT_PER_AABB * 4,
             )
 
         if self._enable_rigid_fem_contact:
@@ -445,12 +606,34 @@ class SAPCoupler(RBC):
 
     def _init_sap_fields(self):
         self.batch_active = qd.field(dtype=gs.qd_bool, shape=(self.sim._B,), needs_grad=False)
+        self.batch_pcg_budget_exhausted = qd.field(dtype=gs.qd_bool, shape=(self.sim._B,), needs_grad=False)
+        self.batch_linesearch_budget_exhausted = qd.field(dtype=gs.qd_bool, shape=(self.sim._B,), needs_grad=False)
         sap_state = qd.types.struct(
             gradient_norm=gs.qd_float,  # norm of the gradient
             momentum_norm=gs.qd_float,  # norm of the momentum
             impulse_norm=gs.qd_float,  # norm of the impulse
         )
         self.sap_state = sap_state.field(shape=(self.sim._B,), needs_grad=False, layout=qd.Layout.SOA)
+
+    def _init_development_positive_j_feasible_step_fields(self):
+        """Allocate the narrow development-only post-SAP feasibility trace."""
+        self._development_positive_j_pre_sap_min_j = qd.field(
+            dtype=gs.qd_float, shape=(self.sim._B,), needs_grad=False
+        )
+        self._development_positive_j_trial_min_j = qd.field(
+            dtype=gs.qd_float, shape=(self.sim._B,), needs_grad=False
+        )
+        self._development_positive_j_accepted_alpha = qd.field(
+            dtype=gs.qd_float, shape=(self.sim._B,), needs_grad=False
+        )
+        self._development_positive_j_witness_tet_id = qd.field(
+            dtype=gs.qd_int, shape=(self.sim._B,), needs_grad=False
+        )
+        self._development_positive_j_schedule_min_j = qd.field(
+            dtype=gs.qd_float,
+            shape=(DEVELOPMENT_POSITIVE_J_SCHEDULE_LENGTH, self.sim._B),
+            needs_grad=False,
+        )
 
     def _init_fem_fields(self):
         fem_state_v = qd.types.struct(
@@ -578,6 +761,7 @@ class SAPCoupler(RBC):
             dofs_state=self.rigid_solver.dofs_state,
             links_state=self.rigid_solver.links_state,
         )
+        self._last_contact_overflow = bool(overflow)
         if overflow:
             message = "Overflowed In Contact Query: \n"
             for contact in self.contact_handlers:
@@ -651,7 +835,465 @@ class SAPCoupler(RBC):
     def couple(self, i_step):
         if self.has_contact:
             self.sap_solve(i_step)
+            if (
+                self._enable_development_positive_j_feasible_step
+                and not self._enable_development_positive_j_alpha_one_only
+            ):
+                self._apply_development_positive_j_feasible_step(i_step, dofs_state=self.rigid_solver.dofs_state)
+            # In alpha=1-only mode SAP's solved velocity correction is already
+            # the complete paired rigid/FEM correction; update_vel commits it
+            # directly without endpoint reductions or blending.
             self.update_vel(i_step, dofs_state=self.rigid_solver.dofs_state)
+        elif (
+            self._enable_development_positive_j_feasible_step
+            and not self._enable_development_positive_j_alpha_one_only
+        ):
+            self._record_development_positive_j_no_contact(i_step)
+        if self._enable_rigid_fem_contact:
+            if self._enable_development_direct_replay_finger_contact_flags:
+                # The performance direct-replay path exports only two link
+                # booleans.  Do not materialize per-row public contact state.
+                self._reset_development_direct_replay_finger_contact_flags()
+                self._reduce_development_direct_replay_finger_contact_flags()
+            else:
+                self.rigid_fem_contact.finalize_public_state()
+            self._rigid_fem_contact_completed = (
+                int(self.sim.cur_step_global),
+                int(self.sim.cur_substep_global),
+                float(self.sim._substep_dt),
+            )
+        # Final FEM geometric safety extrema are captured only after the
+        # simulator completed ``substep_post_coupling``.  Publishing here
+        # would inspect an intermediate physical-substep state.
+        if self._enable_completed_solver_health:
+            self._last_completed_solver_health = self._capture_completed_solver_health()
+        else:
+            self._last_completed_solver_health = None
+
+    def _field_vector(self, field, *, dtype, label):
+        value = np.asarray(field.to_numpy(), dtype=dtype)
+        expected = (self.sim._B,)
+        if value.shape != expected:
+            raise SolverHealthUnavailableError(
+                f"SAP {label} shape {value.shape} does not match batch shape {expected}"
+            )
+        return tuple(value.tolist())
+
+    def _rigid_fem_health_contact_state(self):
+        if not self._enable_rigid_fem_contact or not hasattr(self, "rigid_fem_contact"):
+            return False, 0, None, False, ()
+        handler = self.rigid_fem_contact
+        n_contacts = int(handler.n_contact_pairs[None])
+        if n_contacts < 0 or n_contacts > handler.max_contact_pairs:
+            raise SolverHealthUnavailableError("SAP rigid--FEM contact count is outside its allocated range")
+        if n_contacts == 0:
+            return True, 0, 0.0, False, ()
+        signed_gap = np.asarray(handler.contact_pairs.sap_info.phi0.to_numpy(), dtype=np.float64)[:n_contacts]
+        mode_values = np.asarray(handler.contact_pairs.public_mode.to_numpy(), dtype=np.int64)[:n_contacts]
+        link_indices = np.asarray(handler.contact_pairs.link_idx.to_numpy(), dtype=np.int64)[:n_contacts]
+        if signed_gap.shape != (n_contacts,) or mode_values.shape != (n_contacts,) or link_indices.shape != (n_contacts,):
+            raise SolverHealthUnavailableError("SAP rigid--FEM public contact fields have an inconsistent shape")
+        if not np.isfinite(signed_gap).all():
+            max_penetration_m = float("nan")
+        else:
+            max_penetration_m = max(0.0, -float(np.min(signed_gap)))
+        known_modes = {int(ContactMode.STICK), int(ContactMode.SLIDE), int(ContactMode.NO_CONTACT)}
+        unknown_mode = any(int(value) not in known_modes for value in mode_values)
+        known_links = {link.idx: link.name for link in self.rigid_solver.links}
+        enabled_links = {
+            index
+            for entry in self._rigid_fem_whitelist_receipt.entries
+            if entry.collision_enabled
+            for index in entry.resolved_link_indices
+        }
+        unwhitelisted = set()
+        for index in link_indices:
+            name = known_links.get(int(index))
+            if name is None:
+                unwhitelisted.add(f"<unknown-link-index:{int(index)}>")
+            elif int(index) not in enabled_links:
+                unwhitelisted.add(name)
+        return True, n_contacts, max_penetration_m, unknown_mode, tuple(sorted(unwhitelisted))
+
+    def _implicit_fem_health_state(self):
+        fem_solver = self.fem_solver
+        if not fem_solver.is_active or not fem_solver._use_implicit_solver:
+            return None
+        required = (
+            "batch_active",
+            "batch_pcg_active",
+            "batch_linesearch_active",
+            "batch_pcg_budget_exhausted",
+            "batch_pcg_breakdown",
+            "batch_linesearch_budget_exhausted",
+            "pcg_state",
+            "pcg_state_v",
+            "_n_newton_iterations",
+            "_n_pcg_iterations",
+            "_n_linesearch_iterations",
+            "_newton_dx_threshold",
+            "_pcg_threshold",
+            "_pcg_rtol",
+        )
+        if any(not hasattr(fem_solver, name) for name in required):
+            raise SolverHealthUnavailableError("implicit FEM solver does not expose its completed iteration state")
+        batch_active = self._field_vector(fem_solver.batch_active, dtype=np.bool_, label="fem_batch_active")
+        pcg_active = self._field_vector(fem_solver.batch_pcg_active, dtype=np.bool_, label="fem_batch_pcg_active")
+        linesearch_active = self._field_vector(
+            fem_solver.batch_linesearch_active, dtype=np.bool_, label="fem_batch_linesearch_active"
+        )
+        pcg_budget_exhausted = self._field_vector(
+            fem_solver.batch_pcg_budget_exhausted, dtype=np.bool_, label="fem_batch_pcg_budget_exhausted"
+        )
+        pcg_breakdown = self._field_vector(
+            fem_solver.batch_pcg_breakdown, dtype=np.bool_, label="fem_batch_pcg_breakdown"
+        )
+        linesearch_budget_exhausted = self._field_vector(
+            fem_solver.batch_linesearch_budget_exhausted,
+            dtype=np.bool_,
+            label="fem_batch_linesearch_budget_exhausted",
+        )
+        initial_residual = np.asarray(
+            self._field_vector(fem_solver.pcg_state.rTr_initial, dtype=np.float64, label="fem_pcg_rTr_initial"),
+            dtype=np.float64,
+        )
+        residual = np.asarray(
+            self._field_vector(fem_solver.pcg_state.rTr, dtype=np.float64, label="fem_pcg_rTr"), dtype=np.float64
+        )
+        preconditioned_residual = self._field_vector(fem_solver.pcg_state.rTz, dtype=np.float64, label="fem_pcg_rTz")
+        effective_threshold = np.asarray(
+            self._field_vector(
+                fem_solver.pcg_state.termination_threshold, dtype=np.float64, label="fem_pcg_termination_threshold"
+            ),
+            dtype=np.float64,
+        )
+        relative_residual = np.full(initial_residual.shape, np.nan, dtype=np.float64)
+        zero_initial = initial_residual == 0.0
+        relative_residual[zero_initial & (residual == 0.0)] = 0.0
+        positive = (initial_residual > 0.0) & (residual >= 0.0)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            relative_residual[positive] = np.sqrt(residual[positive] / initial_residual[positive])
+        update = np.asarray(fem_solver.pcg_state_v.x.to_numpy(), dtype=np.float64)
+        expected = (self.sim._B, fem_solver.n_vertices, 3)
+        if update.shape != expected:
+            raise SolverHealthUnavailableError(
+                f"implicit FEM final Newton update shape {update.shape} does not match {expected}"
+            )
+        max_update = tuple(np.linalg.norm(update, axis=2).max(axis=1).astype(np.float64).tolist())
+        return ImplicitFEMSubstepHealth(
+            batch_active_by_batch=batch_active,
+            pcg_active_by_batch=pcg_active,
+            linesearch_active_by_batch=linesearch_active,
+            pcg_budget_exhausted_by_batch=pcg_budget_exhausted,
+            pcg_breakdown_by_batch=pcg_breakdown,
+            linesearch_budget_exhausted_by_batch=linesearch_budget_exhausted,
+            pcg_initial_residual_squared_by_batch=tuple(initial_residual.tolist()),
+            pcg_residual_squared_by_batch=tuple(residual.tolist()),
+            pcg_preconditioned_residual_by_batch=preconditioned_residual,
+            pcg_relative_residual_norm_by_batch=tuple(relative_residual.tolist()),
+            pcg_effective_residual_squared_threshold_by_batch=tuple(effective_threshold.tolist()),
+            max_newton_update_m_by_batch=max_update,
+            newton_iteration_budget=int(fem_solver._n_newton_iterations),
+            pcg_iteration_budget=int(fem_solver._n_pcg_iterations),
+            linesearch_iteration_budget=int(fem_solver._n_linesearch_iterations),
+            newton_dx_threshold_m=float(fem_solver._newton_dx_threshold),
+            pcg_threshold=float(fem_solver._pcg_threshold),
+            pcg_absolute_residual_squared_floor=float(fem_solver._pcg_threshold),
+            pcg_rtol=float(fem_solver._pcg_rtol),
+        )
+
+    def _development_positive_j_feasible_step_health(self):
+        if (
+            not self._enable_development_positive_j_feasible_step
+            or self._enable_development_positive_j_alpha_one_only
+        ):
+            return None
+        return PositiveJFeasibleStep(
+            pre_sap_min_j=self._field_vector(
+                self._development_positive_j_pre_sap_min_j,
+                dtype=np.float64,
+                label="development_positive_j_pre_sap_min_j",
+            ),
+            unfiltered_post_sap_trial_min_j=self._field_vector(
+                self._development_positive_j_trial_min_j,
+                dtype=np.float64,
+                label="development_positive_j_trial_min_j",
+            ),
+            accepted_alpha=self._field_vector(
+                self._development_positive_j_accepted_alpha,
+                dtype=np.float64,
+                label="development_positive_j_accepted_alpha",
+            ),
+            witness_tet_id=self._field_vector(
+                self._development_positive_j_witness_tet_id,
+                dtype=np.int64,
+                label="development_positive_j_witness_tet_id",
+            ),
+        )
+
+    def _capture_completed_solver_health(self, *, fem_safety_extrema: FEMSubstepSafetyExtrema | None = None):
+        (
+            rigid_fem_supported,
+            rigid_fem_pair_count,
+            max_rigid_fem_penetration_m,
+            unknown_rigid_fem_contact_mode,
+            unwhitelisted_rigid_fem_link_names,
+        ) = self._rigid_fem_health_contact_state()
+        implicit_fem = self._implicit_fem_health_state()
+        if self.has_contact:
+            legacy = getattr(self, "_legacy_sap_health_fields", None) or self._snapshot_sap_health_fields()
+            (
+                sap_active,
+                pcg_active,
+                linesearch_active,
+                pcg_budget_exhausted,
+                linesearch_budget_exhausted,
+                gradient_norm,
+                momentum_norm,
+                impulse_norm,
+                pcg_residual_squared,
+                pcg_preconditioned_residual,
+            ) = legacy
+            post_final = getattr(self, "_post_final_sap_health_fields", None)
+        else:
+            sap_active = pcg_active = linesearch_active = ()
+            pcg_budget_exhausted = linesearch_budget_exhausted = ()
+            gradient_norm = momentum_norm = impulse_norm = ()
+            pcg_residual_squared = pcg_preconditioned_residual = ()
+            post_final = None
+        if post_final is None:
+            post_final_available = False
+            post_final_sap_active = post_final_gradient = post_final_momentum = post_final_impulse = ()
+        else:
+            post_final_available = True
+            (
+                post_final_sap_active,
+                _,
+                _,
+                _,
+                _,
+                post_final_gradient,
+                post_final_momentum,
+                post_final_impulse,
+                _,
+                _,
+            ) = post_final
+        return SAPSubstepSolverHealth(
+            global_substep_index=int(self.sim.cur_substep_global),
+            sim_step_index=int(self.sim.cur_step_global),
+            physical_dt_s=float(self.sim._substep_dt),
+            contact_solve_executed=bool(self.has_contact),
+            sap_iteration_budget=int(self._n_sap_iterations),
+            pcg_iteration_budget=int(self._n_pcg_iterations),
+            linesearch_iteration_budget=int(self._n_linesearch_iterations),
+            sap_active_by_batch=sap_active,
+            pcg_active_by_batch=pcg_active,
+            linesearch_active_by_batch=linesearch_active,
+            pcg_budget_exhausted_by_batch=pcg_budget_exhausted,
+            linesearch_budget_exhausted_by_batch=linesearch_budget_exhausted,
+            gradient_norm_by_batch=gradient_norm,
+            momentum_norm_by_batch=momentum_norm,
+            impulse_norm_by_batch=impulse_norm,
+            pcg_residual_squared_by_batch=pcg_residual_squared,
+            pcg_preconditioned_residual_by_batch=pcg_preconditioned_residual,
+            sap_convergence_atol=float(self._sap_convergence_atol),
+            sap_convergence_rtol=float(self._sap_convergence_rtol),
+            pcg_threshold=float(self._pcg_threshold),
+            implicit_fem=implicit_fem,
+            fem_safety_extrema=fem_safety_extrema,
+            rigid_fem_contact_supported=rigid_fem_supported,
+            rigid_fem_contact_pair_count=rigid_fem_pair_count,
+            max_rigid_fem_penetration_m=max_rigid_fem_penetration_m,
+            contact_overflow=bool(self._last_contact_overflow),
+            unknown_rigid_fem_contact_mode=unknown_rigid_fem_contact_mode,
+            unwhitelisted_rigid_fem_link_names=unwhitelisted_rigid_fem_link_names,
+            post_final_sap_health_available=post_final_available,
+            post_final_sap_active_by_batch=post_final_sap_active,
+            post_final_gradient_norm_by_batch=post_final_gradient,
+            post_final_momentum_norm_by_batch=post_final_momentum,
+            post_final_impulse_norm_by_batch=post_final_impulse,
+            positive_j_feasible_step=self._development_positive_j_feasible_step_health(),
+            implicit_fem_positive_j_feasible_step=(
+                self.fem_solver._development_implicit_fem_positive_j_feasible_step_health()
+            ),
+        )
+
+    def finalize_completed_solver_health(self, *, fem_safety_extrema: FEMSubstepSafetyExtrema | None) -> None:
+        """Attach post-coupling FEM extrema to this substep's immutable record."""
+        if self._last_completed_solver_health is None:
+            raise SolverHealthNotReadyError("SAP solver health is unavailable before a completed coupling pass")
+        self._last_completed_solver_health = replace(
+            self._last_completed_solver_health,
+            fem_safety_extrema=fem_safety_extrema,
+        )
+
+    def get_last_completed_solver_health(self):
+        """Return the immutable health snapshot for this coupler's last physical substep."""
+        if self._last_completed_solver_health is None:
+            raise SolverHealthNotReadyError("no SAP physical substep has completed since scene build or reset")
+        return self._last_completed_solver_health
+
+    def get_rigid_fem_contact_ownership(self):
+        """Return immutable build-time rigid--FEM/floor ownership facts."""
+        if not self._enable_rigid_fem_contact or self._rigid_fem_whitelist_receipt is None:
+            raise RigidFEMContactUnavailableError("scene has no built SAP rigid--FEM ownership receipt")
+        return RigidFEMContactOwnershipReceipt(
+            whitelist_receipt=self._rigid_fem_whitelist_receipt,
+            rigid_fem_contact_enabled=True,
+            floor_tet_contact_enabled=self._fem_floor_contact_type == FEMFloorContactType.TET,
+            floor_height_m=float(self.fem_solver.floor_height),
+        )
+
+    @qd.kernel
+    def _reset_development_direct_replay_finger_contact_flags(self):
+        for i_b, i_side in qd.ndrange(self.sim._B, 2):
+            self._development_direct_replay_finger_contact_flags[i_b, i_side] = 0
+
+    @qd.kernel
+    def _reduce_development_direct_replay_finger_contact_flags(self):
+        for i_p in qd.ndrange(self.rigid_fem_contact.n_contact_pairs[None]):
+            i_b = self.rigid_fem_contact.contact_pairs[i_p].batch_idx
+            i_link = self.rigid_fem_contact.contact_pairs[i_p].link_idx
+            if i_link == qd.static(self._development_direct_replay_finger_link_indices[0]):
+                qd.atomic_max(self._development_direct_replay_finger_contact_flags[i_b, 0], 1)
+            elif i_link == qd.static(self._development_direct_replay_finger_link_indices[1]):
+                qd.atomic_max(self._development_direct_replay_finger_contact_flags[i_b, 1], 1)
+
+    def get_development_direct_replay_finger_contact_flags(self):
+        """Return only the two G2 per-env contact booleans for direct replay."""
+        if not self._enable_development_direct_replay_finger_contact_flags:
+            raise RigidFEMContactUnavailableError(
+                "development direct-replay G2 contact flags were not enabled for this SAP scene"
+            )
+        if self._rigid_fem_contact_completed is None:
+            raise RigidFEMContactNotReadyError("no SAP substep has completed since scene build or reset")
+        flags = np.asarray(self._development_direct_replay_finger_contact_flags.to_numpy(), dtype=np.int64)
+        expected = (self.sim._B, 2)
+        if flags.shape != expected or not np.logical_or(flags == 0, flags == 1).all():
+            raise RigidFEMContactUnavailableError(
+                f"development direct-replay G2 contact flags have invalid shape or values: {flags.shape}"
+            )
+        return np.array(flags != 0, dtype=np.bool_, order="C", copy=True)
+
+    def get_rigid_fem_contacts(self):
+        if not self._enable_rigid_fem_contact or not hasattr(self, "rigid_fem_contact"):
+            raise RigidFEMContactUnavailableError("scene has no usable SAP rigid--FEM contact subsystem")
+        if self._rigid_fem_contact_completed is None:
+            raise RigidFEMContactNotReadyError("no SAP substep has completed since scene build or reset")
+
+        handler = self.rigid_fem_contact
+        n_contacts = int(handler.n_contact_pairs[None])
+
+        def take(field, dtype, width=None):
+            value = np.asarray(field.to_numpy())[:n_contacts]
+            expected_shape = (n_contacts,) if width is None else (n_contacts, width)
+            value = np.array(value, dtype=dtype, order="C", copy=True)
+            if value.shape != expected_shape:
+                raise RigidFEMContactUnavailableError(
+                    f"internal SAP contact field shape {value.shape} does not match {expected_shape}"
+                )
+            return value
+
+        env_idx = take(handler.contact_pairs.batch_idx, np.int64)
+        rigid_link_idx = take(handler.contact_pairs.link_idx, np.int64)
+        rigid_geom_idx = take(handler.contact_pairs.rigid_geom_idx, np.int64)
+        rigid_face_idx = take(handler.contact_pairs.rigid_face_idx, np.int64)
+        fem_element_global = take(handler.contact_pairs.geom_idx0, np.int64)
+        point_m = take(handler.contact_pairs.contact_pos, np.float64, 3)
+        normal_world = take(handler.contact_pairs.normal, np.float64, 3)
+        tangent0 = take(handler.contact_pairs.tangent0, np.float64, 3)
+        tangent1 = take(handler.contact_pairs.tangent1, np.float64, 3)
+        signed_gap_m = take(handler.contact_pairs.sap_info.phi0, np.float64)
+        gamma = take(handler.contact_pairs.public_gamma, np.float64, 3)
+        relative_velocity = take(handler.contact_pairs.public_relative_velocity, np.float64, 3)
+        mode_values = take(handler.contact_pairs.public_mode, np.int64)
+
+        rigid_entity_idx = np.empty((n_contacts,), dtype=np.int64)
+        fem_entity_idx = np.empty((n_contacts,), dtype=np.int64)
+        fem_element_idx_local = np.empty((n_contacts,), dtype=np.int64)
+        rigid_entity_names = []
+        rigid_link_names = []
+        fem_entity_names = []
+        rigid_links = {link.idx: link for link in self.rigid_solver.links}
+        rigid_geoms = {geom.idx: geom for geom in self.rigid_solver.geoms}
+        for row in range(n_contacts):
+            link = rigid_links.get(int(rigid_link_idx[row]))
+            geom = rigid_geoms.get(int(rigid_geom_idx[row]))
+            if link is None or geom is None or geom.link is not link:
+                raise RigidFEMContactUnavailableError("SAP exported an inconsistent rigid link/geom identity")
+            face = int(rigid_face_idx[row])
+            if face < geom.face_start or face >= geom.face_end or not self.rigid_fem_face_enabled[face]:
+                raise RigidFEMContactUnavailableError("SAP exported a rigid face outside the positive whitelist")
+            rigid_entity_idx[row] = link.entity.idx
+            rigid_entity_names.append(link.entity.name)
+            rigid_link_names.append(link.name)
+
+            global_element = int(fem_element_global[row])
+            owners = [
+                entity
+                for entity in self.fem_solver.entities
+                if entity.el_start <= global_element < entity.el_start + entity.n_elements
+            ]
+            if len(owners) != 1:
+                raise RigidFEMContactUnavailableError("SAP FEM element identity did not resolve exactly once")
+            owner = owners[0]
+            fem_entity_idx[row] = owner.idx
+            fem_element_idx_local[row] = global_element - owner.el_start
+            fem_entity_names.append(owner.name)
+
+        tangential_impulse_world = gamma[:, :1] * tangent0 + gamma[:, 1:2] * tangent1
+        relative_tangential_velocity_world = (
+            relative_velocity[:, :1] * tangent0 + relative_velocity[:, 1:2] * tangent1
+        )
+        mode_map = {
+            int(ContactMode.STICK): RigidFEMContactMode.STICK,
+            int(ContactMode.SLIDE): RigidFEMContactMode.SLIDE,
+            int(ContactMode.NO_CONTACT): RigidFEMContactMode.NO_CONTACT,
+        }
+        try:
+            modes = tuple(mode_map[int(value)] for value in mode_values)
+        except KeyError as error:
+            raise RigidFEMContactUnavailableError("SAP exported an unknown contact mode") from error
+
+        order_array = _rigid_fem_contact_sort_order(
+            env_idx,
+            rigid_entity_idx,
+            rigid_link_idx,
+            rigid_geom_idx,
+            fem_entity_idx,
+            fem_element_idx_local,
+            rigid_face_idx,
+            point_m,
+        )
+        order = order_array.tolist()
+
+        def ordered(value):
+            return value[order_array]
+
+        completed_scene_step, completed_substep, dt_s = self._rigid_fem_contact_completed
+        return RigidFEMContactBatch(
+            env_idx=ordered(env_idx),
+            rigid_entity_idx=ordered(rigid_entity_idx),
+            rigid_link_idx=ordered(rigid_link_idx),
+            rigid_geom_idx=ordered(rigid_geom_idx),
+            fem_entity_idx=ordered(fem_entity_idx),
+            fem_element_idx_local=ordered(fem_element_idx_local),
+            rigid_entity_names=tuple(rigid_entity_names[row] for row in order),
+            rigid_link_names=tuple(rigid_link_names[row] for row in order),
+            fem_entity_names=tuple(fem_entity_names[row] for row in order),
+            point_m=ordered(point_m),
+            normal_world=ordered(normal_world),
+            signed_gap_m=ordered(signed_gap_m),
+            penetration_m=np.maximum(-ordered(signed_gap_m), 0.0),
+            normal_impulse_ns=ordered(gamma[:, 2]),
+            tangential_impulse_world_ns=ordered(tangential_impulse_world),
+            relative_tangential_velocity_world_mps=ordered(relative_tangential_velocity_world),
+            modes=tuple(modes[row] for row in order),
+            completed_scene_step=completed_scene_step,
+            completed_substep=completed_substep,
+            dt_s=dt_s,
+            whitelist_receipt=self._rigid_fem_whitelist_receipt,
+        )
 
     def couple_grad(self, i_step):
         gs.raise_exception("couple_grad is not available for SAPCoupler. Please use LegacyCoupler instead.")
@@ -672,6 +1314,125 @@ class SAPCoupler(RBC):
     def update_rigid_vel(self, dofs_state: array_class.DofsState):
         for i_b, i_d in qd.ndrange(self.rigid_solver._B, self.rigid_solver.n_dofs):
             dofs_state.vel[i_d, i_b] = self.rigid_state_dof.v[i_b, i_d]
+
+    @qd.func
+    def _development_positive_j_at_alpha(self, i_step: qd.i32, i_b: qd.i32, i_e: qd.i32, alpha):
+        i_v0, i_v1, i_v2, i_v3 = self.fem_solver.elements_i[i_e].el2v
+        dt = self.fem_solver._substep_dt
+        pos_v0 = self.fem_solver.elements_v[i_step + 1, i_v0, i_b].pos + alpha * dt * (
+            self.fem_state_v.v[i_b, i_v0] - self.fem_solver.elements_v[i_step + 1, i_v0, i_b].vel
+        )
+        pos_v1 = self.fem_solver.elements_v[i_step + 1, i_v1, i_b].pos + alpha * dt * (
+            self.fem_state_v.v[i_b, i_v1] - self.fem_solver.elements_v[i_step + 1, i_v1, i_b].vel
+        )
+        pos_v2 = self.fem_solver.elements_v[i_step + 1, i_v2, i_b].pos + alpha * dt * (
+            self.fem_state_v.v[i_b, i_v2] - self.fem_solver.elements_v[i_step + 1, i_v2, i_b].vel
+        )
+        pos_v3 = self.fem_solver.elements_v[i_step + 1, i_v3, i_b].pos + alpha * dt * (
+            self.fem_state_v.v[i_b, i_v3] - self.fem_solver.elements_v[i_step + 1, i_v3, i_b].vel
+        )
+        F = qd.Matrix.cols([pos_v0 - pos_v3, pos_v1 - pos_v3, pos_v2 - pos_v3]) @ self.fem_solver.elements_i[i_e].B
+        return F.determinant()
+
+    @qd.kernel
+    def _init_development_positive_j_reduction(self):
+        for i_b in range(self.sim._B):
+            self._development_positive_j_pre_sap_min_j[i_b] = qd.math.inf
+            self._development_positive_j_trial_min_j[i_b] = qd.math.inf
+            self._development_positive_j_accepted_alpha[i_b] = 0.0
+            self._development_positive_j_witness_tet_id[i_b] = -1
+            for i_schedule in qd.static(range(DEVELOPMENT_POSITIVE_J_SCHEDULE_LENGTH)):
+                self._development_positive_j_schedule_min_j[i_schedule, i_b] = qd.math.inf
+
+    @qd.kernel
+    def _reduce_development_positive_j_endpoints(self, i_step: qd.i32):
+        for i_b, i_e in qd.ndrange(self.sim._B, self.fem_solver.n_elements):
+            if not self.fem_solver.elements_el_ng[i_step + 1, i_e, i_b].active:
+                continue
+            qd.atomic_min(
+                self._development_positive_j_pre_sap_min_j[i_b],
+                self._development_positive_j_at_alpha(i_step, i_b, i_e, 0.0),
+            )
+            qd.atomic_min(
+                self._development_positive_j_trial_min_j[i_b],
+                self._development_positive_j_at_alpha(i_step, i_b, i_e, 1.0),
+            )
+            for i_schedule in qd.static(range(DEVELOPMENT_POSITIVE_J_SCHEDULE_LENGTH)):
+                alpha = qd.static(1.0 / (2**i_schedule))
+                qd.atomic_min(
+                    self._development_positive_j_schedule_min_j[i_schedule, i_b],
+                    self._development_positive_j_at_alpha(i_step, i_b, i_e, alpha),
+                )
+
+    @qd.kernel
+    def _select_development_positive_j_alpha_and_witness(self, i_step: qd.i32):
+        for i_b in range(self.sim._B):
+            pre_min = self._development_positive_j_pre_sap_min_j[i_b]
+            if pre_min == qd.math.inf:
+                self._development_positive_j_pre_sap_min_j[i_b] = 1.0
+                self._development_positive_j_trial_min_j[i_b] = 1.0
+                self._development_positive_j_accepted_alpha[i_b] = 1.0
+                self._development_positive_j_witness_tet_id[i_b] = -1
+                continue
+            baseline_infeasible = pre_min < DEVELOPMENT_POSITIVE_J_FLOOR
+            alpha = 0.0
+            if not baseline_infeasible:
+                for i_schedule in qd.static(range(DEVELOPMENT_POSITIVE_J_SCHEDULE_LENGTH)):
+                    scheduled_alpha = qd.static(1.0 / (2**i_schedule))
+                    if alpha == 0.0 and self._development_positive_j_schedule_min_j[i_schedule, i_b] >= DEVELOPMENT_POSITIVE_J_FLOOR:
+                        alpha = scheduled_alpha
+            witness_alpha = 0.0 if baseline_infeasible else 1.0
+            witness_j = qd.math.inf
+            witness_tet = -1
+            for i_e in range(self.fem_solver.n_elements):
+                if not self.fem_solver.elements_el_ng[i_step + 1, i_e, i_b].active:
+                    continue
+                candidate_j = self._development_positive_j_at_alpha(i_step, i_b, i_e, witness_alpha)
+                if candidate_j < witness_j:
+                    witness_j = candidate_j
+                    witness_tet = i_e
+            self._development_positive_j_accepted_alpha[i_b] = alpha
+            self._development_positive_j_witness_tet_id[i_b] = witness_tet
+
+    @qd.kernel
+    def _blend_development_positive_j_corrections(self, i_step: qd.i32, dofs_state: array_class.DofsState):
+        for i_b, i_v in qd.ndrange(self.sim._B, self.fem_solver.n_vertices):
+            alpha = self._development_positive_j_accepted_alpha[i_b]
+            free_velocity = self.fem_solver.elements_v[i_step + 1, i_v, i_b].vel
+            self.fem_state_v.v[i_b, i_v] = free_velocity + alpha * (self.fem_state_v.v[i_b, i_v] - free_velocity)
+        if qd.static(self.rigid_solver.is_active):
+            for i_b, i_d in qd.ndrange(self.sim._B, self.rigid_solver.n_dofs):
+                alpha = self._development_positive_j_accepted_alpha[i_b]
+                free_velocity = dofs_state.vel[i_d, i_b]
+                self.rigid_state_dof.v[i_b, i_d] = free_velocity + alpha * (
+                    self.rigid_state_dof.v[i_b, i_d] - free_velocity
+                )
+
+    @qd.kernel
+    def _record_development_positive_j_no_contact(self, i_step: qd.i32):
+        for i_b in range(self.sim._B):
+            min_j = qd.math.inf
+            witness_tet = -1
+            for i_e in range(self.fem_solver.n_elements):
+                if not self.fem_solver.elements_el_ng[i_step + 1, i_e, i_b].active:
+                    continue
+                candidate_j = self._development_positive_j_at_alpha(i_step, i_b, i_e, 0.0)
+                if candidate_j < min_j:
+                    min_j = candidate_j
+                    witness_tet = i_e
+            if min_j == qd.math.inf:
+                min_j = 1.0
+            self._development_positive_j_pre_sap_min_j[i_b] = min_j
+            self._development_positive_j_trial_min_j[i_b] = min_j
+            self._development_positive_j_accepted_alpha[i_b] = 1.0
+            self._development_positive_j_witness_tet_id[i_b] = witness_tet
+
+    def _apply_development_positive_j_feasible_step(self, i_step, *, dofs_state):
+        """Accept the largest fixed endpoint step and scale paired SAP corrections."""
+        self._init_development_positive_j_reduction()
+        self._reduce_development_positive_j_endpoints(i_step)
+        self._select_development_positive_j_alpha_and_witness(i_step)
+        self._blend_development_positive_j_corrections(i_step, dofs_state=dofs_state)
 
     @qd.kernel
     def fem_compute_pressure_gradient(self, i_step: qd.i32):
@@ -703,7 +1464,7 @@ class SAPCoupler(RBC):
     # ------------------------------------------------------------------------------------
 
     def update_bvh(self, i_step: qd.i32):
-        if self._enable_fem_self_tet_contact:
+        if self._enable_fem_self_tet_contact or self._enable_rigid_fem_contact:
             self.update_fem_surface_tet_bvh(i_step)
 
         if self._enable_rigid_fem_contact:
@@ -753,6 +1514,10 @@ class SAPCoupler(RBC):
     ):
         aabbs = qd.static(self.rigid_tri_aabb.aabbs)
         for i_b, i_f in qd.ndrange(self.rigid_solver._B, self.rigid_solver.n_faces):
+            if not self.rigid_fem_face_enabled[i_f]:
+                aabbs[i_b, i_f].min.fill(np.inf)
+                aabbs[i_b, i_f].max.fill(-np.inf)
+                continue
             tri_vertices = qd.Matrix.zero(gs.qd_float, 3, 3)
             for i in qd.static(range(3)):
                 i_v = faces_info.verts_idx[i_f][i]
@@ -786,6 +1551,8 @@ class SAPCoupler(RBC):
     # ------------------------------------------------------------------------------------
 
     def sap_solve(self, i_step):
+        self._legacy_sap_health_fields = None
+        self._post_final_sap_health_fields = None
         self._init_sap_solve(i_step, dofs_state=self.rigid_solver.dofs_state)
         for iter in range(self._n_sap_iterations):
             # init gradient and preconditioner
@@ -796,9 +1563,49 @@ class SAPCoupler(RBC):
             self.check_sap_convergence(rigid_global_info=self.rigid_solver._rigid_global_info)
             # solve for the vertex velocity
             self.pcg_solve()
+            self._accumulate_pcg_budget_exhaustion()
 
             # line search
             self.exact_linesearch(i_step)
+            self._accumulate_linesearch_budget_exhaustion()
+        if self._enable_qualification_post_final_sap_health:
+            self._legacy_sap_health_fields = self._snapshot_sap_health_fields()
+            self._recompute_qualification_post_final_sap_health(i_step, positive_marker=1)
+            self._post_final_sap_health_fields = self._snapshot_sap_health_fields()
+
+    def _snapshot_sap_health_fields(self):
+        """Read the existing SAP diagnostic fields without mutating solver state."""
+        return (
+            self._field_vector(self.batch_active, dtype=np.bool_, label="batch_active"),
+            self._field_vector(self.batch_pcg_active, dtype=np.bool_, label="batch_pcg_active"),
+            self._field_vector(self.batch_linesearch_active, dtype=np.bool_, label="batch_linesearch_active"),
+            self._field_vector(
+                self.batch_pcg_budget_exhausted, dtype=np.bool_, label="batch_pcg_budget_exhausted"
+            ),
+            self._field_vector(
+                self.batch_linesearch_budget_exhausted, dtype=np.bool_, label="batch_linesearch_budget_exhausted"
+            ),
+            self._field_vector(self.sap_state.gradient_norm, dtype=np.float64, label="gradient_norm"),
+            self._field_vector(self.sap_state.momentum_norm, dtype=np.float64, label="momentum_norm"),
+            self._field_vector(self.sap_state.impulse_norm, dtype=np.float64, label="impulse_norm"),
+            self._field_vector(self.pcg_state.rTr, dtype=np.float64, label="pcg_rTr"),
+            self._field_vector(self.pcg_state.rTz, dtype=np.float64, label="pcg_rTz"),
+        )
+
+    def _recompute_qualification_post_final_sap_health(self, i_step, *, positive_marker):
+        """Recheck only final-active batches before ``update_vel`` for qualification.
+
+        ``batch_active`` intentionally remains a monotone mask. Batches that
+        became inactive in an earlier outer iteration were not changed since
+        their already-converged diagnostic; only the remaining active batches
+        need a completed-state recomputation. This routine never runs PCG or
+        line search and does not write physical position or velocity state.
+        """
+        if type(positive_marker) is not int or positive_marker <= 0:
+            raise ValueError("post-final SAP recomputation requires a positive unconstrained-gradient marker")
+        self.compute_unconstrained_gradient_diag(i_step, positive_marker)
+        self.compute_constraint_contact_gradient_hessian_diag_prec()
+        self.check_sap_convergence(rigid_global_info=self.rigid_solver._rigid_global_info)
 
     @qd.kernel
     def check_sap_convergence(self, rigid_global_info: array_class.RigidGlobalInfo):
@@ -874,6 +1681,18 @@ class SAPCoupler(RBC):
     def _init_sap_solve(self, i_step: qd.i32, dofs_state: array_class.DofsState):
         self._init_v(i_step, dofs_state=dofs_state)
         self.batch_active.fill(True)
+        self.batch_pcg_budget_exhausted.fill(False)
+        self.batch_linesearch_budget_exhausted.fill(False)
+
+    @qd.kernel
+    def _accumulate_pcg_budget_exhaustion(self):
+        for i_b in range(self._B):
+            self.batch_pcg_budget_exhausted[i_b] |= self.batch_pcg_active[i_b]
+
+    @qd.kernel
+    def _accumulate_linesearch_budget_exhaustion(self):
+        for i_b in range(self._B):
+            self.batch_linesearch_budget_exhausted[i_b] |= self.batch_linesearch_active[i_b]
 
     @qd.func
     def _init_v(self, i_step: qd.i32, dofs_state: array_class.DofsState):
@@ -2773,7 +3592,7 @@ class FEMSelfTetContactHandler(FEMContactHandler):
             distance0=gs.qd_vec4,  # distance vector for element0
         )
         self.n_contact_candidates = qd.field(gs.qd_int, shape=())
-        self.max_contact_candidates = self.fem_solver.n_surface_elements * self.fem_solver._B * 8
+        self.max_contact_candidates = self.fem_solver.n_surface_elements * self.fem_solver._B * 32
         self.contact_candidates = self.contact_candidate_type.field(shape=(self.max_contact_candidates,))
 
         self.contact_pair_type = qd.types.struct(
@@ -2788,7 +3607,11 @@ class FEMSelfTetContactHandler(FEMContactHandler):
             contact_pos=gs.qd_vec3,  # contact position
             sap_info=self.sap_contact_info_type,  # contact info
         )
-        self.max_contact_pairs = self.fem_solver.n_surface_elements * self.fem_solver._B
+        # Development control episodes can fold the soft body deeply enough
+        # to produce more than one self-contact pair per surface element.
+        # Match the broad candidate budget more closely instead of aborting a
+        # physically finite episode at the old one-pair-per-element cap.
+        self.max_contact_pairs = self.fem_solver.n_surface_elements * self.fem_solver._B * 8
         self.contact_pairs = self.contact_pair_type.field(shape=(self.max_contact_pairs,))
 
     @qd.func
@@ -3460,7 +4283,12 @@ class RigidFemTriTetContactHandler(RigidFEMContactHandler):
             geom_idx0=gs.qd_int,  # index of the FEM element
             barycentric0=gs.qd_vec4,  # barycentric coordinates of the contact point in tet
             link_idx=gs.qd_int,  # index of the link
+            rigid_geom_idx=gs.qd_int,  # index of the rigid collision geom
+            rigid_face_idx=gs.qd_int,  # index of the rigid collision face
             contact_pos=gs.qd_vec3,  # contact position
+            public_relative_velocity=gs.qd_vec3,  # final contact-frame relative velocity
+            public_gamma=gs.qd_vec3,  # final contact-frame impulse
+            public_mode=gs.qd_int,  # final ContactMode
             sap_info=self.sap_contact_info_type,  # contact info
         )
         self.max_contact_pairs = max(self.fem_solver.n_surface_elements, self.rigid_solver.n_faces) * self.fem_solver._B
@@ -3485,6 +4313,8 @@ class RigidFemTriTetContactHandler(RigidFEMContactHandler):
         )
         for i_r in range(result_count):
             i_b, i_a, i_sq = self.coupler.rigid_tri_bvh.query_result[i_r]
+            if not self.coupler.rigid_fem_face_enabled[i_a]:
+                continue
             i_q = self.fem_solver.surface_elements[i_sq]
 
             vert_idx1 = qd.Vector.zero(gs.qd_int, 3)
@@ -3634,6 +4464,9 @@ class RigidFemTriTetContactHandler(RigidFEMContactHandler):
             rigid_phi0 = -pressure / g
             i_g = verts_info.geom_idx[self.contact_candidates[i_c].vert_idx1[0]]
             i_l = geoms_info.link_idx[i_g]
+            i_f = self.contact_candidates[i_c].geom_idx1
+            if not self.coupler.rigid_fem_face_enabled[i_f]:
+                continue
             i_p = qd.atomic_add(self.n_contact_pairs[None], 1)
             if i_p < self.max_contact_pairs:
                 self.contact_pairs[i_p].batch_idx = i_b
@@ -3643,6 +4476,8 @@ class RigidFemTriTetContactHandler(RigidFEMContactHandler):
                 self.contact_pairs[i_p].geom_idx0 = i_e
                 self.contact_pairs[i_p].barycentric0 = barycentric0
                 self.contact_pairs[i_p].link_idx = i_l
+                self.contact_pairs[i_p].rigid_geom_idx = i_g
+                self.contact_pairs[i_p].rigid_face_idx = i_f
                 self.contact_pairs[i_p].contact_pos = centroid
                 sap_info[i_p].k = rigid_k
                 sap_info[i_p].phi0 = rigid_phi0
@@ -3651,6 +4486,22 @@ class RigidFemTriTetContactHandler(RigidFEMContactHandler):
                 overflow = True
 
         return overflow
+
+    @qd.kernel
+    def finalize_public_state(self):
+        sap_info = qd.static(self.contact_pairs.sap_info)
+        for i_p in range(self.n_contact_pairs[None]):
+            velocity = self.compute_contact_velocity(i_p)
+            self.compute_contact_gamma_G(sap_info, i_p, velocity)
+            y = qd.Vector([0.0, 0.0, sap_info[i_p].vn_hat]) - velocity
+            y[0] *= sap_info[i_p].Rt_inv
+            y[1] *= sap_info[i_p].Rt_inv
+            y[2] *= sap_info[i_p].Rn_inv
+            yr = y[:2].norm(gs.EPS)
+            mode = self.compute_contact_mode(sap_info[i_p].mu, sap_info[i_p].mu_hat, yr, y[2])
+            self.contact_pairs[i_p].public_relative_velocity = velocity
+            self.contact_pairs[i_p].public_gamma = sap_info[i_p].gamma
+            self.contact_pairs[i_p].public_mode = mode
 
     @qd.func
     def detection(

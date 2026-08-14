@@ -28,7 +28,7 @@ def _write_two_tet_mesh(path):
     igl.writeMESH(str(path), _TWO_TET_VERTS, _TWO_TETS, np.empty((0, 3), dtype=np.int64))
 
 
-def _build_native_implicit_two_tet_scene(tmp_path, *, n_linesearch_iterations=0):
+def _build_native_implicit_two_tet_scene(tmp_path, *, n_linesearch_iterations=0, n_envs=1):
     tmp_path.mkdir(parents=True, exist_ok=True)
     mesh_path = tmp_path / "two_tets.mesh"
     _write_two_tet_mesh(mesh_path)
@@ -55,7 +55,7 @@ def _build_native_implicit_two_tet_scene(tmp_path, *, n_linesearch_iterations=0)
         morph=gs.morphs.TetMesh(file=str(mesh_path), pos=(0.0, 0.0, 2.0)),
         material=gs.materials.FEM.Elastic(E=100.0, rho=100.0, model="linear_corotated"),
     )
-    scene.build()
+    scene.build(n_envs=n_envs)
     return scene, entity
 
 
@@ -86,6 +86,27 @@ def _native_constraint_slice(scene, entity):
         "is_soft_constraint": constraints.is_soft_constraint.to_numpy()[vertex_slice, 0],
         "stiffness": constraints.stiffness.to_numpy()[vertex_slice, 0],
     }
+
+
+@pytest.mark.required
+def test_fem_partial_state_restore_only_mutates_selected_environment(tmp_path):
+    """M3 replay must not restore one candidate's FEM state into every env."""
+    scene, _ = _build_native_implicit_two_tet_scene(tmp_path, n_envs=2)
+    snapshot = scene.capture_whole_batch_snapshot()
+    state = scene.fem_solver.get_state(0)
+    before = tensor_to_array(state.pos).copy()
+    state.pos[0, 0, 0] += 0.125
+    state.pos[1, 0, 0] += 0.375
+
+    scene.fem_solver.set_state(0, state, envs_idx=[0])
+    after = tensor_to_array(scene.fem_solver.get_state(0).pos)
+
+    assert_allclose(after[0, 0, 0], before[0, 0, 0] + 0.125, tol=1e-12)
+    assert_allclose(after[1], before[1], tol=1e-12)
+
+    scene.restore_whole_batch_snapshot(snapshot)
+    restored = tensor_to_array(scene.fem_solver.get_state(0).pos)
+    assert_allclose(restored, before, tol=1e-12)
 
 
 @pytest.mark.required

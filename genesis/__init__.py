@@ -514,6 +514,26 @@ from .grad.creation_ops import *
 
 from .engine import states, materials, force_fields
 from .engine.mesh import Mesh
+from .engine.rigid_fem_contact import (
+    RigidFEMContactBatch,
+    RigidFEMContactError,
+    RigidFEMContactMode,
+    RigidFEMContactNotReadyError,
+    RigidFEMContactOwnershipReceipt,
+    RigidFEMContactUnavailableError,
+    RigidFEMWhitelistEntry,
+    RigidFEMWhitelistReceipt,
+)
+from .engine.solver_health import (
+    FEMPrincipalStrainWitness,
+    FEMSubstepSafetyExtrema,
+    ImplicitFEMSubstepHealth,
+    SAPControlStepSolverHealth,
+    SAPSubstepSolverHealth,
+    SolverHealthError,
+    SolverHealthNotReadyError,
+    SolverHealthUnavailableError,
+)
 from .engine.scene import Scene
 
 from . import recorders

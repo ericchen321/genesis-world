@@ -162,6 +162,26 @@ class SAPCouplerOptions(BaseCouplerOptions):
         Vert would be preferable when the mesh is very coarse, such as a single cube or a tetrahedron.
     enable_rigid_fem_contact : bool, optional
         Whether to enable coupling between rigid and FEM solvers. Defaults to True.
+    enable_qualification_post_final_sap_health : bool, optional
+        Enable a qualification-only recomputation of the SAP convergence
+        diagnostics after the final outer update. This is disabled by default
+        because it synchronizes additional diagnostic state and is not part of
+        the normal solver path.
+    enable_development_positive_j_feasible_step : bool, optional
+        Enable the development-only post-SAP common-alpha positive-J feasible
+        step used by the Clawhauser contact-collapse diagnostic. Defaults to
+        False and is not part of the ordinary SAP path.
+    enable_completed_solver_health : bool, optional
+        Publish the complete per-physical-substep SAP solver-health record.
+        Defaults to True. Development direct replay may disable it to avoid
+        diagnostic host synchronization without changing contact physics.
+    enable_development_positive_j_alpha_one_only : bool, optional
+        Retain the development post-SAP update site but commit its unmodified
+        alpha=1 correction without endpoint backtracking. Defaults to False.
+    enable_development_direct_replay_finger_contact_flags : bool, optional
+        Enable the narrow per-environment two-flag G2 contact observation used
+        by development direct replay instead of exporting full contact rows.
+        Defaults to False.
     """
 
     n_sap_iterations: PositiveInt = 5
@@ -182,6 +202,11 @@ class SAPCouplerOptions(BaseCouplerOptions):
     rigid_floor_contact_type: Literal["tet", "vert", "none"] = "tet"
     enable_rigid_fem_contact: StrictBool = True
     rigid_rigid_contact_type: Literal["tet", "vert", "none"] = "tet"
+    enable_qualification_post_final_sap_health: StrictBool = False
+    enable_development_positive_j_feasible_step: StrictBool = False
+    enable_completed_solver_health: StrictBool = True
+    enable_development_positive_j_alpha_one_only: StrictBool = False
+    enable_development_direct_replay_finger_contact_flags: StrictBool = False
 
 
 class IPCCouplerOptions(BaseCouplerOptions):
@@ -829,7 +854,12 @@ class FEMOptions(Options):
     newton_dx_threshold : float, optional
         Threshold for the Newton solver. Defaults to 1e-6. Only used when `use_implicit_solver` is True.
     pcg_threshold : float, optional
-        Threshold for the PCG solver. Defaults to 1e-6. Only used when `use_implicit_solver` is True.
+        Squared absolute residual floor for the PCG solver. Defaults to 1e-6.
+        Only used when `use_implicit_solver` is True.
+    pcg_rtol : float, optional
+        Optional relative residual-norm tolerance for the PCG solver. A value
+        of zero preserves the absolute-floor-only stopping semantics. Defaults
+        to 0.0. Only used when `use_implicit_solver` is True.
     linesearch_c : float, optional
         Line search sufficient decrease parameter. Defaults to 1e-4. Only used when `use_implicit_solver` is True.
     linesearch_tau : float, optional
@@ -840,6 +870,21 @@ class FEMOptions(Options):
         Rayleigh Damping factor for the implicit solver. Defaults to 5e-4. Only used when `use_implicit_solver` is True.
     enable_vertex_constraints : bool, optional
         Whether to enable vertex constraints. Defaults to False.
+    enable_qualification_safety_extrema : bool, optional
+        Enable the B=1 implicit-FEM CPU extrema reduction used by an explicit
+        qualification scene. It synchronizes device state after each physical
+        substep and is therefore disabled by default.
+    enable_development_implicit_fem_positive_j_feasible_step : bool, optional
+        Enable the development-only common-alpha positive-J feasible PCG
+        position update used by the Clawhauser contact-collapse diagnostic.
+        Defaults to False and is not part of the ordinary implicit FEM path.
+    enable_development_implicit_fem_positive_j_alpha_one_only : bool, optional
+        Retain the development implicit-FEM update site but commit the full
+        alpha=1 PCG position update without endpoint backtracking. Defaults to
+        False.
+    enable_development_direct_replay_min_j_query : bool, optional
+        Enable the narrow one-scalar committed relative-J readback used only
+        by development direct replay. Defaults to False.
     """
 
     dt: PositiveFloat | None = None
@@ -853,11 +898,16 @@ class FEMOptions(Options):
     n_linesearch_iterations: NonNegativeInt = 0
     newton_dx_threshold: PositiveFloat = 1e-6
     pcg_threshold: PositiveFloat = 1e-6
+    pcg_rtol: NonNegativeFloat = 0.0
     linesearch_c: PositiveFloat = 1e-4
     linesearch_tau: PositiveFloat = 0.5
     damping_alpha: NonNegativeFloat = 0.5
     damping_beta: NonNegativeFloat = 5e-4
     enable_vertex_constraints: StrictBool = False
+    enable_qualification_safety_extrema: StrictBool = False
+    enable_development_implicit_fem_positive_j_feasible_step: StrictBool = False
+    enable_development_implicit_fem_positive_j_alpha_one_only: StrictBool = False
+    enable_development_direct_replay_min_j_query: StrictBool = False
 
 
 class SFOptions(Options):

@@ -1,3 +1,5 @@
+from dataclasses import dataclass
+
 import genesis as gs
 from genesis.repr_base import RBC
 
@@ -41,6 +43,44 @@ class SimState(RBC):
 
     def __iter__(self):
         return iter(self._solvers_state)
+
+
+@dataclass(frozen=True)
+class WholeBatchSnapshot:
+    """Opaque, full-control-step state for deterministic batched replay.
+
+    ``native_state`` is intentionally private: product code restores this token
+    only through :meth:`Scene.restore_whole_batch_snapshot`, rather than
+    reaching into solver or SAP-coupler fields.  SAP reinitializes its
+    per-substep scratch/contact solve from the restored physical state; it has
+    no cross-control-step warm-start payload in this contract.
+    """
+
+    _native_state: SimState
+    scene_step_index: int
+    global_substep_index: int
+    simulation_time_s: float
+    batch_size: int
+    sap_continuation_semantics: str
+    snapshot_identity_sha256: str
+
+
+@dataclass(frozen=True)
+class CompletedPhysicalSubstepGeometryTrace:
+    """One successful control step's completed physical-frame geometry.
+
+    This deliberately is a last-step value, rather than simulator history.
+    The tensor payloads stay on the simulator device until the public caller
+    elects to read them back once after ``Scene.step``.
+    """
+
+    scene_step_index: int
+    first_global_substep_index: int
+    batch_size: int
+    substeps: int
+    fem_vertices: object  # [B,S,V,3]
+    rigid_link_pos: object  # [B,S,L,3]
+    rigid_link_quat: object  # [B,S,L,4]
 
 
 class KinematicSolverState:
@@ -99,6 +139,12 @@ class RigidSolverState:
         self.qpos = gs.zeros((_B, scene.sim.rigid_solver.n_qs), **args)
         self.dofs_vel = gs.zeros((_B, scene.sim.rigid_solver.n_dofs), **args)
         self.dofs_acc = gs.zeros((_B, scene.sim.rigid_solver.n_dofs), **args)
+        self.ctrl_pos = gs.zeros((_B, scene.sim.rigid_solver.n_dofs), **args)
+        self.ctrl_vel = gs.zeros((_B, scene.sim.rigid_solver.n_dofs), **args)
+        self.ctrl_force = gs.zeros((_B, scene.sim.rigid_solver.n_dofs), **args)
+        args["dtype"] = gs.tc_int
+        self.ctrl_mode = gs.zeros((_B, scene.sim.rigid_solver.n_dofs), **args)
+        args["dtype"] = gs.tc_float
         self.links_pos = gs.zeros((_B, scene.sim.rigid_solver.n_links, 3), **args)
         self.links_quat = gs.zeros((_B, scene.sim.rigid_solver.n_links, 4), **args)
         self.i_pos_shift = gs.zeros((_B, scene.sim.rigid_solver.n_links, 3), **args)
@@ -110,6 +156,10 @@ class RigidSolverState:
         self.qpos = self.qpos.detach()
         self.dofs_vel = self.dofs_vel.detach()
         self.dofs_acc = self.dofs_acc.detach()
+        self.ctrl_pos = self.ctrl_pos.detach()
+        self.ctrl_vel = self.ctrl_vel.detach()
+        self.ctrl_force = self.ctrl_force.detach()
+        self.ctrl_mode = self.ctrl_mode.detach()
         self.links_pos = self.links_pos.detach()
         self.links_quat = self.links_quat.detach()
         self.i_pos_shift = self.i_pos_shift.detach()

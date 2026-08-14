@@ -63,11 +63,11 @@ class Rigid(Kinematic["RigidEntity"]):
         in coupling; other links are excluded. Only supported with needs_coup=True and
         ``two_way_soft_constraint`` type in IPC. Default is None.
     enable_coup_collision : bool, optional
-        Whether coupler collision is enabled for this entity's links. Only used by the IPC coupler.
+        Whether coupler collision is enabled for this entity's links. Used by the IPC and SAP couplers.
         Unlike ``needs_coup=False`` (which removes the entity from the coupler entirely), setting this to
         False keeps the entity in the coupler for coupling forces but disables contact response. Default is True.
     coup_collision_links : tuple of str or None, optional
-        Tuple of link names whose geoms participate in coupler collision. Only used by the IPC coupler.
+        Tuple of link names whose geoms participate in coupler collision. Used by the IPC and SAP couplers.
         Only effective when ``enable_coup_collision=True``. If None, all coupled links have collision.
         When set, only the named links get coupler collision; other links are marked no-collision.
         Default is None.
@@ -130,6 +130,15 @@ class Rigid(Kinematic["RigidEntity"]):
                 "`coup_collision_links` is only effective when `enable_coup_collision=True`. "
                 "Set `enable_coup_collision=False` to disable collision for all links."
             )
+
+        if self.coup_collision_links is not None:
+            names = tuple(self.coup_collision_links)
+            if not names:
+                gs.raise_exception("`coup_collision_links` must not be empty. Use None to enable all links.")
+            if any(not name or name.strip() != name for name in names):
+                gs.raise_exception("`coup_collision_links` must contain nonempty stripped link names.")
+            if len(names) != len(set(names)):
+                gs.raise_exception("`coup_collision_links` must not contain duplicate link names.")
 
         if self.sdf_min_res > self.sdf_max_res:
             gs.raise_exception("`sdf_min_res` must be smaller than or equal to `sdf_max_res`.")

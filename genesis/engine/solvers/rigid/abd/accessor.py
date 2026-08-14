@@ -95,6 +95,10 @@ def kernel_get_state(
     qpos: qd.types.ndarray(),
     vel: qd.types.ndarray(),
     acc: qd.types.ndarray(),
+    ctrl_pos: qd.types.ndarray(),
+    ctrl_vel: qd.types.ndarray(),
+    ctrl_force: qd.types.ndarray(),
+    ctrl_mode: qd.types.ndarray(),
     links_pos: qd.types.ndarray(),
     links_quat: qd.types.ndarray(),
     i_pos_shift: qd.types.ndarray(),
@@ -120,6 +124,10 @@ def kernel_get_state(
     for i_d, i_b in qd.ndrange(n_dofs, _B):
         vel[i_b, i_d] = dofs_state.vel[i_d, i_b]
         acc[i_b, i_d] = dofs_state.acc[i_d, i_b]
+        ctrl_pos[i_b, i_d] = dofs_state.ctrl_pos[i_d, i_b]
+        ctrl_vel[i_b, i_d] = dofs_state.ctrl_vel[i_d, i_b]
+        ctrl_force[i_b, i_d] = dofs_state.ctrl_force[i_d, i_b]
+        ctrl_mode[i_b, i_d] = dofs_state.ctrl_mode[i_d, i_b]
 
     qd.loop_config(serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL)
     for i_l, i_b in qd.ndrange(n_links, _B):
@@ -141,6 +149,10 @@ def kernel_set_state(
     qpos: qd.types.ndarray(),
     dofs_vel: qd.types.ndarray(),
     dofs_acc: qd.types.ndarray(),
+    ctrl_pos: qd.types.ndarray(),
+    ctrl_vel: qd.types.ndarray(),
+    ctrl_force: qd.types.ndarray(),
+    ctrl_mode: qd.types.ndarray(),
     links_pos: qd.types.ndarray(),
     links_quat: qd.types.ndarray(),
     i_pos_shift: qd.types.ndarray(),
@@ -166,8 +178,10 @@ def kernel_set_state(
     for i_d, i_b_ in qd.ndrange(n_dofs, _B):
         dofs_state.vel[i_d, envs_idx[i_b_]] = dofs_vel[envs_idx[i_b_], i_d]
         dofs_state.acc[i_d, envs_idx[i_b_]] = dofs_acc[envs_idx[i_b_], i_d]
-        dofs_state.ctrl_force[i_d, envs_idx[i_b_]] = gs.qd_float(0.0)
-        dofs_state.ctrl_mode[i_d, envs_idx[i_b_]] = gs.CTRL_MODE.FORCE
+        dofs_state.ctrl_pos[i_d, envs_idx[i_b_]] = ctrl_pos[envs_idx[i_b_], i_d]
+        dofs_state.ctrl_vel[i_d, envs_idx[i_b_]] = ctrl_vel[envs_idx[i_b_], i_d]
+        dofs_state.ctrl_force[i_d, envs_idx[i_b_]] = ctrl_force[envs_idx[i_b_], i_d]
+        dofs_state.ctrl_mode[i_d, envs_idx[i_b_]] = ctrl_mode[envs_idx[i_b_], i_d]
 
     qd.loop_config(serialize=static_rigid_sim_config.para_level < gs.PARA_LEVEL.ALL)
     for i_l, i_b_ in qd.ndrange(n_links, _B):

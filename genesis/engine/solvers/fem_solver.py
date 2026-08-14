@@ -11,14 +11,177 @@ import genesis as gs
 import genesis.utils.array_class as array_class
 from genesis.engine.boundaries import FloorBoundary
 from genesis.engine.entities.fem_entity import FEMEntity
+from genesis.engine.solver_health import (
+    FEMPrincipalStrainWitness,
+    FEMSubstepSafetyExtrema,
+    ImplicitFEMPositiveJFeasibleStep,
+)
 from genesis.engine.states.solvers import FEMSolverState
-from genesis.utils.misc import qd_to_torch
+from genesis.utils.misc import qd_to_torch, tensor_to_array
 from genesis.utils.geom import qd_transform_by_quat, qd_transform_quat_by_quat
 
 from .base_solver import Solver
 
 if TYPE_CHECKING:
     from genesis.engine.entities import FEMEntity
+
+DEVELOPMENT_IMPLICIT_FEM_POSITIVE_J_FLOOR = 0.20
+DEVELOPMENT_IMPLICIT_FEM_POSITIVE_J_SCHEDULE_LENGTH = 8
+
+
+def _linear_corotated_safety_extrema(
+    *,
+    rest_positions: np.ndarray,
+    tetrahedra: np.ndarray,
+    current_positions: np.ndarray,
+    active: np.ndarray,
+    lame_mu: np.ndarray,
+    lame_lambda: np.ndarray,
+    global_substep_index: int | None = None,
+    env_index: int = 0,
+    fem_entity_index: int | None = None,
+    fem_entity_name: str | None = None,
+    vertex_global_offset: int = 0,
+    tet_global_offset: int = 0,
+    floor_height_m: float | None = None,
+) -> FEMSubstepSafetyExtrema | None:
+    """Reduce one volumetric linear-corotated FEM state.
+
+    The optional metadata enables one bounded public argmax witness for the
+    qualification-only B=1 path.  Omitting it preserves the scalar-only
+    source-compatible helper behavior used by unrelated consumers.
+    """
+    rest = np.asarray(rest_positions, dtype=np.float64)
+    tets = np.asarray(tetrahedra, dtype=np.int64)
+    current = np.asarray(current_positions, dtype=np.float64)
+    active_mask = np.asarray(active, dtype=np.bool_)
+    mu = np.asarray(lame_mu, dtype=np.float64)
+    lam = np.asarray(lame_lambda, dtype=np.float64)
+    if (
+        rest.ndim != 2
+        or rest.shape[1] != 3
+        or current.ndim != 3
+        or current.shape[1:] != rest.shape
+        or tets.ndim != 2
+        or tets.shape[1] != 4
+        or active_mask.shape != (current.shape[0], tets.shape[0])
+        or mu.shape != (tets.shape[0],)
+        or lam.shape != (tets.shape[0],)
+        or not np.isfinite(rest).all()
+        or not np.isfinite(current).all()
+        or not np.isfinite(mu).all()
+        or not np.isfinite(lam).all()
+        or np.any(mu <= 0.0)
+        or np.any(lam < 0.0)
+        or np.any(tets < 0)
+        or np.any(tets >= rest.shape[0])
+    ):
+        raise ValueError("implicit FEM safety extrema received malformed volumetric state")
+    if not np.any(active_mask):
+        return None
+
+    rest_edges = np.stack(
+        (rest[tets[:, 0]] - rest[tets[:, 3]], rest[tets[:, 1]] - rest[tets[:, 3]], rest[tets[:, 2]] - rest[tets[:, 3]]),
+        axis=2,
+    )
+    rest_det = np.linalg.det(rest_edges)
+    if not np.isfinite(rest_det).all() or np.any(rest_det == 0.0):
+        raise ValueError("implicit FEM safety extrema require nondegenerate rest tetrahedra")
+    rest_inverse = np.linalg.inv(rest_edges)
+    rest_volume = np.abs(rest_det) / 6.0
+
+    current_edges = np.stack(
+        (
+            current[:, tets[:, 0]] - current[:, tets[:, 3]],
+            current[:, tets[:, 1]] - current[:, tets[:, 3]],
+            current[:, tets[:, 2]] - current[:, tets[:, 3]],
+        ),
+        axis=3,
+    )
+    deformation = current_edges @ rest_inverse
+    jacobian = np.linalg.det(deformation)
+    singular_values = np.linalg.svd(deformation, compute_uv=False)
+    principal_strain = np.max(np.abs(singular_values - 1.0), axis=2)
+    # Match ``Elastic._pre_compute_linear_corotated`` exactly. In particular,
+    # an improper polar factor is not corrected here: J <= 0 is separately
+    # retained as the inversion hard-safety evidence.
+    u, _, vh = np.linalg.svd(deformation)
+    rotation = u @ vh
+    f_hat = np.swapaxes(rotation, 2, 3) @ deformation
+    epsilon = 0.5 * (f_hat + np.swapaxes(f_hat, 2, 3)) - np.eye(3, dtype=np.float64)
+    trace = np.trace(epsilon, axis1=2, axis2=3)
+    density = mu[None] * np.sum(epsilon * epsilon, axis=(2, 3)) + 0.5 * lam[None] * trace * trace
+    energy = density * rest_volume[None]
+    if not np.isfinite(jacobian).all() or not np.isfinite(principal_strain).all() or not np.isfinite(energy).all():
+        raise ValueError("implicit FEM safety extrema computation produced a non-finite value")
+
+    selected = active_mask
+    selected_jacobian = jacobian[selected]
+    selected_strain = principal_strain[selected]
+    selected_energy = energy[selected]
+    witness = None
+    if (
+        current.shape[0] == 1
+        and global_substep_index is not None
+        and fem_entity_index is not None
+        and fem_entity_name is not None
+        and floor_height_m is not None
+    ):
+        if type(global_substep_index) is not int or global_substep_index < 0:
+            raise ValueError("global_substep_index must be a nonnegative int")
+        if type(env_index) is not int or env_index != 0:
+            raise ValueError("qualification FEM witness requires env_index == 0")
+        if type(fem_entity_index) is not int or fem_entity_index < 0 or not isinstance(fem_entity_name, str) or not fem_entity_name:
+            raise ValueError("FEM witness entity identity is malformed")
+        if type(vertex_global_offset) is not int or vertex_global_offset < 0 or type(tet_global_offset) is not int or tet_global_offset < 0:
+            raise ValueError("FEM witness global offsets must be nonnegative ints")
+        if type(floor_height_m) is not float or not np.isfinite(floor_height_m):
+            raise ValueError("floor_height_m must be a finite float")
+        active_indices = np.argwhere(active_mask[0])[:, 0]
+        max_value = float(np.max(principal_strain[0, active_indices]))
+        tied = active_indices[principal_strain[0, active_indices] == max_value]
+        tet_local_index = int(np.min(tied))
+        tet_local_vertices = tuple(int(value) for value in tets[tet_local_index])
+        vertex_positions = tuple(
+            tuple(float(component) for component in current[0, vertex_index]) for vertex_index in tet_local_vertices
+        )
+        centroid = tuple(float(sum(vertex[axis] for vertex in vertex_positions) / 4.0) for axis in range(3))
+        floor_candidate = any(vertex[2] > floor_height_m for vertex in vertex_positions) and any(
+            vertex[2] <= floor_height_m for vertex in vertex_positions
+        )
+        witness = FEMPrincipalStrainWitness(
+            global_substep_index=global_substep_index,
+            env_index=env_index,
+            fem_entity_index=fem_entity_index,
+            fem_entity_name=fem_entity_name,
+            tet_local_index=tet_local_index,
+            tet_global_index=tet_global_offset + tet_local_index,
+            tet_entity_local_vertex_indices=tet_local_vertices,
+            tet_global_vertex_indices=tuple(vertex_global_offset + value for value in tet_local_vertices),
+            current_vertex_positions_m=vertex_positions,
+            current_centroid_m=centroid,
+            principal_stretch_strain=max_value,
+            floor_height_m=floor_height_m,
+            floor_tet_candidate_geometrically_possible=floor_candidate,
+        )
+    return FEMSubstepSafetyExtrema(
+        min_j=float(np.min(selected_jacobian)),
+        max_principal_stretch_strain=float(np.max(selected_strain)),
+        max_tet_elastic_energy_j=float(np.max(selected_energy)),
+        total_elastic_energy_j=float(np.sum(selected_energy, dtype=np.float64)),
+        no_inversion=bool(np.min(selected_jacobian) > 0.0),
+        principal_strain_witness=witness,
+    )
+
+
+def _pcg_effective_residual_squared_threshold(
+    *, initial_residual_squared: float, absolute_residual_squared_floor: float, pcg_rtol: float
+) -> float:
+    """Return the documented PCG stopping threshold for one zero-start solve."""
+    values = (initial_residual_squared, absolute_residual_squared_floor, pcg_rtol)
+    if any(not np.isfinite(value) or value < 0.0 for value in values):
+        raise ValueError("PCG stopping inputs must be finite and nonnegative")
+    return max(absolute_residual_squared_floor, initial_residual_squared * pcg_rtol * pcg_rtol)
 
 
 @qd.data_oriented
@@ -39,12 +202,23 @@ class FEMSolver(Solver):
         self._newton_dx_threshold = options.newton_dx_threshold
         self._n_pcg_iterations = options.n_pcg_iterations
         self._pcg_threshold = options.pcg_threshold
+        self._pcg_rtol = options.pcg_rtol
         self._n_linesearch_iterations = options.n_linesearch_iterations
         self._linesearch_c = options.linesearch_c
         self._linesearch_tau = options.linesearch_tau
         self._damping_alpha = options.damping_alpha
         self._damping_beta = options.damping_beta
         self._enable_vertex_constraints = options.enable_vertex_constraints
+        self._enable_qualification_safety_extrema = options.enable_qualification_safety_extrema
+        self._enable_development_implicit_fem_positive_j_feasible_step = (
+            options.enable_development_implicit_fem_positive_j_feasible_step
+        )
+        self._enable_development_implicit_fem_positive_j_alpha_one_only = (
+            options.enable_development_implicit_fem_positive_j_alpha_one_only
+        )
+        self._enable_development_direct_replay_min_j_query = (
+            options.enable_development_direct_replay_min_j_query
+        )
 
         # use scaled volume for better numerical stability, similar to p_vol_scale in mpm
         self._vol_scale = float(1e4)
@@ -69,9 +243,14 @@ class FEMSolver(Solver):
         self.batch_active = qd.field(dtype=gs.qd_bool, shape=(self._B,), needs_grad=False)
         self.batch_pcg_active = qd.field(dtype=gs.qd_bool, shape=(self._B,), needs_grad=False)
         self.batch_linesearch_active = qd.field(dtype=gs.qd_bool, shape=(self._B,), needs_grad=False)
+        self.batch_pcg_budget_exhausted = qd.field(dtype=gs.qd_bool, shape=(self._B,), needs_grad=False)
+        self.batch_pcg_breakdown = qd.field(dtype=gs.qd_bool, shape=(self._B,), needs_grad=False)
+        self.batch_linesearch_budget_exhausted = qd.field(dtype=gs.qd_bool, shape=(self._B,), needs_grad=False)
 
         pcg_state = qd.types.struct(
             rTr=gs.qd_float,
+            rTr_initial=gs.qd_float,
+            termination_threshold=gs.qd_float,
             rTz=gs.qd_float,
             rTr_new=gs.qd_float,
             rTz_new=gs.qd_float,
@@ -88,6 +267,32 @@ class FEMSolver(Solver):
             m=gs.qd_float,
         )
         self.linesearch_state = linesearch_state.field(shape=(self._B,), needs_grad=False, layout=qd.Layout.SOA)
+
+        if (
+            self._enable_development_implicit_fem_positive_j_feasible_step
+            and not self._enable_development_implicit_fem_positive_j_alpha_one_only
+        ):
+            self._development_implicit_fem_positive_j_base_min_j = qd.field(
+                dtype=gs.qd_float, shape=(self._B,), needs_grad=False
+            )
+            self._development_implicit_fem_positive_j_trial_min_j = qd.field(
+                dtype=gs.qd_float, shape=(self._B,), needs_grad=False
+            )
+            self._development_implicit_fem_positive_j_accepted_alpha = qd.field(
+                dtype=gs.qd_float, shape=(self._B,), needs_grad=False
+            )
+            self._development_implicit_fem_positive_j_witness_tet_id = qd.field(
+                dtype=gs.qd_int, shape=(self._B,), needs_grad=False
+            )
+            self._development_implicit_fem_positive_j_schedule_min_j = qd.field(
+                dtype=gs.qd_float,
+                shape=(DEVELOPMENT_IMPLICIT_FEM_POSITIVE_J_SCHEDULE_LENGTH, self._B),
+                needs_grad=False,
+            )
+        if self._enable_development_direct_replay_min_j_query:
+            self._development_direct_replay_current_min_relative_j = qd.field(
+                dtype=gs.qd_float, shape=(self._B,), needs_grad=False
+            )
 
     def init_element_fields(self):
         # element state in vertices
@@ -518,6 +723,15 @@ class FEMSolver(Solver):
                 )
                 self.elements_v[f + 1, i_v, i_b].pos = self.elements_v[f, i_v, i_b].pos
 
+        # Element activity is state, not topology.  The implicit solver writes
+        # the completed position/velocity frame here, so preserve the matching
+        # per-element activity mask for public completed-frame readback too.
+        # Without this propagation, a just-completed frame reports every
+        # element inactive even though the next physical substep still solves
+        # the same active volume.
+        for i_e, i_b in qd.ndrange(self.n_elements, self._B):
+            self.elements_el_ng[f + 1, i_e, i_b].active = self.elements_el_ng[f, i_e, i_b].active
+
     @qd.func
     def _compute_ele_J_F(self, f: qd.i32, i_e: qd.i32, i_b: qd.i32):
         """
@@ -535,6 +749,45 @@ class FEMSolver(Solver):
         J = F.determinant()
 
         return J, F
+
+    @qd.kernel
+    def _init_development_direct_replay_current_min_relative_j(self):
+        for i_b in range(self._B):
+            self._development_direct_replay_current_min_relative_j[i_b] = qd.math.inf
+
+    @qd.kernel
+    def _reduce_development_direct_replay_current_min_relative_j(
+        self, f: qd.i32, element_start: qd.i32, element_count: qd.i32
+    ):
+        for i_b, i_e_local in qd.ndrange(self._B, element_count):
+            i_e = element_start + i_e_local
+            if self.elements_el_ng[f, i_e, i_b].active:
+                J, _ = self._compute_ele_J_F(f, i_e, i_b)
+                qd.atomic_min(
+                    self._development_direct_replay_current_min_relative_j[i_b], J
+                )
+
+    def get_development_direct_replay_current_min_relative_j(
+        self, entity: FEMEntity, *, env_index: int = 0
+    ) -> float:
+        """Return one scalar committed relative-J value for direct replay only."""
+        if not self._enable_development_direct_replay_min_j_query:
+            raise RuntimeError("development direct replay min-J query is not enabled")
+        if entity._solver is not self:
+            raise ValueError("development direct replay min-J entity belongs to another FEM solver")
+        if type(env_index) is not int or not 0 <= env_index < self._B:
+            raise ValueError("development direct replay min-J environment is invalid")
+        self._init_development_direct_replay_current_min_relative_j()
+        self._reduce_development_direct_replay_current_min_relative_j(
+            int(self.sim.cur_substep_local), int(entity.el_start), int(entity.n_elements)
+        )
+        values = np.asarray(
+            self._development_direct_replay_current_min_relative_j.to_numpy(),
+            dtype=np.float64,
+        )
+        if values.shape != (self._B,) or not np.isfinite(values).all():
+            raise RuntimeError("development direct replay committed relative-J is nonfinite")
+        return float(values[env_index])
 
     @qd.kernel
     def compute_ele_hessian_gradient(self, f: qd.i32):
@@ -783,6 +1036,8 @@ class FEMSolver(Solver):
             if not self.batch_pcg_active[i_b]:
                 continue
             self.pcg_state[i_b].rTr = 0.0
+            self.pcg_state[i_b].rTr_initial = 0.0
+            self.pcg_state[i_b].termination_threshold = self._pcg_threshold
             self.pcg_state[i_b].rTz = 0.0
         for i_b, i_v in qd.ndrange(self._B, self.n_vertices):
             if not self.batch_pcg_active[i_b]:
@@ -796,7 +1051,24 @@ class FEMSolver(Solver):
         for i_b in range(self._B):
             if not self.batch_pcg_active[i_b]:
                 continue
-            self.batch_pcg_active[i_b] = self.pcg_state[i_b].rTr > self._pcg_threshold
+            self.pcg_state[i_b].rTr_initial = self.pcg_state[i_b].rTr
+            self.pcg_state[i_b].termination_threshold = qd.max(
+                self._pcg_threshold,
+                self.pcg_state[i_b].rTr_initial * self._pcg_rtol * self._pcg_rtol,
+            )
+            valid = (
+                self.pcg_state[i_b].rTr >= 0.0
+                and not qd.math.isnan(self.pcg_state[i_b].rTr)
+                and not qd.math.isinf(self.pcg_state[i_b].rTr)
+                and self.pcg_state[i_b].termination_threshold >= 0.0
+                and not qd.math.isnan(self.pcg_state[i_b].termination_threshold)
+                and not qd.math.isinf(self.pcg_state[i_b].termination_threshold)
+            )
+            if not valid:
+                self.batch_pcg_breakdown[i_b] = True
+                self.batch_pcg_active[i_b] = False
+            else:
+                self.batch_pcg_active[i_b] = self.pcg_state[i_b].rTr > self.pcg_state[i_b].termination_threshold
 
     @qd.kernel
     def one_pcg_iter(self):
@@ -816,9 +1088,21 @@ class FEMSolver(Solver):
         for i_b in range(self._B):
             if not self.batch_pcg_active[i_b]:
                 continue
-            self.pcg_state[i_b].alpha = self.pcg_state[i_b].rTz / self.pcg_state[i_b].pTAp
-            self.pcg_state[i_b].rTr_new = 0.0
-            self.pcg_state[i_b].rTz_new = 0.0
+            valid = (
+                self.pcg_state[i_b].rTz > 0.0
+                and self.pcg_state[i_b].pTAp > 0.0
+                and not qd.math.isnan(self.pcg_state[i_b].rTz)
+                and not qd.math.isinf(self.pcg_state[i_b].rTz)
+                and not qd.math.isnan(self.pcg_state[i_b].pTAp)
+                and not qd.math.isinf(self.pcg_state[i_b].pTAp)
+            )
+            if not valid:
+                self.batch_pcg_breakdown[i_b] = True
+                self.batch_pcg_active[i_b] = False
+            else:
+                self.pcg_state[i_b].alpha = self.pcg_state[i_b].rTz / self.pcg_state[i_b].pTAp
+                self.pcg_state[i_b].rTr_new = 0.0
+                self.pcg_state[i_b].rTz_new = 0.0
         for i_b, i_v in qd.ndrange(self._B, self.n_vertices):
             if not self.batch_pcg_active[i_b]:
                 continue
@@ -828,19 +1112,33 @@ class FEMSolver(Solver):
             qd.atomic_add(self.pcg_state[i_b].rTr_new, self.pcg_state_v[i_b, i_v].r.dot(self.pcg_state_v[i_b, i_v].r))
             qd.atomic_add(self.pcg_state[i_b].rTz_new, self.pcg_state_v[i_b, i_v].r.dot(self.pcg_state_v[i_b, i_v].z))
 
-        # check convergence
+        # Preserve the final residual even when this iteration converges. The
+        # public health snapshot must never report the previous iterate.
         for i_b in range(self._B):
             if not self.batch_pcg_active[i_b]:
                 continue
-            self.batch_pcg_active[i_b] = self.pcg_state[i_b].rTr_new > self._pcg_threshold
-
-        # update beta, rTr, rTz
-        for i_b in range(self._B):
-            if not self.batch_pcg_active[i_b]:
+            valid = (
+                self.pcg_state[i_b].rTr_new >= 0.0
+                and self.pcg_state[i_b].rTz_new >= 0.0
+                and not qd.math.isnan(self.pcg_state[i_b].rTr_new)
+                and not qd.math.isinf(self.pcg_state[i_b].rTr_new)
+                and not qd.math.isnan(self.pcg_state[i_b].rTz_new)
+                and not qd.math.isinf(self.pcg_state[i_b].rTz_new)
+            )
+            if not valid:
+                self.batch_pcg_breakdown[i_b] = True
+                self.batch_pcg_active[i_b] = False
+                self.pcg_state[i_b].rTr = self.pcg_state[i_b].rTr_new
+                self.pcg_state[i_b].rTz = self.pcg_state[i_b].rTz_new
                 continue
             self.pcg_state[i_b].beta = self.pcg_state[i_b].rTz_new / self.pcg_state[i_b].rTz
             self.pcg_state[i_b].rTr = self.pcg_state[i_b].rTr_new
             self.pcg_state[i_b].rTz = self.pcg_state[i_b].rTz_new
+            if qd.math.isnan(self.pcg_state[i_b].beta) or qd.math.isinf(self.pcg_state[i_b].beta):
+                self.batch_pcg_breakdown[i_b] = True
+                self.batch_pcg_active[i_b] = False
+            else:
+                self.batch_pcg_active[i_b] = self.pcg_state[i_b].rTr > self.pcg_state[i_b].termination_threshold
 
         # update p
         for i_b, i_v in qd.ndrange(self._B, self.n_vertices):
@@ -955,8 +1253,102 @@ class FEMSolver(Solver):
         for i in range(self._n_linesearch_iterations):
             self.one_linesearch_iter(f)
 
+    @qd.func
+    def _development_implicit_fem_positive_j_at_alpha(self, f: qd.i32, i_b: qd.i32, i_e: qd.i32, alpha):
+        i_v0, i_v1, i_v2, i_v3 = self.elements_i[i_e].el2v
+        pos_v0 = self.elements_v[f + 1, i_v0, i_b].pos + alpha * self.pcg_state_v[i_b, i_v0].x
+        pos_v1 = self.elements_v[f + 1, i_v1, i_b].pos + alpha * self.pcg_state_v[i_b, i_v1].x
+        pos_v2 = self.elements_v[f + 1, i_v2, i_b].pos + alpha * self.pcg_state_v[i_b, i_v2].x
+        pos_v3 = self.elements_v[f + 1, i_v3, i_b].pos + alpha * self.pcg_state_v[i_b, i_v3].x
+        F = qd.Matrix.cols([pos_v0 - pos_v3, pos_v1 - pos_v3, pos_v2 - pos_v3]) @ self.elements_i[i_e].B
+        return F.determinant()
+
+    @qd.kernel
+    def _init_development_implicit_fem_positive_j_reduction(self):
+        for i_b in range(self._B):
+            self._development_implicit_fem_positive_j_base_min_j[i_b] = qd.math.inf
+            self._development_implicit_fem_positive_j_trial_min_j[i_b] = qd.math.inf
+            self._development_implicit_fem_positive_j_accepted_alpha[i_b] = 0.0
+            self._development_implicit_fem_positive_j_witness_tet_id[i_b] = -1
+            for i_schedule in qd.static(range(DEVELOPMENT_IMPLICIT_FEM_POSITIVE_J_SCHEDULE_LENGTH)):
+                self._development_implicit_fem_positive_j_schedule_min_j[i_schedule, i_b] = qd.math.inf
+
+    @qd.kernel
+    def _reduce_development_implicit_fem_positive_j_endpoints(self, f: qd.i32):
+        for i_b, i_e in qd.ndrange(self._B, self.n_elements):
+            if not self.elements_el_ng[f + 1, i_e, i_b].active:
+                continue
+            qd.atomic_min(
+                self._development_implicit_fem_positive_j_base_min_j[i_b],
+                self._development_implicit_fem_positive_j_at_alpha(f, i_b, i_e, 0.0),
+            )
+            qd.atomic_min(
+                self._development_implicit_fem_positive_j_trial_min_j[i_b],
+                self._development_implicit_fem_positive_j_at_alpha(f, i_b, i_e, 1.0),
+            )
+            for i_schedule in qd.static(range(DEVELOPMENT_IMPLICIT_FEM_POSITIVE_J_SCHEDULE_LENGTH)):
+                alpha = qd.static(1.0 / (2**i_schedule))
+                qd.atomic_min(
+                    self._development_implicit_fem_positive_j_schedule_min_j[i_schedule, i_b],
+                    self._development_implicit_fem_positive_j_at_alpha(f, i_b, i_e, alpha),
+                )
+
+    @qd.kernel
+    def _select_development_implicit_fem_positive_j_alpha_and_witness(self, f: qd.i32):
+        for i_b in range(self._B):
+            base_min = self._development_implicit_fem_positive_j_base_min_j[i_b]
+            if base_min == qd.math.inf:
+                self._development_implicit_fem_positive_j_base_min_j[i_b] = 1.0
+                self._development_implicit_fem_positive_j_trial_min_j[i_b] = 1.0
+                self._development_implicit_fem_positive_j_accepted_alpha[i_b] = 1.0
+                self._development_implicit_fem_positive_j_witness_tet_id[i_b] = -1
+                continue
+
+            base_infeasible = base_min < DEVELOPMENT_IMPLICIT_FEM_POSITIVE_J_FLOOR
+            alpha = 0.0
+            if not base_infeasible:
+                for i_schedule in qd.static(range(DEVELOPMENT_IMPLICIT_FEM_POSITIVE_J_SCHEDULE_LENGTH)):
+                    scheduled_alpha = qd.static(1.0 / (2**i_schedule))
+                    if (
+                        alpha == 0.0
+                        and self._development_implicit_fem_positive_j_schedule_min_j[i_schedule, i_b]
+                        >= DEVELOPMENT_IMPLICIT_FEM_POSITIVE_J_FLOOR
+                    ):
+                        alpha = scheduled_alpha
+
+            witness_alpha = 0.0 if base_infeasible else 1.0
+            witness_j = qd.math.inf
+            witness_tet = -1
+            for i_e in range(self.n_elements):
+                if not self.elements_el_ng[f + 1, i_e, i_b].active:
+                    continue
+                candidate_j = self._development_implicit_fem_positive_j_at_alpha(f, i_b, i_e, witness_alpha)
+                if candidate_j < witness_j:
+                    witness_j = candidate_j
+                    witness_tet = i_e
+            self._development_implicit_fem_positive_j_accepted_alpha[i_b] = alpha
+            self._development_implicit_fem_positive_j_witness_tet_id[i_b] = witness_tet
+
+    @qd.kernel
+    def _commit_development_implicit_fem_positive_j_position(self, f: qd.i32):
+        for i_b, i_v in qd.ndrange(self._B, self.n_vertices):
+            alpha = self._development_implicit_fem_positive_j_accepted_alpha[i_b]
+            self.elements_v[f + 1, i_v, i_b].pos = (
+                self.elements_v[f + 1, i_v, i_b].pos + alpha * self.pcg_state_v[i_b, i_v].x
+            )
+
+    def _apply_development_implicit_fem_positive_j_feasible_step(self, f: qd.i32):
+        """Commit the largest fixed endpoint-feasible PCG position update per environment."""
+        self._init_development_implicit_fem_positive_j_reduction()
+        self._reduce_development_implicit_fem_positive_j_endpoints(f)
+        self._select_development_implicit_fem_positive_j_alpha_and_witness(f)
+        self._commit_development_implicit_fem_positive_j_position(f)
+
     def batch_solve(self, f: qd.i32):
         self.batch_active.fill(True)
+        self.batch_pcg_budget_exhausted.fill(False)
+        self.batch_pcg_breakdown.fill(False)
+        self.batch_linesearch_budget_exhausted.fill(False)
 
         for i in range(self._n_newton_iterations):
             # compute element energy and gradient
@@ -972,9 +1364,29 @@ class FEMSolver(Solver):
 
             # solve for the vertex positions
             self.pcg_solve()
+            self._accumulate_pcg_budget_exhaustion()
 
             # line search
-            self.linesearch(f)
+            if self._enable_development_implicit_fem_positive_j_feasible_step:
+                if self._enable_development_implicit_fem_positive_j_alpha_one_only:
+                    # Alpha=1-only direct replay: commit the unmodified full
+                    # PCG update and let setup_pos_vel derive velocity from it.
+                    self.skip_linesearch(f)
+                else:
+                    self._apply_development_implicit_fem_positive_j_feasible_step(f)
+            else:
+                self.linesearch(f)
+            self._accumulate_linesearch_budget_exhaustion()
+
+    @qd.kernel
+    def _accumulate_pcg_budget_exhaustion(self):
+        for i_b in range(self._B):
+            self.batch_pcg_budget_exhausted[i_b] |= self.batch_pcg_active[i_b]
+
+    @qd.kernel
+    def _accumulate_linesearch_budget_exhaustion(self):
+        for i_b in range(self._B):
+            self.batch_linesearch_budget_exhausted[i_b] |= self.batch_linesearch_active[i_b]
 
     @qd.kernel
     def setup_pos_vel(self, f: qd.i32):
@@ -983,6 +1395,27 @@ class FEMSolver(Solver):
             self.elements_v[f + 1, i_v, i_b].vel = (
                 self.elements_v[f + 1, i_v, i_b].pos - self.elements_v[f, i_v, i_b].pos
             ) / self.substep_dt
+
+    def _development_implicit_fem_positive_j_feasible_step_health(self):
+        if (
+            not self._enable_development_implicit_fem_positive_j_feasible_step
+            or self._enable_development_implicit_fem_positive_j_alpha_one_only
+        ):
+            return None
+        return ImplicitFEMPositiveJFeasibleStep(
+            pre_update_base_min_j=tuple(
+                np.asarray(self._development_implicit_fem_positive_j_base_min_j.to_numpy(), dtype=np.float64).tolist()
+            ),
+            unfiltered_fem_trial_min_j=tuple(
+                np.asarray(self._development_implicit_fem_positive_j_trial_min_j.to_numpy(), dtype=np.float64).tolist()
+            ),
+            accepted_fem_alpha=tuple(
+                np.asarray(self._development_implicit_fem_positive_j_accepted_alpha.to_numpy(), dtype=np.float64).tolist()
+            ),
+            witness_tet_id=tuple(
+                np.asarray(self._development_implicit_fem_positive_j_witness_tet_id.to_numpy(), dtype=np.int64).tolist()
+            ),
+        )
 
     # ------------------------------------------------------------------------------------
     # ------------------------------------ stepping --------------------------------------
@@ -1122,7 +1555,8 @@ class FEMSolver(Solver):
 
     def set_state(self, f, state, envs_idx=None):
         if self.is_active:
-            self._kernel_set_state(f, state.pos, state.vel, state.active)
+            envs_idx = self._scene._sanitize_envs_idx(envs_idx)
+            self._kernel_set_state_envs(f, state.pos, state.vel, state.active, envs_idx)
 
     def get_state(self, f):
         if self.is_active:
@@ -1131,6 +1565,102 @@ class FEMSolver(Solver):
         else:
             state = None
         return state
+
+    def get_completed_control_step_vertices(self):
+        """Return all local completed FEM frames ``1..substeps_local`` at once.
+
+        M3 uses this only where one control step is retained locally
+        (``substeps_local == substeps``).  Frame zero may already have been
+        refreshed from the final frame by ``save_ckpt``; the completed frames
+        themselves remain intact.
+        """
+        if not self.is_active:
+            return None
+        frames = torch.empty(
+            (self._B, self.sim.substeps_local, self.n_vertices, 3),
+            dtype=gs.tc_float,
+            device=gs.device,
+        )
+        self._kernel_get_completed_control_step_vertices(frames)
+        return frames
+
+    def get_completed_substep_safety_extrema(
+        self, *, completed_frame: int, global_substep_index: int | None = None
+    ) -> FEMSubstepSafetyExtrema | None:
+        """Return one conservative extrema record for a completed implicit-FEM frame.
+
+        This is intentionally a small solver-health reduction: it exports no
+        vertex or element history. It is a B=1 qualification-only CPU
+        readback and reduction, not a K-way runtime telemetry API. It supports
+        active volumetric ``linear_corotated`` entities, whose energy
+        definition matches the implicit FEM solver. Other configurations return
+        ``None`` so a caller requiring this safety evidence can fail closed.
+        """
+        if not self.is_active or not self._use_implicit_solver or self._B != 1:
+            return None
+        if type(completed_frame) is not int or not (1 <= completed_frame <= self.sim.substeps_local):
+            raise ValueError("completed FEM safety frame lies outside the local frame range")
+        state = self.get_state(completed_frame)
+        if state is None:
+            return None
+        positions = np.asarray(tensor_to_array(state.pos), dtype=np.float64)
+        active = np.asarray(tensor_to_array(state.active), dtype=np.bool_)
+        if positions.shape != (self._B, self.n_vertices, 3) or active.shape != (self._B, self.n_elements):
+            raise ValueError("implicit FEM completed-state shape does not match solver topology")
+
+        extrema: list[FEMSubstepSafetyExtrema] = []
+        for entity_index, entity in enumerate(self._entities):
+            material = entity.material
+            if getattr(material, "model", None) != "linear_corotated":
+                return None
+            tetrahedra = np.asarray(entity.elems, dtype=np.int64)
+            if tetrahedra.ndim != 2 or tetrahedra.shape[1] != 4:
+                return None
+            heterogeneous = entity._heterogeneous_material_np
+            if heterogeneous is None:
+                lame_mu = np.full(entity.n_elements, material.mu, dtype=np.float64)
+                lame_lambda = np.full(entity.n_elements, material.lam, dtype=np.float64)
+            else:
+                lame_mu = np.asarray(heterogeneous.mu, dtype=np.float64)
+                lame_lambda = np.asarray(heterogeneous.lam, dtype=np.float64)
+            entity_extrema = _linear_corotated_safety_extrema(
+                rest_positions=np.asarray(tensor_to_array(entity.init_positions), dtype=np.float64),
+                tetrahedra=tetrahedra,
+                current_positions=positions[:, entity.v_start : entity.v_start + entity.n_vertices],
+                active=active[:, entity.el_start : entity.el_start + entity.n_elements],
+                lame_mu=lame_mu,
+                lame_lambda=lame_lambda,
+                global_substep_index=global_substep_index,
+                env_index=0,
+                fem_entity_index=entity.idx,
+                fem_entity_name=getattr(entity, "name", None),
+                vertex_global_offset=entity.v_start,
+                tet_global_offset=entity.el_start,
+                floor_height_m=float(self._floor_height),
+            )
+            if entity_extrema is None:
+                return None
+            extrema.append(entity_extrema)
+        if not extrema:
+            return None
+        max_strain = max(item.max_principal_stretch_strain for item in extrema)
+        strain_witnesses = tuple(
+            item.principal_strain_witness
+            for item in extrema
+            if item.principal_strain_witness is not None and item.principal_strain_witness.principal_stretch_strain == max_strain
+        )
+        witness = min(
+            strain_witnesses,
+            key=lambda item: (item.fem_entity_index, item.tet_local_index),
+        ) if strain_witnesses else None
+        return FEMSubstepSafetyExtrema(
+            min_j=min(item.min_j for item in extrema),
+            max_principal_stretch_strain=max_strain,
+            max_tet_elastic_energy_j=max(item.max_tet_elastic_energy_j for item in extrema),
+            total_elastic_energy_j=sum(item.total_elastic_energy_j for item in extrema),
+            no_inversion=all(item.no_inversion for item in extrema),
+            principal_strain_witness=witness,
+        )
 
     def get_state_render(self, f):
         self.get_state_render_kernel(f)
@@ -1157,13 +1687,10 @@ class FEMSolver(Solver):
         self,
         f: qd.i32,
         mat_idx: qd.i32,
-        mat_mu: qd.f32,
-        mat_lam: qd.f32,
-        mat_rho: qd.f32,
-        mat_friction_mu: qd.f32,
         mat_mu_per_el: qd.types.ndarray(),
         mat_lam_per_el: qd.types.ndarray(),
         mat_rho_per_el: qd.types.ndarray(),
+        mat_friction_mu_per_el: qd.types.ndarray(),
         n_surfaces: qd.i32,
         v_start: qd.i32,
         el_start: qd.i32,
@@ -1191,11 +1718,10 @@ class FEMSolver(Solver):
             i_global = i_v + v_start
             self.elements_v_info[i_global].mass = 0.0
             self.elements_v_info[i_global].mass_over_dt2 = 0.0
-            self.elements_v_info[i_global].friction_mu = mat_friction_mu
+            self.elements_v_info[i_global].friction_mu = mat_friction_mu_per_el[0]
 
         dt2_inv = 1.0 / (self.substep_dt**2)
         n_elems_local = elems.shape[0]
-        has_heterogeneous_material = mat_mu_per_el.shape[0] > 0
         for i_e in range(n_elems_local):
             i_global = i_e + el_start
 
@@ -1216,20 +1742,13 @@ class FEMSolver(Solver):
 
             for j in qd.static(range(4)):
                 self.elements_i[i_global].el2v[j] = elems[i_e, j] + v_start
-            el_mu = mat_mu
-            el_lam = mat_lam
-            el_rho = mat_rho
-            if has_heterogeneous_material:
-                el_mu = mat_mu_per_el[i_e]
-                el_lam = mat_lam_per_el[i_e]
-                el_rho = mat_rho_per_el[i_e]
             self.elements_i[i_global].mat_idx = mat_idx
-            self.elements_i[i_global].mu = el_mu
-            self.elements_i[i_global].lam = el_lam
-            self.elements_i[i_global].friction_mu = mat_friction_mu
-            self.elements_i[i_global].mass_scaled = el_rho * V_scaled
+            self.elements_i[i_global].mu = mat_mu_per_el[i_e]
+            self.elements_i[i_global].lam = mat_lam_per_el[i_e]
+            self.elements_i[i_global].friction_mu = mat_friction_mu_per_el[i_e]
+            self.elements_i[i_global].mass_scaled = mat_rho_per_el[i_e] * V_scaled
             for j in qd.static(range(4)):
-                mass = 0.25 * el_rho * V
+                mass = 0.25 * mat_rho_per_el[i_e] * V
                 self.elements_v_info[self.elements_i[i_global].el2v[j]].mass += mass
                 self.elements_v_info[self.elements_i[i_global].el2v[j]].mass_over_dt2 += mass * dt2_inv
             self.elements_i[i_global].muscle_group = 0
@@ -1438,6 +1957,15 @@ class FEMSolver(Solver):
             active[i_b, i_e] = self.elements_el_ng[f, i_e, i_b].active
 
     @qd.kernel
+    def _kernel_get_completed_control_step_vertices(
+        self,
+        vertices: qd.types.ndarray(),  # [B,S,V,3]
+    ):
+        for i_b, f, i_v in qd.ndrange(self._B, self.sim.substeps_local, self.n_vertices):
+            for j in qd.static(range(3)):
+                vertices[i_b, f, i_v, j] = self.elements_v[f + 1, i_v, i_b].pos[j]
+
+    @qd.kernel
     def get_state_render_kernel(self, f: qd.i32):
         for i_v, i_b in qd.ndrange(self.n_vertices, self._B):
             for j in qd.static(range(3)):
@@ -1463,6 +1991,26 @@ class FEMSolver(Solver):
                 self.elements_v[f, i_v, i_b].vel[j] = vel[i_b, i_v, j]
 
         for i_e, i_b in qd.ndrange(self.n_elements, self._B):
+            self.elements_el_ng[f, i_e, i_b].active = active[i_b, i_e]
+
+    @qd.kernel
+    def _kernel_set_state_envs(
+        self,
+        f: qd.i32,
+        pos: qd.types.ndarray(),  # shape [B, n_vertices, 3]
+        vel: qd.types.ndarray(),  # shape [B, n_vertices, 3]
+        active: qd.types.ndarray(),  # shape [B, n_elements]
+        envs_idx: qd.types.ndarray(),  # shape [n_selected]
+    ):
+        """Restore only the selected batch rows from a full public FEM state."""
+        for i_v, i_b_ in qd.ndrange(self.n_vertices, envs_idx.shape[0]):
+            i_b = envs_idx[i_b_]
+            for j in qd.static(range(3)):
+                self.elements_v[f, i_v, i_b].pos[j] = pos[i_b, i_v, j]
+                self.elements_v[f, i_v, i_b].vel[j] = vel[i_b, i_v, j]
+
+        for i_e, i_b_ in qd.ndrange(self.n_elements, envs_idx.shape[0]):
+            i_b = envs_idx[i_b_]
             self.elements_el_ng[f, i_e, i_b].active = active[i_b, i_e]
 
     @qd.kernel

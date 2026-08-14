@@ -1,4 +1,5 @@
 import collections.abc
+import hashlib
 import os
 import pickle
 import sys
@@ -16,8 +17,9 @@ import genesis as gs
 import genesis.utils.geom as gu
 import genesis.utils.mesh as mu
 from genesis.engine.force_fields import ForceField
+from genesis.engine.couplers.sap_coupler import SAPCoupler
 from genesis.engine.materials.base import EntityT, Material
-from genesis.engine.states.solvers import SimState
+from genesis.engine.states.solvers import CompletedPhysicalSubstepGeometryTrace, SimState, WholeBatchSnapshot
 from genesis.options import (
     KinematicOptions,
     BaseCouplerOptions,
@@ -202,6 +204,8 @@ class Scene(RBC):
 
         self._uid = gs.UID()
         self._t = 0
+        self._last_completed_solver_health = None
+        self._last_completed_physical_substep_geometry_trace = None
         self._is_built = False
         self._pre_step_callbacks: list = []
 
@@ -994,6 +998,8 @@ class Scene(RBC):
             self._init_state = self._get_state()
 
         self._t = 0
+        self._last_completed_solver_health = None
+        self._last_completed_physical_substep_geometry_trace = None
         self._forward_ready = True
         self._reset_grad()
 
@@ -1024,6 +1030,142 @@ class Scene(RBC):
         """
         return self._get_state()
 
+    @gs.assert_built
+    def _whole_batch_snapshot_identity_sha256(self) -> str:
+        """Return the lightweight scene/layout identity for opaque snapshots."""
+        return hashlib.sha256(
+            (
+                "genesis-whole-batch-snapshot-v1|"
+                f"{self._uid}|{self._sim._B}|{len(self._sim._solvers)}|"
+                "reinitialize-from-restored-state-per-physical-substep-v1"
+            ).encode("utf-8")
+        ).hexdigest()
+
+    @gs.assert_built
+    def capture_whole_batch_snapshot(self) -> WholeBatchSnapshot:
+        """Capture an opaque state token at a completed control-step boundary.
+
+        The token owns every native solver state and is deliberately
+        whole-batch only.  SAP contact/scratch fields are reinitialized from
+        the restored rigid/FEM state before every physical substep, so no
+        additional warm-start state is carried across this boundary.
+        """
+        if self.requires_grad:
+            gs.raise_exception("whole-batch snapshot is unavailable for differentiable scenes")
+        if self._sim.cur_substep_global % self._sim._substeps != 0:
+            gs.raise_exception("whole-batch snapshot requires a completed control-step boundary")
+        # Controller setters may have updated native fields after a prior
+        # public state query at this boundary.  Snapshotting must therefore
+        # discard only query caches before asking every solver for its current
+        # payload; non-differentiable capture has no adjoint state to retain.
+        self._sim.reset_grad()
+        state = self._get_state()
+        return WholeBatchSnapshot(
+            _native_state=state,
+            scene_step_index=int(self._t),
+            global_substep_index=int(self._sim.cur_substep_global),
+            simulation_time_s=float(self._sim.cur_t),
+            batch_size=int(self._sim._B),
+            sap_continuation_semantics="reinitialize-from-restored-state-per-physical-substep-v1",
+            snapshot_identity_sha256=self._whole_batch_snapshot_identity_sha256(),
+        )
+
+    @gs.assert_built
+    def restore_whole_batch_snapshot(self, snapshot: WholeBatchSnapshot) -> None:
+        """Restore a token created by :meth:`capture_whole_batch_snapshot`.
+
+        Partial restoration is intentionally unavailable: M3 candidate replay
+        restores one common boundary across the persistent batch, then applies
+        divergent commands through public entity APIs.
+        """
+        if not isinstance(snapshot, WholeBatchSnapshot):
+            gs.raise_exception("whole-batch restore requires a WholeBatchSnapshot")
+        if snapshot.batch_size != self._sim._B:
+            gs.raise_exception("whole-batch snapshot batch size differs from the built scene")
+        if snapshot.global_substep_index < 0 or snapshot.scene_step_index < 0:
+            gs.raise_exception("whole-batch snapshot indices are invalid")
+        if snapshot.global_substep_index != snapshot.scene_step_index * self._sim._substeps:
+            gs.raise_exception("whole-batch snapshot does not lie on a control-step boundary")
+        if snapshot.simulation_time_s != snapshot.global_substep_index * self._sim._substep_dt:
+            gs.raise_exception("whole-batch snapshot simulation time is inconsistent")
+        if snapshot.sap_continuation_semantics != "reinitialize-from-restored-state-per-physical-substep-v1":
+            gs.raise_exception("whole-batch snapshot SAP continuation semantics are unsupported")
+        if snapshot.snapshot_identity_sha256 != self._whole_batch_snapshot_identity_sha256():
+            gs.raise_exception("whole-batch snapshot belongs to another scene or batch layout")
+        self._sim.reset(snapshot._native_state, envs_idx=None)
+        self._sim._cur_substep_global = snapshot.global_substep_index
+        self._t = snapshot.scene_step_index
+        self._last_completed_solver_health = None
+        self._last_completed_physical_substep_geometry_trace = None
+        self._forward_ready = True
+
+    @gs.assert_built
+    def get_rigid_fem_contacts(self):
+        """Return an immutable copy of the last completed SAP rigid--FEM contact batch.
+
+        The query remains usable when individual rigid entities disable coupler
+        collision; such entities simply contribute no contact rows.
+        """
+        if not hasattr(self._sim._coupler, "get_rigid_fem_contacts"):
+            raise gs.RigidFEMContactUnavailableError("scene is not using the SAP rigid--FEM contact subsystem")
+        return self._sim._coupler.get_rigid_fem_contacts()
+
+    @gs.assert_built
+    def get_development_direct_replay_finger_contact_flags(self):
+        """Return only the [left, right] G2 contact flags per environment.
+
+        This deliberately narrow development direct-replay query avoids the
+        public rigid--FEM contact-row export used by full diagnostics.
+        """
+        if not hasattr(self._sim._coupler, "get_development_direct_replay_finger_contact_flags"):
+            raise gs.RigidFEMContactUnavailableError("scene has no direct-replay G2 contact-flag subsystem")
+        return self._sim._coupler.get_development_direct_replay_finger_contact_flags()
+
+    @gs.assert_built
+    def get_rigid_fem_contact_ownership(self):
+        """Return immutable build-time SAP/floor ownership facts.
+
+        Unlike :meth:`get_rigid_fem_contacts`, this query is valid before the
+        first physical step and does not inspect contact-state buffers.
+        """
+        if not hasattr(self._sim._coupler, "get_rigid_fem_contact_ownership"):
+            raise gs.RigidFEMContactUnavailableError("scene has no SAP rigid--FEM ownership subsystem")
+        return self._sim._coupler.get_rigid_fem_contact_ownership()
+
+    @gs.assert_built
+    def get_last_completed_solver_health(self):
+        """Return the immutable all-substep SAP health record for the current Scene step.
+
+        A record is published only after the whole ``Scene.step`` returned from
+        the simulator successfully.  It therefore cannot report a partially
+        executed step after a solver exception.
+        """
+        if self._last_completed_solver_health is None:
+            raise gs.SolverHealthNotReadyError("no successful Scene.step has published solver health since reset")
+        if self._last_completed_solver_health.scene_step_index != self._t:
+            raise gs.SolverHealthNotReadyError("solver-health record is stale for the current Scene step")
+        return self._last_completed_solver_health
+
+    @gs.assert_built
+    def get_last_completed_physical_substep_geometry_trace(self) -> CompletedPhysicalSubstepGeometryTrace:
+        """Return the one complete, current control-step geometry trace.
+
+        This boundary is intentionally narrow: it is available only when the
+        local FEM buffer retained every physical frame of this control step.
+        Reset, whole-batch restore, and a failed step invalidate it.
+        """
+        if self._last_completed_physical_substep_geometry_trace is None:
+            gs.raise_exception("no successful Scene.step has published a complete physical-substep geometry trace")
+        trace = self._last_completed_physical_substep_geometry_trace
+        if trace.scene_step_index != self._t:
+            gs.raise_exception("physical-substep geometry trace is stale for the current Scene step")
+        return trace
+
+    @gs.assert_built
+    def enable_completed_physical_substep_geometry_trace(self) -> None:
+        """Opt in to the narrow last-control-step M3 geometry trace."""
+        self._sim.enable_completed_physical_substep_geometry_trace()
+
     def register_pre_step_callback(self, callback):
         """Register a callback invoked at the start of each ``step()``, on the stepping thread. A callback
         may run deferred work there and veto the advance of that step by returning ``True``. The scene calls
@@ -1044,8 +1186,21 @@ class Scene(RBC):
         if advance:
             if not self._forward_ready:
                 gs.raise_exception("Forward simulation not allowed after backward pass. Please reset scene state.")
+            # Invalidate before the simulator can throw.  Only a fully returned
+            # simulator control step publishes a new record below.
+            self._last_completed_solver_health = None
+            self._last_completed_physical_substep_geometry_trace = None
             self._sim.step()
             self._t += 1
+            if (
+                isinstance(self._sim._coupler, SAPCoupler)
+                and self._sim._completed_solver_health_enabled
+            ):
+                self._last_completed_solver_health = self._sim.get_last_completed_solver_health(scene_step_index=self._t)
+            trace = self._sim.get_last_completed_physical_substep_geometry_trace(
+                scene_step_index=self._t
+            )
+            self._last_completed_physical_substep_geometry_trace = trace
 
         if update_visualizer:
             # Force the refresh when the sim did not advance (e.g. paused) so edits made off the step loop -

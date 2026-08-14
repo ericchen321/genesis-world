@@ -34,7 +34,8 @@ from .solvers import (
 )
 from .couplers import IPCCoupler, LegacyCoupler, SAPCoupler
 from .states.cache import QueriedStates
-from .states.solvers import SimState
+from .states.solvers import CompletedPhysicalSubstepGeometryTrace, SimState
+from .solver_health import SAPControlStepSolverHealth, SolverHealthNotReadyError, SolverHealthUnavailableError
 from .sensors import SensorManager
 
 if TYPE_CHECKING:
@@ -111,6 +112,9 @@ class Simulator(RBC):
         self._steps_local: int | None = options._steps_local
 
         self._cur_substep_global = 0
+        self._last_completed_sap_substeps = None
+        self._last_completed_physical_substep_geometry_trace = None
+        self._completed_physical_substep_geometry_trace_enabled = False
         self._gravity = np.array(options.gravity, dtype=gs.np_float)
 
         # solvers
@@ -149,6 +153,10 @@ class Simulator(RBC):
             gs.raise_exception(
                 f"Coupler options {self.coupler_options} not supported. Please use SAPCouplerOptions, LegacyCouplerOptions, or IPCCouplerOptions."
             )
+        self._completed_solver_health_enabled = bool(
+            isinstance(self.coupler_options, SAPCouplerOptions)
+            and self.coupler_options.enable_completed_solver_health
+        )
 
         # states
         self._queried_states = QueriedStates()
@@ -230,6 +238,8 @@ class Simulator(RBC):
         # TODO: keeping as is for now
         self.reset_grad()
         self._cur_substep_global = 0
+        self._last_completed_sap_substeps = None
+        self._last_completed_physical_substep_geometry_trace = None
 
         # reset sensors state
         self._sensor_manager.reset(envs_idx=envs_idx)
@@ -270,6 +280,10 @@ class Simulator(RBC):
     # ------------------------------------------------------------------------------------
 
     def step(self, in_backward=False):
+        # A failed attempt must not leave an old completed control-step record
+        # eligible for publication by its unchanged scene-step index.
+        self._last_completed_sap_substeps = None
+        self._last_completed_physical_substep_geometry_trace = None
         # Check errno at the very beginning of the step.
         # This will trigger GPU sync, but it is not a big deal at the point, since we are going to enqueue very large
         # kernel right away. Moreover, if computations are still not done at this point, then the queue will just
@@ -277,6 +291,10 @@ class Simulator(RBC):
         if self.rigid_solver.is_active and self._cur_substep_global % RATE_CHECK_ERRNO == 0:
             self.rigid_solver.check_errno()
 
+        completed_sap_substeps = []
+        trace_first_global_substep = self._cur_substep_global
+        if not in_backward and self._completed_physical_substep_geometry_trace_enabled:
+            self.rigid_solver.begin_completed_control_step_link_trace()
         if self._rigid_only and not self._requires_grad:  # "Only Advance!" --Thomas Wade :P
             for _ in range(self._substeps):
                 self.rigid_solver.substep(self.cur_substep_local)
@@ -285,6 +303,26 @@ class Simulator(RBC):
             self.process_input(in_backward=in_backward)
             for _ in range(self._substeps):
                 self.substep(self.cur_substep_local)
+                if not in_backward and self._completed_physical_substep_geometry_trace_enabled:
+                    self.rigid_solver.record_completed_control_step_link_pose(
+                        completed_local_substep=self.cur_substep_local
+                    )
+                if (
+                    isinstance(self._coupler, SAPCoupler)
+                    and self._completed_solver_health_enabled
+                ):
+                    # The FEM position at frame f + 1 includes the complete
+                    # physical substep, including post-coupling integration.
+                    fem_safety_extrema = None
+                    if self.fem_solver._enable_qualification_safety_extrema:
+                        fem_safety_extrema = self.fem_solver.get_completed_substep_safety_extrema(
+                            completed_frame=self.cur_substep_local + 1,
+                            global_substep_index=self._cur_substep_global,
+                        )
+                    self._coupler.finalize_completed_solver_health(
+                        fem_safety_extrema=fem_safety_extrema
+                    )
+                    completed_sap_substeps.append(self._coupler.get_last_completed_solver_health())
 
                 self._cur_substep_global += 1
                 if self.cur_substep_local == 0 and not in_backward:
@@ -294,6 +332,64 @@ class Simulator(RBC):
             self.rigid_solver.clear_external_force()
 
         self._sensor_manager.step()
+        if (
+            isinstance(self._coupler, SAPCoupler)
+            and self._completed_solver_health_enabled
+        ):
+            if len(completed_sap_substeps) != self._substeps:
+                raise SolverHealthUnavailableError("SAP control step did not produce one health record per physical substep")
+            self._last_completed_sap_substeps = tuple(completed_sap_substeps)
+        if not in_backward and self._completed_physical_substep_geometry_trace_enabled:
+            fem_vertices = self.fem_solver.get_completed_control_step_vertices()
+            rigid_pos, rigid_quat = self.rigid_solver.get_completed_control_step_link_poses()
+            if fem_vertices is not None and rigid_pos is not None and rigid_quat is not None:
+                self._last_completed_physical_substep_geometry_trace = CompletedPhysicalSubstepGeometryTrace(
+                    scene_step_index=-1,
+                    first_global_substep_index=trace_first_global_substep,
+                    batch_size=self._B,
+                    substeps=self._substeps,
+                    fem_vertices=fem_vertices,
+                    rigid_link_pos=rigid_pos,
+                    rigid_link_quat=rigid_quat,
+                )
+
+    def get_last_completed_physical_substep_geometry_trace(self, *, scene_step_index: int):
+        trace = self._last_completed_physical_substep_geometry_trace
+        if trace is None:
+            return None
+        if type(scene_step_index) is not int or scene_step_index < 0:
+            raise ValueError("geometry trace scene-step index is invalid")
+        return CompletedPhysicalSubstepGeometryTrace(
+            scene_step_index=scene_step_index,
+            first_global_substep_index=trace.first_global_substep_index,
+            batch_size=trace.batch_size,
+            substeps=trace.substeps,
+            fem_vertices=trace.fem_vertices,
+            rigid_link_pos=trace.rigid_link_pos,
+            rigid_link_quat=trace.rigid_link_quat,
+        )
+
+    def enable_completed_physical_substep_geometry_trace(self) -> None:
+        """Opt in to one local completed-frame trace per successful step."""
+        if self._substeps_local != self._substeps:
+            raise ValueError("completed physical-substep geometry trace requires substeps_local == substeps")
+        if not self.fem_solver.is_active or not self.rigid_solver.is_active:
+            raise ValueError("completed physical-substep geometry trace requires active FEM and rigid solvers")
+        self._completed_physical_substep_geometry_trace_enabled = True
+
+    def get_last_completed_solver_health(self, *, scene_step_index: int):
+        """Aggregate every completed SAP physical substep for one successful Scene.step."""
+        if not isinstance(self._coupler, SAPCoupler):
+            raise SolverHealthUnavailableError("scene is not using the SAP solver-health subsystem")
+        if self._last_completed_sap_substeps is None:
+            raise SolverHealthNotReadyError("no complete SAP control step has completed since scene build or reset")
+        substeps = self._last_completed_sap_substeps
+        return SAPControlStepSolverHealth(
+            scene_step_index=scene_step_index,
+            first_global_substep_index=substeps[0].global_substep_index,
+            last_global_substep_index=substeps[-1].global_substep_index,
+            substeps=substeps,
+        )
 
     def _step_grad(self):
         for _ in range(self._substeps - 1, -1, -1):

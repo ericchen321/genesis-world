@@ -82,6 +82,7 @@ NEUTRAL_COLLISION_RES_REL = 0.05
 class Collider:
     def __init__(self, rigid_solver: "RigidSolver"):
         self._solver = rigid_solver
+        self._ordinary_collision_enabled = rigid_solver._enable_collision
 
         self._mc_perturbation = 1e-3 if self._solver._enable_mujoco_compatibility else 3e-3
         self._mc_tolerance = 1e-3 if self._solver._enable_mujoco_compatibility else 1.5e-2
@@ -101,26 +102,36 @@ class Collider:
 
         self._init_static_config()
         self._use_split_narrowphase = (
-            self._collider_static_config.has_non_box_plane_convex_convex
+            self._ordinary_collision_enabled
+            and self._collider_static_config.has_non_box_plane_convex_convex
             and gs.backend != gs.cpu
             and not self._solver._requires_grad
         )
         self._init_collision_fields()
 
-        self._sdf = SDF(rigid_solver)
-        self._mpr = mpr.MPR(rigid_solver)
-        self._gjk = gjk.GJK(rigid_solver)
-        self._support_field = support_field.SupportField(rigid_solver)
+        # Rigid integration still receives the empty ColliderState while ordinary
+        # collision is disabled, but no ordinary narrowphase resource is needed.
+        # In particular, do not lazily materialize per-geom SDFs merely because a
+        # scene uses SAP rigid--FEM contact through its independent triangle path.
+        self._sdf = None
+        self._mpr = None
+        self._gjk = None
+        self._support_field = None
+        if self._ordinary_collision_enabled:
+            self._sdf = SDF(rigid_solver)
+            self._mpr = mpr.MPR(rigid_solver)
+            self._gjk = gjk.GJK(rigid_solver)
+            self._support_field = support_field.SupportField(rigid_solver)
 
-        if self._collider_static_config.has_nonconvex_nonterrain:
-            self._sdf.activate()
-        if self._collider_static_config.has_non_box_plane_convex_convex:
-            self._gjk.activate()
-        if self._collider_static_config.has_terrain or self._collider_static_config.has_non_box_plane_convex_convex:
-            self._support_field.activate()
+            if self._collider_static_config.has_nonconvex_nonterrain:
+                self._sdf.activate()
+            if self._collider_static_config.has_non_box_plane_convex_convex:
+                self._gjk.activate()
+            if self._collider_static_config.has_terrain or self._collider_static_config.has_non_box_plane_convex_convex:
+                self._support_field.activate()
 
-        if self._use_split_narrowphase:
-            self._init_multicontact_gjk_state()
+            if self._use_split_narrowphase:
+                self._init_multicontact_gjk_state()
 
         if gs.use_zerocopy:
             self._contact_data: dict[str, torch.Tensor] = {}
@@ -693,6 +704,9 @@ class Collider:
 
     def activate_sdf(self) -> None:
         """Enable SDF queries against this collider's geometry. Idempotent."""
+        if not self._ordinary_collision_enabled:
+            gs.raise_exception("Cannot activate an ordinary rigid SDF when `enable_collision=False`.")
+        assert self._sdf is not None
         self._sdf.activate()
 
     def reset(self, envs_idx=None, *, cache_only: bool = True) -> None:
@@ -821,6 +835,8 @@ class Collider:
         )
 
     def detection(self) -> None:
+        if not self._ordinary_collision_enabled:
+            gs.raise_exception("Ordinary rigid collision detection is disabled by `RigidOptions.enable_collision=False`.")
         rigid_solver.kernel_update_geom_aabbs(
             self._solver.geoms_state,
             self._solver.geoms_init_AABB,

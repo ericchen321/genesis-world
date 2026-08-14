@@ -1292,6 +1292,8 @@ class RigidSolver(KinematicSolver):
 
     def detect_collision(self, env_idx=0):
         # TODO: support batching
+        if not self._enable_collision:
+            gs.raise_exception("Ordinary rigid collision detection is disabled by `RigidOptions.enable_collision=False`.")
         self._kernel_detect_collision()
 
         n_collision = qd_to_numpy(self.collider._collider_state.n_contacts)[env_idx]
@@ -1771,6 +1773,10 @@ class RigidSolver(KinematicSolver):
                 qpos=state.qpos,
                 vel=state.dofs_vel,
                 acc=state.dofs_acc,
+                ctrl_pos=state.ctrl_pos,
+                ctrl_vel=state.ctrl_vel,
+                ctrl_force=state.ctrl_force,
+                ctrl_mode=state.ctrl_mode,
                 links_pos=state.links_pos,
                 links_quat=state.links_quat,
                 i_pos_shift=state.i_pos_shift,
@@ -1786,6 +1792,46 @@ class RigidSolver(KinematicSolver):
         else:
             state = None
         return state
+
+    def begin_completed_control_step_link_trace(self):
+        """Allocate the fixed local-frame pose buffer used by one control step."""
+        if not self.is_active:
+            return
+        self._completed_control_step_link_pos = torch.empty(
+            (self.sim.substeps, self._B, self.n_links, 3), dtype=gs.tc_float, device=gs.device
+        )
+        self._completed_control_step_link_quat = torch.empty(
+            (self.sim.substeps, self._B, self.n_links, 4), dtype=gs.tc_float, device=gs.device
+        )
+
+    def record_completed_control_step_link_pose(self, *, completed_local_substep: int):
+        """Record one completed physical frame device-side; no host readback."""
+        if not self.is_active:
+            return
+        if type(completed_local_substep) is not int or not 0 <= completed_local_substep < self.sim.substeps:
+            raise ValueError("completed rigid trace substep lies outside this control step")
+        if not hasattr(self, "_completed_control_step_link_pos"):
+            raise RuntimeError("completed rigid trace was not initialized for this control step")
+        # These are device tensors; this is a device-side slice copy and does
+        # not force a Python/GPU synchronization per physical substep.
+        self._completed_control_step_link_pos[completed_local_substep].copy_(
+            qd_to_torch(self.links_state.pos, transpose=True, copy=True)
+        )
+        self._completed_control_step_link_quat[completed_local_substep].copy_(
+            qd_to_torch(self.links_state.quat, transpose=True, copy=True)
+        )
+
+    def get_completed_control_step_link_poses(self):
+        """Return the current control step's ordered device-side link trace."""
+        if not self.is_active:
+            return None, None
+        if not hasattr(self, "_completed_control_step_link_pos"):
+            raise RuntimeError("no complete rigid control-step trace is available")
+        return (
+            self._completed_control_step_link_pos.permute(1, 0, 2, 3),
+            self._completed_control_step_link_quat.permute(1, 0, 2, 3),
+        )
+
 
     @mutates(StateChange.GEOMETRY, StateChange.DYNAMICS)
     def set_state(self, f, state, envs_idx=None, *, partial: bool = False) -> None:
@@ -1857,8 +1903,12 @@ class RigidSolver(KinematicSolver):
                     torch.where(envs_mask[:, None], state.qpos, qpos_dst, out=qpos_dst)
                     torch.where(envs_mask[:, None], state.dofs_vel, vel_dst, out=vel_dst)
                     torch.where(envs_mask[:, None], state.dofs_acc, acc_dst, out=acc_dst)
-                    ctrl_force_dst.masked_fill_(envs_mask[:, None], 0.0)
-                    ctrl_mode_dst.masked_fill_(envs_mask[:, None], gs.CTRL_MODE.FORCE)
+                    ctrl_pos_dst = qd_to_torch(self.dofs_state.ctrl_pos, transpose=True, copy=False)
+                    ctrl_vel_dst = qd_to_torch(self.dofs_state.ctrl_vel, transpose=True, copy=False)
+                    torch.where(envs_mask[:, None], state.ctrl_pos, ctrl_pos_dst, out=ctrl_pos_dst)
+                    torch.where(envs_mask[:, None], state.ctrl_vel, ctrl_vel_dst, out=ctrl_vel_dst)
+                    torch.where(envs_mask[:, None], state.ctrl_force, ctrl_force_dst, out=ctrl_force_dst)
+                    torch.where(envs_mask[:, None], state.ctrl_mode, ctrl_mode_dst, out=ctrl_mode_dst)
                 torch.where(envs_mask[:, None, None], state.links_pos, pos_dst, out=pos_dst)
                 torch.where(envs_mask[:, None, None], state.links_quat, quat_dst, out=quat_dst)
                 torch.where(envs_mask[:, None, None], state.i_pos_shift, shift_dst, out=shift_dst)
@@ -1887,8 +1937,10 @@ class RigidSolver(KinematicSolver):
                     qpos_dst[envs_idx] = state.qpos[envs_idx]
                     vel_dst[envs_idx] = state.dofs_vel[envs_idx]
                     acc_dst[envs_idx] = state.dofs_acc[envs_idx]
-                    ctrl_force_dst[envs_idx] = 0.0
-                    ctrl_mode_dst[envs_idx] = gs.CTRL_MODE.FORCE
+                    qd_to_torch(self.dofs_state.ctrl_pos, transpose=True, copy=False)[envs_idx] = state.ctrl_pos[envs_idx]
+                    qd_to_torch(self.dofs_state.ctrl_vel, transpose=True, copy=False)[envs_idx] = state.ctrl_vel[envs_idx]
+                    ctrl_force_dst[envs_idx] = state.ctrl_force[envs_idx]
+                    ctrl_mode_dst[envs_idx] = state.ctrl_mode[envs_idx]
                 pos_dst[envs_idx] = state.links_pos[envs_idx]
                 quat_dst[envs_idx] = state.links_quat[envs_idx]
                 shift_dst[envs_idx] = state.i_pos_shift[envs_idx]
@@ -1921,6 +1973,10 @@ class RigidSolver(KinematicSolver):
                 qpos=state.qpos,
                 dofs_vel=state.dofs_vel,
                 dofs_acc=state.dofs_acc,
+                ctrl_pos=state.ctrl_pos,
+                ctrl_vel=state.ctrl_vel,
+                ctrl_force=state.ctrl_force,
+                ctrl_mode=state.ctrl_mode,
                 links_pos=state.links_pos,
                 links_quat=state.links_quat,
                 i_pos_shift=state.i_pos_shift,

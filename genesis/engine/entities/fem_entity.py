@@ -499,6 +499,15 @@ class FEMEntity(Entity):
 
         return state
 
+    def get_development_direct_replay_current_min_relative_j(
+        self, *, env_index: int = 0
+    ) -> float:
+        """Read one current committed relative-J scalar for development replay."""
+        self._assert_active()
+        return self._solver.get_development_direct_replay_current_min_relative_j(
+            self, env_index=env_index
+        )
+
     def deactivate(self):
         gs.logger.info(f"{self.__class__.__name__} <{self.id}> deactivated.")
         self._tgt["act"] = gs.INACTIVE
@@ -688,25 +697,22 @@ class FEMEntity(Entity):
         else:
             # Regular FEM: add vertices, elements, and surfaces for physics and rendering
             elems_np = self.elems.astype(gs.np_int, copy=False)
-            empty_material_np = np.empty((0,), dtype=gs.np_float)
             if self._heterogeneous_material_np is None:
-                mat_mu_per_el = empty_material_np
-                mat_lam_per_el = empty_material_np
-                mat_rho_per_el = empty_material_np
+                mat_mu_per_el = np.full(self.n_elements, self._material.mu, dtype=gs.np_float)
+                mat_lam_per_el = np.full(self.n_elements, self._material.lam, dtype=gs.np_float)
+                mat_rho_per_el = np.full(self.n_elements, self._material.rho, dtype=gs.np_float)
             else:
                 mat_mu_per_el = self._heterogeneous_material_np.mu
                 mat_lam_per_el = self._heterogeneous_material_np.lam
                 mat_rho_per_el = self._heterogeneous_material_np.density
+            mat_friction_mu_per_el = np.full(self.n_elements, self._material.friction_mu, dtype=gs.np_float)
             self._solver._kernel_add_elements(
                 f=self._sim.cur_substep_local,
                 mat_idx=self._material.idx,
-                mat_mu=self._material.mu,
-                mat_lam=self._material.lam,
-                mat_rho=self._material.rho,
-                mat_friction_mu=self._material.friction_mu,
                 mat_mu_per_el=mat_mu_per_el,
                 mat_lam_per_el=mat_lam_per_el,
                 mat_rho_per_el=mat_rho_per_el,
+                mat_friction_mu_per_el=mat_friction_mu_per_el,
                 n_surfaces=self._n_surfaces,
                 v_start=self._v_start,
                 el_start=self._el_start,
