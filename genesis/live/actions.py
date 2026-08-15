@@ -156,17 +156,19 @@ def apply_probe_action(session, params: dict[str, Any]) -> dict[str, Any]:
                 message,
                 details={"action": action, "entity": entity_name, "controller_id": controller_id},
             ) from exc
-        session.controllers[controller_id] = controller
         measurement = params.get("measurement")
         if measurement is not None:
             if not isinstance(measurement, dict):
-                raise GenesisLiveError("invalid_probe_measurement", "measurement lineage must be an object")
-            session.begin_probe_measurement(
+                raise GenesisLiveError("invalid_probe_measurement", "measurement must be an object")
+            active_measurement = session.prepare_probe_measurement(
                 measurement=measurement,
                 entity_name=entity_name,
                 controller_id=controller_id,
                 target_vertices=state.selected_vertices,
             )
+            session.publish_probe_measurement(controller_id, controller, active_measurement)
+        else:
+            session.controllers[controller_id] = controller
         return {
             "action": action,
             "entity": entity_name,
@@ -178,14 +180,15 @@ def apply_probe_action(session, params: dict[str, Any]) -> dict[str, Any]:
         }
 
     if action == "probe_release":
-        controller_id = str(params.get("controller_id") or params.get("probe_id") or "box_ee_0")
-        if controller_id not in session.controllers and len(session.controllers) == 1:
-            controller_id = next(iter(session.controllers))
+        controller_id = str(params.get("controller_id", "")).strip()
+        if not controller_id:
+            raise GenesisLiveError("invalid_probe_measurement", "probe_release requires an explicit controller_id")
         controller = session.controllers.get(controller_id)
         if controller is None:
             raise GenesisLiveError("unknown_controller", f"unknown controller: {controller_id}")
         state = controller.release()
-        session.release_probe_measurement(controller_id)
+        if controller_id in session.active_measurement_by_controller:
+            session.release_probe_measurement(controller_id)
         session.controllers.pop(controller_id, None)
         return {"action": action, "controller_id": controller_id, "controller_state": state.to_dict()}
 

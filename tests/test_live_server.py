@@ -25,7 +25,7 @@ from genesis.live.protocol import (
     send_json,
 )
 from genesis.live.server import GenesisLiveServer
-from genesis.live.session import GenesisLiveSession, ProbeMeasurementTracker
+from genesis.live.session import GenesisLiveSession
 from genesis.live.visual_telemetry import GENESIS_NATIVE_DEBUG_CAMERA_RENDERER
 
 _TWO_TET_VERTS = np.array(
@@ -46,9 +46,12 @@ def _measurement_session_with_anchors(anchors: list[BoxAnchorRecord]) -> Genesis
     session = GenesisLiveSession.__new__(GenesisLiveSession)
     session.entities = {"body": entity}
     session.anchor_records = {"body": anchors}
-    session.probe_measurements = {}
+    session.anchor_by_id = {"body": {record.anchor_id: record for record in anchors}}
+    session.active_measurement_by_controller = {}
     session.controllers = {}
-    session.visual_telemetry = SimpleNamespace(freeze_triptych_for_measurement=lambda *_: None)
+    session.current_step = 0
+    session.running = False
+    session.paused = True
     session._entity_positions_for_validation = lambda *_args, **_kwargs: _TWO_TET_VERTS
     return session
 
@@ -64,38 +67,49 @@ def _measurement_anchor(anchor_id: str, selected_vertices: list[int]) -> BoxAnch
     )
 
 
-def test_probe_measurement_matches_canonical_static_anchor_id_and_release():
+def test_probe_measurement_lifecycle_emits_one_release_pair_and_retires_active_record():
     anchor_id = "brim_midspan_from_front_band"
     session = _measurement_session_with_anchors([_measurement_anchor(anchor_id, [0])])
 
-    tracker = session.begin_probe_measurement(
-        measurement={"measurement_id": "measurement_0001", "anchor_id": anchor_id},
+    active = session.prepare_probe_measurement(
+        measurement={"dispatch_token": "runtime-token", "anchor_id": anchor_id},
         entity_name="body",
         controller_id="controller_1",
         target_vertices=np.array([1], dtype=np.int64),
     )
+    session.scene = SimpleNamespace(step=lambda: None)
+    session.status = lambda: {}
+    session._validate_visual_request = lambda _visual: None
+    session._visual_render_every_steps = lambda _visual: None
+    session._validate_fem_state = lambda **_kwargs: None
+    session._sync_visual_overlays = lambda **_kwargs: None
+    session._visual_result_from_frames = lambda *_args, **_kwargs: {}
+    session.publish_probe_measurement("controller_1", SimpleNamespace(advance_motion=lambda **_kwargs: None), active)
+    compiled_resume = session.resume({"steps": 1})
+    assert "completed_probe_measurement" not in compiled_resume
+    assert active.under_load is not None
     session.release_probe_measurement("controller_1")
+    release_resume = session.resume({"steps": 1})
+    completed = release_resume["completed_probe_measurement"]
 
-    assert tracker.anchor_id == anchor_id
-    assert tracker.phase == "post_release"
+    assert completed["dispatch_token"] == "runtime-token"
+    assert completed["under_load"]["simulation_step"] < completed["post_release"]["simulation_step"]
+    assert session.active_measurement_by_controller == {}
 
 
-def test_probe_measurement_rejects_conflicting_static_anchor_matches():
+def test_probe_measurement_rejects_invalid_physical_vertex_domain():
     anchor_id = "brim_midspan_from_front_band"
-    session = _measurement_session_with_anchors(
-        [_measurement_anchor(anchor_id, [0]), _measurement_anchor(anchor_id, [1])]
-    )
+    session = _measurement_session_with_anchors([_measurement_anchor(anchor_id, [0])])
 
-    with pytest.raises(GenesisLiveError, match="exactly one non-empty matching static anchor") as exc_info:
-        session.begin_probe_measurement(
-            measurement={"measurement_id": "measurement_0001", "anchor_id": anchor_id},
+    with pytest.raises(GenesisLiveError, match="physical FEM domain") as exc_info:
+        session.prepare_probe_measurement(
+            measurement={"dispatch_token": "runtime-token", "anchor_id": anchor_id},
             entity_name="body",
             controller_id="controller_1",
-            target_vertices=np.array([2], dtype=np.int64),
+            target_vertices=np.array([99], dtype=np.int64),
         )
 
     assert exc_info.value.code == "invalid_probe_measurement"
-    assert exc_info.value.details["matches"] == 2
 
 
 def test_non_y_live_apply_passes_runtime_selected_vertices_to_tracker(tmp_path):
@@ -108,7 +122,7 @@ def test_non_y_live_apply_passes_runtime_selected_vertices_to_tracker(tmp_path):
             "action": "box_ee_grasp_and_move",
             "entity": "body",
             "duration_steps": 12,
-            "measurement": {"measurement_id": "non_y_measurement", "anchor_id": "bottom_pin", "motion_axis": "-X"},
+            "measurement": {"dispatch_token": "non_y_dispatch", "anchor_id": "bottom_pin"},
             "controllers": [
                 {
                     "controller_id": "non_y_box",
@@ -120,70 +134,13 @@ def test_non_y_live_apply_passes_runtime_selected_vertices_to_tracker(tmp_path):
         },
     )
     selected = response["probe"]["selected_vertices"]
-    tracker = session.probe_measurements["non_y_measurement"]
+    active = session.active_measurement_by_controller["non_y_box"]
 
     assert selected == [3]
-    assert tracker.target_vertices.tolist() == selected
+    assert active.target_vertices.tolist() == selected
     assert session.controllers["non_y_box"].state.motion_axis == "-X"
     session.dispatch("sim.resume", {"steps": 12})
-    assert tracker.samples[-1]["controller_lineage"]["motion_axis"] == "-X"
-
-
-def test_probe_measurement_socket_payload_is_bounded_and_keeps_large_trace_private(tmp_path):
-    target_vertices = np.arange(1, 100_001, dtype=np.int64)
-    positions = np.zeros((100_001, 3), dtype=np.float64)
-    entity = object()
-    controller = SimpleNamespace(
-        snapshot=lambda: {
-            "displacement": [0.0, 0.01, 0.0],
-            "distance": 0.01,
-            "moved_distance": 0.01,
-            "duration_steps": 32,
-            "estimated_motion_steps": 32,
-            "active": True,
-            "motion_active": True,
-            "selected_vertices": target_vertices.tolist(),
-            "target_positions": positions[target_vertices].tolist(),
-        }
-    )
-    sampling_session = SimpleNamespace(
-        entities={"body": entity},
-        controllers={"controller_1": controller},
-        current_step=1,
-        _entity_positions_for_validation=lambda *_args, **_kwargs: positions,
-    )
-    tracker = ProbeMeasurementTracker(
-        measurement_id="measurement_0001",
-        entity_name="body",
-        entity=entity,
-        controller_id="controller_1",
-        anchor_id="brim_midspan_from_front_band",
-        target_vertices=target_vertices,
-        anchor_vertices=np.array([0], dtype=np.int64),
-        baseline_target_centroid=np.zeros(3),
-        baseline_anchor_centroid=np.zeros(3),
-        baseline_relative=np.zeros(3),
-        lineage={},
-    )
-    tracker.sample(sampling_session)
-    tracker.samples *= 1_000
-
-    session = GenesisLiveSession.__new__(GenesisLiveSession)
-    session.output_dir = str(tmp_path)
-    session.probe_measurements = {tracker.measurement_id: tracker}
-    payload = session._probe_measurement_payload()
-    encoded_response = encode_frame({"ok": True, "data": {"probe_measurement": payload}})
-
-    assert len(encoded_response) < 4_096
-    assert len(encoded_response) < MAX_MESSAGE_BYTES
-    assert b"target_vertices" not in encoded_response
-    assert b"samples" not in encoded_response
-    assert b"target_positions" not in encoded_response
-    artifact_path = tmp_path / payload["private_trace_ref"]["relative_path"]
-    private_trace = json.loads(artifact_path.read_text(encoding="utf-8"))
-    assert private_trace["target_vertices"] == target_vertices.tolist()
-    assert len(private_trace["samples"]) == 1_000
-    assert "target_positions" not in private_trace["samples"][0]["controller_lineage"]
+    assert active.under_load is not None
 
 
 def test_probe_measurement_capability_is_reported_and_requireable():

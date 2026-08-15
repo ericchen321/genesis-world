@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import threading
 import time
@@ -49,137 +48,34 @@ class VisualOverlayRecord:
     visual_rest_vertices_m: np.ndarray
 
 
-@dataclass
-class ProbeMeasurementTracker:
-    """Private, append-only FEM target-to-anchor measurement for one probe."""
+@dataclass(frozen=True)
+class ProbeEndpoint:
+    simulation_step: int
+    vector_env_local_m: np.ndarray
 
-    measurement_id: str
+    def to_dict(self) -> dict[str, Any]:
+        vector = self.vector_env_local_m.astype(float).tolist()
+        return {
+            "simulation_step": int(self.simulation_step),
+            "vector_env_local_m": vector,
+            "magnitude_m": float(np.linalg.norm(self.vector_env_local_m)),
+        }
+
+
+@dataclass
+class ActiveProbeMeasurement:
+    """One runtime-owned measurement, kept only until release completes."""
+
+    dispatch_token: str
     entity_name: str
     entity: Any
     controller_id: str
     anchor_id: str
     target_vertices: np.ndarray
     anchor_vertices: np.ndarray
-    baseline_target_centroid: np.ndarray
-    baseline_anchor_centroid: np.ndarray
     baseline_relative: np.ndarray
-    lineage: dict[str, Any]
-    phase: str = "under_load"
-    samples: list[dict[str, Any]] | None = None
-    under_load_endpoint: dict[str, Any] | None = None
-    post_release_endpoint: dict[str, Any] | None = None
-    valid: bool = True
-    failure_reason: str | None = None
-
-    def __post_init__(self) -> None:
-        if self.samples is None:
-            self.samples = []
-
-    def _fail(self, reason: str) -> None:
-        self.valid = False
-        self.failure_reason = reason
-        raise GenesisLiveError(
-            "probe_measurement_invalid",
-            "anchor-relative probe measurement is invalid: " + reason,
-            details={"measurement_id": self.measurement_id, "reason": reason},
-        )
-
-    def sample(self, session: "GenesisLiveSession") -> dict[str, Any]:
-        if not self.valid:
-            self._fail(self.failure_reason or "tracker was already invalid")
-        if self.entity_name not in session.entities or session.entities[self.entity_name] is not self.entity:
-            self._fail("entity lineage changed")
-        if self.target_vertices.ndim != 1 or self.anchor_vertices.ndim != 1:
-            self._fail("vertex identity arrays have invalid shape")
-        positions = session._entity_positions_for_validation(
-            self.entity_name, self.entity, checked_at="probe_measurement"
-        )
-        if (
-            self.target_vertices.size == 0
-            or self.anchor_vertices.size == 0
-            or np.any(self.target_vertices < 0)
-            or np.any(self.anchor_vertices < 0)
-            or np.any(self.target_vertices >= positions.shape[0])
-            or np.any(self.anchor_vertices >= positions.shape[0])
-        ):
-            self._fail("selected vertex identity no longer agrees with FEM state")
-        target_centroid = np.mean(positions[self.target_vertices], axis=0)
-        anchor_centroid = np.mean(positions[self.anchor_vertices], axis=0)
-        relative = target_centroid - anchor_centroid
-        displacement = relative - self.baseline_relative
-        if not all(np.all(np.isfinite(value)) for value in (target_centroid, anchor_centroid, relative, displacement)):
-            self._fail("non-finite target or anchor centroid")
-        controller = session.controllers.get(self.controller_id)
-        controller_state = controller.snapshot() if controller is not None else None
-        controller_lineage = None
-        if isinstance(controller_state, dict):
-            controller_displacement = controller_state.get("displacement")
-            controller_lineage = {
-                "displacement_env_local_m": [float(value) for value in controller_displacement]
-                if isinstance(controller_displacement, list) and len(controller_displacement) == 3
-                else None,
-                "distance_m": float(controller_state["distance"]),
-                "moved_distance_m": float(controller_state["moved_distance"]),
-                "duration_steps": int(controller_state["duration_steps"]),
-                "estimated_motion_steps": int(controller_state["estimated_motion_steps"]),
-                "motion_axis": controller_state.get("motion_axis"),
-                "active": bool(controller_state["active"]),
-                "motion_active": bool(controller_state["motion_active"]),
-            }
-        sample = {
-            "sample_index": len(self.samples),
-            "simulation_step": int(session.current_step),
-            "phase": self.phase,
-            "target_centroid_env_local_m": target_centroid.astype(float).tolist(),
-            "anchor_centroid_env_local_m": anchor_centroid.astype(float).tolist(),
-            "relative_env_local_m": relative.astype(float).tolist(),
-            "displacement_vector_env_local_m": displacement.astype(float).tolist(),
-            "magnitude_m": float(np.linalg.norm(displacement)),
-            "controller_lineage": controller_lineage,
-        }
-        self.samples.append(sample)
-        endpoint = dict(sample)
-        if self.phase == "under_load":
-            self.under_load_endpoint = endpoint
-        else:
-            self.post_release_endpoint = endpoint
-        return endpoint
-
-    def to_dict(self) -> dict[str, Any]:
-        residual = None
-        if self.post_release_endpoint is not None:
-            residual = self.post_release_endpoint["displacement_vector_env_local_m"]
-        return {
-            "measurement_id": self.measurement_id,
-            "frame": "env_local",
-            "entity": self.entity_name,
-            "controller_id": self.controller_id,
-            "anchor_id": self.anchor_id,
-            "lineage": dict(self.lineage),
-            "target_vertices": self.target_vertices.astype(int).tolist(),
-            "anchor_vertices": self.anchor_vertices.astype(int).tolist(),
-            "target_vertex_count": int(self.target_vertices.size),
-            "anchor_vertex_count": int(self.anchor_vertices.size),
-            "baseline_target_centroid_env_local_m": self.baseline_target_centroid.astype(float).tolist(),
-            "baseline_anchor_centroid_env_local_m": self.baseline_anchor_centroid.astype(float).tolist(),
-            "baseline_relative_env_local_m": self.baseline_relative.astype(float).tolist(),
-            "samples": list(self.samples),
-            "under_load_endpoint": self.under_load_endpoint,
-            "post_release_endpoint": self.post_release_endpoint,
-            "release_residual_vector_env_local_m": residual,
-            "valid": self.valid,
-            "failure_reason": self.failure_reason,
-        }
-
-    def public_endpoint(self) -> dict[str, Any] | None:
-        endpoint = self.under_load_endpoint if self.phase == "under_load" else self.post_release_endpoint
-        if endpoint is None or not self.valid:
-            return None
-        return {
-            "phase": self.phase,
-            "vector_env_local_m": list(endpoint["displacement_vector_env_local_m"]),
-            "magnitude_m": float(endpoint["magnitude_m"]),
-        }
+    under_load: ProbeEndpoint | None = None
+    released: bool = False
 
 
 class GenesisLiveSession:
@@ -198,7 +94,8 @@ class GenesisLiveSession:
         self.actions = ActionRegistry()
         self.controllers = {}
         self.anchor_records = {}
-        self.probe_measurements: dict[str, ProbeMeasurementTracker] = {}
+        self.anchor_by_id: dict[str, dict[str, Any]] = {}
+        self.active_measurement_by_controller: dict[str, ActiveProbeMeasurement] = {}
         self.last_request_id = None
         self.last_frame_index = None
         self.fatal_error = None
@@ -553,7 +450,8 @@ class GenesisLiveSession:
         self.controllers.clear()
         self.actions.clear()
         self.anchor_records.clear()
-        self.probe_measurements.clear()
+        self.anchor_by_id.clear()
+        self.active_measurement_by_controller.clear()
 
         sim_options = self._scene_config.get("sim_options", {})
         fem_options = {"enable_vertex_constraints": True}
@@ -641,7 +539,9 @@ class GenesisLiveSession:
             if anchors:
                 name = next(name for name, candidate in self.entities.items() if candidate is entity)
                 try:
-                    self.anchor_records[name] = apply_static_box_anchors(entity, anchors, frame="env_local")
+                    records = apply_static_box_anchors(entity, anchors, frame="env_local")
+                    self.anchor_records[name] = records
+                    self.anchor_by_id[name] = {record.anchor_id: record for record in records}
                 except gs.GenesisException as exc:
                     raise GenesisLiveError(
                         "invalid_scene_config",
@@ -800,7 +700,6 @@ class GenesisLiveSession:
                 self.heartbeat_timestamp = time.time()
                 return error_response(request_id, exc)
             except Exception as exc:
-                self.fatal_error = str(exc)
                 self.heartbeat_timestamp = time.time()
                 return error_response(request_id, GenesisLiveError("internal_error", str(exc)))
 
@@ -837,95 +736,97 @@ class GenesisLiveSession:
             return fused_observation(self)
         raise GenesisLiveError("unknown_method", f"unknown live method: {method}")
 
-    def begin_probe_measurement(
+    def prepare_probe_measurement(
         self, *, measurement: dict[str, Any], entity_name: str, controller_id: str, target_vertices: np.ndarray
-    ) -> ProbeMeasurementTracker:
-        measurement_id = str(measurement.get("measurement_id", "")).strip()
+    ) -> ActiveProbeMeasurement:
+        dispatch_token = str(measurement.get("dispatch_token", "")).strip()
         anchor_id = str(measurement.get("anchor_id", "")).strip()
-        if not measurement_id or not anchor_id:
-            raise GenesisLiveError("invalid_probe_measurement", "measurement_id and anchor_id are required")
-        if measurement_id in self.probe_measurements:
-            raise GenesisLiveError("invalid_probe_measurement", "measurement_id is already active")
+        if not dispatch_token or not anchor_id:
+            raise GenesisLiveError("invalid_probe_measurement", "dispatch_token and anchor_id are required")
         entity = self.entities.get(entity_name)
-        records = self.anchor_records.get(entity_name, [])
-        anchors = [record for record in records if record.anchor_id == anchor_id and record.selected_vertex_count > 0]
-        if len(anchors) != 1:
+        anchor = self.anchor_by_id.get(entity_name, {}).get(anchor_id)
+        if anchor is None:
             raise GenesisLiveError(
                 "invalid_probe_measurement",
-                "measurement requires exactly one non-empty matching static anchor",
-                details={
-                    "measurement_id": measurement_id,
-                    "entity": entity_name,
-                    "anchor_id": anchor_id,
-                    "matches": len(anchors),
-                },
+                "measurement anchor is unavailable",
+                details={"entity": entity_name, "anchor_id": anchor_id},
             )
         positions = self._entity_positions_for_validation(entity_name, entity, checked_at="probe_measurement_baseline")
         target_vertices = np.asarray(target_vertices, dtype=np.int64).reshape(-1)
-        anchor_vertices = np.asarray(anchors[0].selected_vertices, dtype=np.int64).reshape(-1)
-        if target_vertices.size == 0 or np.any(target_vertices < 0) or np.any(target_vertices >= positions.shape[0]):
+        anchor_vertices = np.asarray(anchor.selected_vertices, dtype=np.int64).reshape(-1)
+        if (
+            target_vertices.size == 0
+            or anchor_vertices.size == 0
+            or np.any(target_vertices < 0)
+            or np.any(anchor_vertices < 0)
+            or np.any(target_vertices >= positions.shape[0])
+            or np.any(anchor_vertices >= positions.shape[0])
+        ):
             raise GenesisLiveError(
-                "invalid_probe_measurement", "runtime target selection is invalid for measurement baseline"
+                "invalid_probe_measurement", "measurement vertex selections are outside the physical FEM domain"
             )
-        if np.any(anchor_vertices < 0) or np.any(anchor_vertices >= positions.shape[0]):
-            raise GenesisLiveError(
-                "invalid_probe_measurement", "runtime anchor selection is invalid for measurement baseline"
-            )
-        target_centroid = np.mean(positions[target_vertices], axis=0)
-        anchor_centroid = np.mean(positions[anchor_vertices], axis=0)
-        if not np.all(np.isfinite(target_centroid)) or not np.all(np.isfinite(anchor_centroid)):
-            raise GenesisLiveError("invalid_probe_measurement", "measurement baseline centroids are non-finite")
-        tracker = ProbeMeasurementTracker(
-            measurement_id=measurement_id,
+        baseline_relative = np.mean(positions[target_vertices], axis=0) - np.mean(positions[anchor_vertices], axis=0)
+        if not np.all(np.isfinite(baseline_relative)):
+            raise GenesisLiveError("invalid_probe_measurement", "measurement baseline relative vector is non-finite")
+        return ActiveProbeMeasurement(
+            dispatch_token=dispatch_token,
             entity_name=entity_name,
             entity=entity,
             controller_id=controller_id,
             anchor_id=anchor_id,
             target_vertices=target_vertices,
             anchor_vertices=anchor_vertices,
-            baseline_target_centroid=target_centroid.copy(),
-            baseline_anchor_centroid=anchor_centroid.copy(),
-            baseline_relative=(target_centroid - anchor_centroid).copy(),
-            lineage={key: value for key, value in measurement.items() if key not in {"measurement_id", "anchor_id"}},
+            baseline_relative=baseline_relative.copy(),
         )
-        self.probe_measurements[measurement_id] = tracker
-        self.visual_telemetry.freeze_triptych_for_measurement(self, tracker)
-        return tracker
+
+    def publish_probe_measurement(self, controller_id: str, controller: Any, measurement: ActiveProbeMeasurement) -> None:
+        self.controllers[controller_id] = controller
+        self.active_measurement_by_controller[controller_id] = measurement
 
     def release_probe_measurement(self, controller_id: str) -> None:
-        trackers = [tracker for tracker in self.probe_measurements.values() if tracker.controller_id == controller_id]
-        if not trackers:
-            return
-        active = [tracker for tracker in trackers if tracker.valid]
-        if len(active) != 1:
-            raise GenesisLiveError("invalid_probe_measurement", "release requires exactly one active probe measurement")
-        active[0].phase = "post_release"
+        active = self.active_measurement_by_controller.get(controller_id)
+        if active is not None:
+            active.released = True
 
-    def _sample_probe_measurements(self) -> None:
-        for tracker in list(self.probe_measurements.values()):
-            tracker.sample(self)
+    def _measurement_endpoint(self, active: ActiveProbeMeasurement) -> ProbeEndpoint:
+        positions = self._entity_positions_for_validation(active.entity_name, active.entity, checked_at="probe_measurement_endpoint")
+        relative = np.mean(positions[active.target_vertices], axis=0) - np.mean(positions[active.anchor_vertices], axis=0)
+        vector = relative - active.baseline_relative
+        if not np.all(np.isfinite(vector)):
+            raise GenesisLiveError("invalid_probe_measurement", "probe endpoint vector is non-finite")
+        return ProbeEndpoint(simulation_step=int(self.current_step), vector_env_local_m=np.asarray(vector, dtype=np.float32))
 
-    def _probe_measurement_payload(self) -> dict[str, Any] | None:
-        if not self.probe_measurements:
-            return None
-        tracker = next(reversed(self.probe_measurements.values()))
-        trace = tracker.to_dict()
-        encoded_trace = json.dumps(trace, separators=(",", ":"), sort_keys=True).encode("utf-8")
-        digest = hashlib.sha256(encoded_trace).hexdigest()
-        relative_path = Path("private_probe_measurements") / f"{digest}.json"
-        artifact_path = self._resolve_output_dir() / relative_path
-        artifact_path.parent.mkdir(parents=True, exist_ok=True)
-        artifact_path.write_bytes(encoded_trace)
+    def _completed_probe_measurement(self, active: ActiveProbeMeasurement, post_release: ProbeEndpoint) -> dict[str, Any]:
+        if active.under_load is None or post_release.simulation_step <= active.under_load.simulation_step:
+            raise GenesisLiveError("invalid_probe_measurement", "probe endpoint pair is not causally ordered")
         return {
-            "private_trace_ref": {
-                "schema_version": "genesis-probe-measurement-trace-ref-v1",
-                "measurement_id": tracker.measurement_id,
-                "relative_path": str(relative_path),
-                "sha256": digest,
-                "byte_count": len(encoded_trace),
+            "dispatch_token": active.dispatch_token,
+            "identity": {
+                "entity": active.entity_name,
+                "controller_id": active.controller_id,
+                "anchor_id": active.anchor_id,
+                "target_vertices": active.target_vertices.astype(int).tolist(),
+                "anchor_vertices": active.anchor_vertices.astype(int).tolist(),
+                "baseline_relative_env_local_m": active.baseline_relative.astype(float).tolist(),
             },
-            "endpoint": tracker.public_endpoint(),
+            "under_load": active.under_load.to_dict(),
+            "post_release": post_release.to_dict(),
         }
+
+    def _sample_active_measurements(self) -> dict[str, Any] | None:
+        completed = None
+        for controller_id, active in list(self.active_measurement_by_controller.items()):
+            try:
+                if active.released:
+                    post_release = self._measurement_endpoint(active)
+                    completed = self._completed_probe_measurement(active, post_release)
+                    self.active_measurement_by_controller.pop(controller_id, None)
+                elif active.under_load is None:
+                    active.under_load = self._measurement_endpoint(active)
+            except GenesisLiveError:
+                self.active_measurement_by_controller.pop(controller_id, None)
+                raise
+        return completed
 
     def resume(self, params: dict[str, Any]) -> dict[str, Any]:
         steps = int(params.get("steps", params.get("duration_steps", 1)))
@@ -935,6 +836,7 @@ class GenesisLiveSession:
         self._validate_visual_request(visual)
         render_every_steps = self._visual_render_every_steps(visual)
         visual_frames = []
+        completed_probe_measurement = None
 
         self.paused = False
         self.running = True
@@ -945,7 +847,9 @@ class GenesisLiveSession:
                 self.scene.step()
                 self.current_step += 1
                 self._validate_fem_state(checked_at="after_step")
-                self._sample_probe_measurements()
+                completed = self._sample_active_measurements()
+                if completed is not None:
+                    completed_probe_measurement = completed
                 self._sync_visual_overlays(checked_at="after_step")
                 if render_every_steps is not None and (local_step_index + 1) % render_every_steps == 0:
                     visual_frames.append(
@@ -970,9 +874,8 @@ class GenesisLiveSession:
             self.running = False
             self.paused = True
         result = {"steps": steps, "status": self.status(), "visual_telemetry": visual_result}
-        measurement = self._probe_measurement_payload()
-        if measurement is not None:
-            result["probe_measurement"] = measurement
+        if completed_probe_measurement is not None:
+            result["completed_probe_measurement"] = completed_probe_measurement
         return result
 
     def _entity_positions_for_validation(self, entity_name: str, entity, *, checked_at: str) -> np.ndarray:
