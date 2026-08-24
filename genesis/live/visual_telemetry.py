@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import math
 import time
 from pathlib import Path
 from typing import Any
@@ -15,6 +17,9 @@ from .overlay_state import anchor_overlay_records, controller_overlay_records
 from .triptych import HAG4R_LABELS, PANEL_ORDER, png_record, stitch_triptych
 
 PANEL_SIZE = (256, 256)
+FIXED_RGB_VIEW_SIZE = (512, 512)
+FIXED_RGB_VIEW_ORDER = ("full", "context")
+FIXED_RGB_FOV_DEGREES = 40.0
 GENESIS_NATIVE_DEBUG_CAMERA_RENDERER = "genesis_native_debug_camera_renderer"
 ANCHOR_DEBUG_BOX_COLOR = (0.16, 0.43, 1.0, 1.0)
 CONTROLLER_DEBUG_BOX_COLOR = (1.0, 0.35, 0.16, 1.0)
@@ -367,15 +372,105 @@ def _camera_metadata(camera: Any, label: str, pose: dict[str, tuple[float, float
     }
 
 
+def canonical_fixed_rgb_request(value: Any) -> dict[str, Any]:
+    """Validate the immutable PAIP camera request and return its canonical form."""
+    if not isinstance(value, dict) or set(value) != {"mode", "render_every_steps", "views"}:
+        raise ValueError("fixed_rgb_views request must contain exactly mode, render_every_steps, and views")
+    if value.get("mode") != "fixed_rgb_views" or value.get("render_every_steps") != 10:
+        raise ValueError("fixed_rgb_views requires mode=fixed_rgb_views and render_every_steps=10")
+    raw_views = value.get("views")
+    if not isinstance(raw_views, list) or len(raw_views) != 2:
+        raise ValueError("fixed_rgb_views requires exactly two views")
+
+    views = []
+    for index, (expected_name, raw) in enumerate(zip(FIXED_RGB_VIEW_ORDER, raw_views, strict=True)):
+        if not isinstance(raw, dict) or set(raw) != {
+            "name",
+            "position",
+            "look_at",
+            "up",
+            "resolution",
+            "fov_degrees",
+        }:
+            raise ValueError(f"fixed_rgb_views.views[{index}] has unexpected or missing fields")
+        if raw.get("name") != expected_name:
+            raise ValueError("fixed_rgb_views view order must be full, context")
+        if raw.get("resolution") != list(FIXED_RGB_VIEW_SIZE):
+            raise ValueError("fixed_rgb_views resolution must be [512, 512]")
+        fov = raw.get("fov_degrees")
+        if isinstance(fov, bool) or not isinstance(fov, (int, float)) or float(fov) != FIXED_RGB_FOV_DEGREES:
+            raise ValueError("fixed_rgb_views fov_degrees must be 40.0")
+
+        vectors = {}
+        for field in ("position", "look_at", "up"):
+            vector = raw.get(field)
+            if (
+                not isinstance(vector, list)
+                or len(vector) != 3
+                or any(isinstance(component, bool) or not isinstance(component, (int, float)) for component in vector)
+            ):
+                raise ValueError(f"fixed_rgb_views {expected_name}.{field} must be a finite vec3")
+            canonical = [float(component) for component in vector]
+            if not all(math.isfinite(component) for component in canonical):
+                raise ValueError(f"fixed_rgb_views {expected_name}.{field} must be a finite vec3")
+            vectors[field] = canonical
+        direction = np.asarray(vectors["look_at"]) - np.asarray(vectors["position"])
+        up = np.asarray(vectors["up"])
+        if np.linalg.norm(direction) <= 1.0e-8 or np.linalg.norm(up) <= 1.0e-8:
+            raise ValueError(f"fixed_rgb_views {expected_name} has a degenerate camera vector")
+        if np.linalg.norm(np.cross(direction, up)) <= 1.0e-8:
+            raise ValueError(f"fixed_rgb_views {expected_name}.up is collinear with the view direction")
+        views.append(
+            {
+                "name": expected_name,
+                "position": vectors["position"],
+                "look_at": vectors["look_at"],
+                "up": vectors["up"],
+                "resolution": list(FIXED_RGB_VIEW_SIZE),
+                "fov_degrees": FIXED_RGB_FOV_DEGREES,
+            }
+        )
+    return {"mode": "fixed_rgb_views", "render_every_steps": 10, "views": views}
+
+
+def fixed_rgb_request_hash(value: Any) -> str:
+    canonical = canonical_fixed_rgb_request(value)
+    encoded = json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 class VisualTelemetry:
     def __init__(self, output_dir: str | Path):
         self.output_dir = Path(output_dir)
         self.triptych_cameras: dict[str, Any] = {}
+        self.fixed_rgb_cameras: dict[str, Any] = {}
         self._triptych_debug_marker_handles: list[Any] = []
 
     def reset_triptych_cameras(self) -> None:
         self.triptych_cameras.clear()
         self._triptych_debug_marker_handles.clear()
+
+    def reset_fixed_rgb_cameras(self) -> None:
+        self.fixed_rgb_cameras.clear()
+
+    def register_fixed_rgb_cameras(self, session) -> None:
+        self.reset_fixed_rgb_cameras()
+        if session.scene is None:
+            raise ValueError("Cannot register fixed RGB cameras before the Genesis scene exists")
+        for index, label in enumerate(FIXED_RGB_VIEW_ORDER):
+            camera = session.scene.add_camera(
+                model="pinhole",
+                res=FIXED_RGB_VIEW_SIZE,
+                pos=(1.0 + index, 1.0, 1.0),
+                lookat=(0.0, 0.0, 0.0),
+                up=(0.0, 0.0, 1.0),
+                fov=FIXED_RGB_FOV_DEGREES,
+                GUI=False,
+                debug=False,
+            )
+            self.fixed_rgb_cameras[label] = camera
+        if tuple(self.fixed_rgb_cameras) != FIXED_RGB_VIEW_ORDER:
+            raise ValueError("Fixed RGB camera registration did not produce full/context order")
 
     def register_triptych_cameras(self, session) -> None:
         self.reset_triptych_cameras()
@@ -692,3 +787,101 @@ class VisualTelemetry:
 
     def capture_part_segmentation_triptych(self, session, *, frame_index: int | None = None) -> dict[str, Any]:
         return self.capture_triptych(session, mode="part_segmentation_triptych", frame_index=frame_index)
+
+    @torch.no_grad()
+    def capture_fixed_rgb_views(
+        self,
+        session,
+        *,
+        visual: dict[str, Any],
+        frame_index: int | None = None,
+    ) -> dict[str, Any]:
+        request = canonical_fixed_rgb_request(visual)
+        request_hash = fixed_rgb_request_hash(request)
+        if frame_index is None:
+            frame_index = int(session.current_step)
+        if tuple(self.fixed_rgb_cameras) != FIXED_RGB_VIEW_ORDER:
+            raise ValueError("Fixed RGB cameras are not registered")
+
+        panel_records = []
+        panel_render_seconds = []
+        png_encode_write_seconds = 0.0
+        capture_started = time.perf_counter()
+        for index, spec in enumerate(request["views"]):
+            label = spec["name"]
+            camera = self.fixed_rgb_cameras[label]
+            if bool(camera.debug):
+                raise ValueError(f"Fixed RGB camera {label!r} must be non-debug")
+            pose = {
+                "pos": tuple(spec["position"]),
+                "lookat": tuple(spec["look_at"]),
+                "up": tuple(spec["up"]),
+            }
+            camera.set_pose(pos=pose["pos"], lookat=pose["lookat"], up=pose["up"])
+            render_started = time.perf_counter()
+            image = _render_camera_rgb(camera, label=label, force_render=index == 0)
+            panel_render_seconds.append(time.perf_counter() - render_started)
+            path = self.output_dir / "png_fixed_rgb_views" / label / f"frame_{frame_index:06d}.png"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            png_started = time.perf_counter()
+            Image.fromarray(image, mode="RGB").save(path)
+            png_encode_write_seconds += time.perf_counter() - png_started
+            record = png_record(
+                path,
+                label=label,
+                hag4r_label=label,
+                frame_index=frame_index,
+                simulation_step=session.current_step,
+            )
+            record.update(
+                {
+                    "render_backend": GENESIS_NATIVE_DEBUG_CAMERA_RENDERER,
+                    "renderer": {
+                        "backend": GENESIS_NATIVE_DEBUG_CAMERA_RENDERER,
+                        "mode": "fixed_rgb_views",
+                        "debug_camera": False,
+                        "native_camera_registered": True,
+                    },
+                    "camera": _camera_metadata(camera, label, pose),
+                    "camera_spec": spec,
+                    "camera_spec_hash": request_hash,
+                }
+            )
+            panel_records.append(record)
+
+        metadata_path = self.output_dir / "fixed_rgb_views_metadata" / f"frame_{frame_index:06d}.json"
+        metadata = {
+            "requested": True,
+            "mode": "fixed_rgb_views",
+            "rendered": True,
+            "render_backend": GENESIS_NATIVE_DEBUG_CAMERA_RENDERER,
+            "renderer": {
+                "backend": GENESIS_NATIVE_DEBUG_CAMERA_RENDERER,
+                "mode": "fixed_rgb_views",
+                "camera_model": "pinhole",
+                "debug_camera": False,
+                "debug_markers": False,
+                "panel_size": list(FIXED_RGB_VIEW_SIZE),
+            },
+            "camera_specs": request["views"],
+            "camera_specs_hash": request_hash,
+            "view_order": list(FIXED_RGB_VIEW_ORDER),
+            "views": panel_records,
+            "frame_metadata": panel_records,
+            "overlays": [],
+            "debug_markers": [],
+            "frame_id": int(frame_index),
+            "frame_index": int(frame_index),
+            "simulation_step": int(session.current_step),
+            "performance": {
+                "rgb_render_count": len(FIXED_RGB_VIEW_ORDER),
+                "panel_raster_seconds": panel_render_seconds,
+                "png_encode_write_seconds": png_encode_write_seconds,
+                "capture_seconds": time.perf_counter() - capture_started,
+            },
+            "capture_time": time.time(),
+            "metadata_path": str(metadata_path),
+        }
+        metadata_path.parent.mkdir(parents=True, exist_ok=True)
+        metadata_path.write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        return metadata

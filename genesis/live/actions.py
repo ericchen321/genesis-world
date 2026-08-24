@@ -6,11 +6,9 @@ import math
 from typing import Any
 
 import genesis as gs
-
 from genesis.engine.controllers.box_end_effector import BoxEndEffectorController
 
 from .protocol import GenesisLiveError
-
 
 BOX_EE_NATIVE_FEM_COMPLIANT_STIFFNESS = 0.1
 BOX_EE_IPC_SURFACE_COMPLIANT_STRENGTH_RATE = 100.0
@@ -107,16 +105,29 @@ def _force_limited_policy(session, entity) -> dict[str, object] | None:
     required = {"mode", "policy_id", "total_stiffness_n_per_m", "max_net_spring_force_n"}
     if not isinstance(policy, dict) or set(policy) != required:
         raise GenesisLiveError("invalid_controller_policy", "box_ee_controller_policy has unexpected fields")
-    if policy["mode"] != BOX_EE_FORCE_LIMITED_MODE or not isinstance(policy["policy_id"], str) or not policy["policy_id"]:
+    if (
+        policy["mode"] != BOX_EE_FORCE_LIMITED_MODE
+        or not isinstance(policy["policy_id"], str)
+        or not policy["policy_id"]
+    ):
         raise GenesisLiveError("invalid_controller_policy", "box_ee_controller_policy identity is invalid")
     for key in ("total_stiffness_n_per_m", "max_net_spring_force_n"):
         value = policy[key]
-        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)) or value <= 0:
-            raise GenesisLiveError("invalid_controller_policy", f"box_ee_controller_policy.{key} must be finite and > 0")
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+            or value <= 0
+        ):
+            raise GenesisLiveError(
+                "invalid_controller_policy", f"box_ee_controller_policy.{key} must be finite and > 0"
+            )
     from genesis.engine.couplers import IPCCoupler
 
     if isinstance(entity.sim.coupler, IPCCoupler):
-        raise GenesisLiveError("unsupported_controller_policy", "force-limited BoxEE currently supports native FEM only")
+        raise GenesisLiveError(
+            "unsupported_controller_policy", "force-limited BoxEE currently supports native FEM only"
+        )
     normalized = {
         "mode": policy["mode"],
         "policy_id": policy["policy_id"],
@@ -235,7 +246,7 @@ def apply_probe_action(session, params: dict[str, Any]) -> dict[str, Any]:
             raise GenesisLiveError("unknown_controller", f"unknown controller: {controller_id}")
         state = controller.release()
         if controller_id in session.active_measurement_by_controller:
-            session.release_probe_measurement(controller_id)
+            session.release_probe_measurement(controller_id, controller_state=state.to_dict())
         session.controllers.pop(controller_id, None)
         return {"action": action, "controller_id": controller_id, "controller_state": state.to_dict()}
 

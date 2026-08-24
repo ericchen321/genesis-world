@@ -1,14 +1,13 @@
 from __future__ import annotations
 
+import copy
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-import copy
 
 import numpy as np
 
 import genesis as gs
 from genesis.utils import spatial_selection as su
-
 
 DEFAULT_BOX_EE_SPEED = 0.6
 DEFAULT_MAX_DISTANCE_SCALE = 1.0
@@ -334,7 +333,9 @@ class BoxEndEffectorController:
         self.env_idx = env_idx
         self.object_to_env = object_to_env
         self.world_to_env = world_to_env
-        self._force_limited_policy = copy.deepcopy(dict(force_limited_policy)) if force_limited_policy is not None else None
+        self._force_limited_policy = (
+            copy.deepcopy(dict(force_limited_policy)) if force_limited_policy is not None else None
+        )
         self._force_limited_telemetry: dict[str, object] | None = None
         self._state = BoxEndEffectorState(
             controller_id=controller_id,
@@ -851,5 +852,6 @@ class BoxEndEffectorController:
             distance_scale=self._state.distance_scale,
             active=False,
             optional=self._state.optional,
+            **self._state_policy_fields(),
         )
         return self._state

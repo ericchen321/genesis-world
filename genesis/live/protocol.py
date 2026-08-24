@@ -6,11 +6,11 @@ import struct
 from dataclasses import dataclass
 from typing import Any
 
-
 PROTOCOL = "genesis-live-v1"
 HEADER_STRUCT = struct.Struct(">I")
 MAX_MESSAGE_BYTES = 64 * 1024 * 1024
 ANCHOR_RELATIVE_PROBE_MEASUREMENT_CAPABILITY = "anchor_relative_probe_measurement_telemetry"
+FIXED_RGB_VIEW_CAPABILITY = "fixed_rgb_view_telemetry"
 
 BASE_CAPABILITIES = (
     "pause_resume_reset",
@@ -19,6 +19,7 @@ BASE_CAPABILITIES = (
     "visual_overlay_depth_normal_triptych_telemetry",
     "visual_overlay_vertex_trace",
     "part_segmentation_triptych_telemetry",
+    FIXED_RGB_VIEW_CAPABILITY,
     "frame_metadata",
     "geometry_context",
     "fused_observation",
