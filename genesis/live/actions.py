@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import hashlib
+import json
+import math
 from typing import Any
 
 import genesis as gs
@@ -23,6 +26,8 @@ BOX_EE_COMPLIANCE_OVERRIDE_KEYS = frozenset(
     }
 )
 BOX_EE_DIRECTION_ALIAS_KEYS = frozenset({"direction", "direction_vector", "motion_vector", "axis_vector", "vector"})
+BOX_EE_FORCE_LIMITED_MODE = "native_fem_force_limited_box_ee/v1"
+BOX_EE_FORCE_LIMITED_CAPABILITY = "native_fem_force_limited_box_ee"
 
 
 class ActionRegistry:
@@ -95,6 +100,41 @@ def _box_ee_compliant_policy(entity) -> tuple[bool, float]:
     return True, BOX_EE_NATIVE_FEM_COMPLIANT_STIFFNESS
 
 
+def _force_limited_policy(session, entity) -> dict[str, object] | None:
+    policy = getattr(session, "_scene_config", {}).get("box_ee_controller_policy")
+    if policy is None:
+        return None
+    required = {"mode", "policy_id", "total_stiffness_n_per_m", "max_net_spring_force_n"}
+    if not isinstance(policy, dict) or set(policy) != required:
+        raise GenesisLiveError("invalid_controller_policy", "box_ee_controller_policy has unexpected fields")
+    if policy["mode"] != BOX_EE_FORCE_LIMITED_MODE or not isinstance(policy["policy_id"], str) or not policy["policy_id"]:
+        raise GenesisLiveError("invalid_controller_policy", "box_ee_controller_policy identity is invalid")
+    for key in ("total_stiffness_n_per_m", "max_net_spring_force_n"):
+        value = policy[key]
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)) or value <= 0:
+            raise GenesisLiveError("invalid_controller_policy", f"box_ee_controller_policy.{key} must be finite and > 0")
+    from genesis.engine.couplers import IPCCoupler
+
+    if isinstance(entity.sim.coupler, IPCCoupler):
+        raise GenesisLiveError("unsupported_controller_policy", "force-limited BoxEE currently supports native FEM only")
+    normalized = {
+        "mode": policy["mode"],
+        "policy_id": policy["policy_id"],
+        "total_stiffness_n_per_m": float(policy["total_stiffness_n_per_m"]),
+        "max_net_spring_force_n": float(policy["max_net_spring_force_n"]),
+    }
+    canonical = json.dumps(normalized, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    return {
+        **normalized,
+        "policy_hash": hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
+        "force_scope": {
+            "quantity": "net_spring_force",
+            "formula": "||sum_i f_i||",
+            "excludes": ["sum_of_magnitudes", "stress", "torque", "contact_force", "internal_force"],
+        },
+    }
+
+
 def apply_probe_action(session, params: dict[str, Any]) -> dict[str, Any]:
     action = params.get("action")
     if action is None and params.get("action_id"):
@@ -130,9 +170,16 @@ def apply_probe_action(session, params: dict[str, Any]) -> dict[str, Any]:
             ),
         )
 
-        controller = BoxEndEffectorController(entity, controller_id=controller_id)
+        force_limited_policy = _force_limited_policy(session, entity)
+        controller = BoxEndEffectorController(
+            entity,
+            controller_id=controller_id,
+            force_limited_policy=force_limited_policy,
+        )
         frame = aabb_box.get("frame", "env_local") if isinstance(aabb_box, dict) else "env_local"
         is_soft_constraint, compliance_value = _box_ee_compliant_policy(entity)
+        if force_limited_policy is not None:
+            compliance_value = float(force_limited_policy["total_stiffness_n_per_m"])
         try:
             state = controller.grasp_and_move_cardinal_axis(
                 aabb_box,

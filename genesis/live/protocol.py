@@ -38,6 +38,7 @@ DIAGNOSTIC_BASE_CAPABILITIES = tuple(
 )
 
 VOLUMETRIC_CAPABILITIES = (
+    "native_fem_force_limited_box_ee",
     "volumetric_mesh_import",
     "heterogeneous_fem_material_arrays",
     "static_box_anchors",

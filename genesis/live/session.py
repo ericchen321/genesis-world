@@ -843,7 +843,7 @@ class GenesisLiveSession:
         try:
             for local_step_index in range(steps):
                 for controller in list(self.controllers.values()):
-                    controller.advance_motion(steps=1)
+                    controller.prepare_step()
                 self.scene.step()
                 self.current_step += 1
                 self._validate_fem_state(checked_at="after_step")
