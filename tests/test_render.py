@@ -2223,6 +2223,59 @@ def test_camera_render_honors_resolution_with_viewer(renderer):
 
 @pytest.mark.required
 @pytest.mark.parametrize("renderer_type", [RENDERER_TYPE.RASTERIZER])
+def test_custom_vverts_env_separate(renderer):
+    camera_res = (160, 120)
+    mesh = trimesh.creation.box(extents=(0.3, 0.3, 0.3))
+
+    scene = gs.Scene(
+        renderer=renderer,
+        vis_options=gs.options.VisOptions(
+            rendered_envs_idx=(0, 1),
+            env_separate_rigid=True,
+            shadow=False,
+            segmentation_level="entity",
+        ),
+        show_viewer=False,
+        show_FPS=False,
+    )
+    entity = scene.add_entity(
+        morph=gs.morphs.MeshSet(
+            files=(mesh,),
+            fixed=True,
+            enable_custom_vverts=True,
+        ),
+        material=gs.materials.Kinematic(),
+    )
+    camera = scene.add_camera(
+        res=camera_res,
+        pos=(0.0, -2.0, 0.0),
+        lookat=(0.0, 0.0, 0.0),
+        fov=45.0,
+        GUI=False,
+    )
+    scene.build(n_envs=2, env_spacing=(0.0, 0.0))
+
+    template = tensor_to_array(entity.get_vverts())[0]
+    offsets = np.asarray(((-0.55, 0.0, 0.0), (0.55, 0.0, 0.0)), dtype=gs.np_float)
+    entity.set_vverts(template[None, :, :] + offsets[:, None, :])
+
+    rgb, _, segmentation, _ = camera.render(rgb=True, segmentation=True, force_render=True)
+    rgb = tensor_to_array(rgb)
+    segmentation = tensor_to_array(segmentation)
+    masks = segmentation > 0
+
+    assert rgb.shape[0] == 2
+    assert segmentation.shape[0] == 2
+    assert masks[0].any()
+    assert masks[1].any()
+    width = segmentation.shape[-1]
+    assert np.all(np.where(masks[0])[1] < width // 2)
+    assert np.all(np.where(masks[1])[1] >= width // 2)
+    assert (rgb[0] != rgb[1]).any()
+
+
+@pytest.mark.required
+@pytest.mark.parametrize("renderer_type", [RENDERER_TYPE.RASTERIZER])
 def test_set_vverts(renderer, show_viewer):
     scene = gs.Scene(
         renderer=renderer,

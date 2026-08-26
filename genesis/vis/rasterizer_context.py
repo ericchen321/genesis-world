@@ -561,6 +561,8 @@ class RasterizerContext:
                             vverts = qd_to_numpy(solver.vverts_state.pos, self.rendered_envs_idx, transpose=True)
                             envs_offset = self.scene.envs_offset
                             custom_offset = entity._custom_vvert_start - entity._vvert_start
+                            n_rendered_envs = len(self.rendered_envs_idx)
+                            identity_poses = np.tile(np.eye(4, dtype=np.float32), (n_rendered_envs, 1, 1))
                             for geom in entity.vgeoms:
                                 old_node = self.rigid_nodes.pop(geom.uid, None)
                                 if old_node is not None:
@@ -575,14 +577,19 @@ class RasterizerContext:
                                 v_start = geom.vvert_start + custom_offset
                                 v_end = geom.vvert_end + custom_offset
                                 for i_b in geom_envs_idx:
+                                    env_i = self.rendered_envs_idx.index(i_b)
+                                    active_envs = np.zeros(n_rendered_envs, dtype=bool)
+                                    active_envs[env_i] = True
                                     node = self.add_node(
                                         pyrender.Mesh.from_trimesh(
                                             mesh=mesh,
+                                            poses=identity_poses,
                                             smooth=geom.surface.smooth,
                                             double_sided=geom.surface.double_sided,
+                                            env_shared=False,
+                                            active_envs=active_envs,
                                         ),
                                     )
-                                    env_i = self.rendered_envs_idx.index(i_b)
                                     geom_vverts = vverts[env_i, v_start:v_end, :] + envs_offset[i_b]
                                     node.mesh.primitives[0].positions = self._scene.reorder_vertices(
                                         node, geom_vverts.astype(np.float32)
