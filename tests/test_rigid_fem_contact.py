@@ -2,6 +2,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 import numpy as np
 import pytest
+import torch
 import genesis as gs
 from genesis.engine.couplers.sap_coupler import (
     _build_rigid_fem_face_whitelist,
@@ -304,3 +305,88 @@ def test_enabled_scene_exports_nonempty_deterministic_last_substep_batch(show_vi
     scene.reset()
     with pytest.raises(gs.RigidFEMContactNotReadyError):
         scene.get_rigid_fem_contacts()
+
+
+@pytest.mark.required
+@pytest.mark.parametrize("precision", ["64"])
+def test_rigid_fem_sap_mu_uses_per_environment_link_friction_ratio(show_viewer, precision):
+    fem_mu = 0.4
+    coup_friction = 0.6
+    ratio_by_env = np.asarray([0.5, 1.0, 2.0, 4.0], dtype=np.float64)
+    scene = gs.Scene(
+        sim_options=gs.options.SimOptions(dt=1e-3, substeps=1, gravity=(0.0, 0.0, 0.0)),
+        fem_options=gs.options.FEMOptions(use_implicit_solver=True),
+        coupler_options=gs.options.SAPCouplerOptions(
+            enable_rigid_fem_contact=True,
+            fem_floor_contact_type="none",
+            rigid_floor_contact_type="none",
+            rigid_rigid_contact_type="none",
+        ),
+        show_viewer=show_viewer,
+    )
+    rigid = scene.add_entity(
+        morph=gs.morphs.Box(pos=(0.0, 0.0, -0.05), size=(0.12, 0.10, 0.10), fixed=False),
+        material=gs.materials.Rigid(
+            enable_coup_collision=True,
+            coup_collision_links=None,
+            coup_friction=coup_friction,
+        ),
+        name="coupled_rigid",
+    )
+    fem = scene.add_entity(
+        morph=gs.morphs.Box(pos=(0.0, 0.0, 0.01), size=(0.03, 0.03, 0.03)),
+        material=gs.materials.FEM.Elastic(model="linear_corotated", friction_mu=fem_mu),
+        name="soft",
+    )
+    scene.build(n_envs=4)
+
+    rigid_link = rigid.links[0]
+    link_idx_local = rigid_link.idx - rigid.link_start
+    geom_indices = tuple(geom.idx for geom in rigid_link.geoms)
+    assert geom_indices
+    envs_idx = np.arange(4, dtype=np.int64)
+    initial_ratios = rigid._solver.get_geoms_friction_ratio(geom_indices, envs_idx=envs_idx)
+    np.testing.assert_allclose(
+        initial_ratios.detach().cpu().numpy(),
+        np.ones((4, len(geom_indices)), dtype=np.float64),
+        rtol=0.0,
+        atol=0.0,
+    )
+
+    rigid.set_friction_ratio(
+        torch.as_tensor(ratio_by_env[:, None], dtype=gs.tc_float, device=gs.device),
+        links_idx_local=(link_idx_local,),
+        envs_idx=envs_idx,
+    )
+    updated_ratios = rigid._solver.get_geoms_friction_ratio(geom_indices, envs_idx=envs_idx)
+    np.testing.assert_allclose(
+        updated_ratios.detach().cpu().numpy(),
+        np.repeat(ratio_by_env[:, None], len(geom_indices), axis=1),
+        rtol=0.0,
+        atol=0.0,
+    )
+
+    for completed_step in range(40):
+        scene.step(update_visualizer=False)
+        handler = scene.sim.coupler.rigid_fem_contact
+        n_contacts = int(handler.n_contact_pairs[None])
+        batch_idx = np.asarray(handler.contact_pairs.batch_idx.to_numpy(), dtype=np.int64)[:n_contacts]
+        if set(batch_idx.tolist()) == set(range(4)):
+            break
+    else:
+        raise AssertionError("the B=4 fixture must produce rigid-FEM contact pairs in every environment")
+
+    rigid_geom_idx = np.asarray(handler.contact_pairs.rigid_geom_idx.to_numpy(), dtype=np.int64)[:n_contacts]
+    sap_mu = np.asarray(handler.contact_pairs.sap_info.mu.to_numpy(), dtype=np.float64)[:n_contacts]
+    assert set(rigid_geom_idx.tolist()).issubset(set(geom_indices))
+    expected_mu = np.sqrt(fem_mu * coup_friction * ratio_by_env[batch_idx])
+    np.testing.assert_allclose(sap_mu, expected_mu, rtol=1e-10, atol=1e-12)
+    for env_idx, ratio in enumerate(ratio_by_env):
+        env_mu = sap_mu[batch_idx == env_idx]
+        assert len(env_mu) > 0
+        np.testing.assert_allclose(
+            env_mu,
+            np.full_like(env_mu, np.sqrt(fem_mu * coup_friction * ratio)),
+            rtol=1e-10,
+            atol=1e-12,
+        )

@@ -428,6 +428,11 @@ class SAPCoupler(RBC):
             gs.raise_exception(
                 "development direct-replay finger contact flags require SAP rigid--FEM contact"
             )
+        self._contact_handlers_without_rigid_fem = (
+            tuple(self.contact_handlers[:-1])
+            if self._enable_rigid_fem_contact
+            else tuple(self.contact_handlers)
+        )
 
         self._init_bvh()
         if init_tet_tables:
@@ -758,6 +763,7 @@ class SAPCoupler(RBC):
             free_verts_state=self.rigid_solver.free_verts_state,
             fixed_verts_state=self.rigid_solver.fixed_verts_state,
             geoms_info=self.rigid_solver.geoms_info,
+            friction_ratio=self.rigid_solver.geoms_state.friction_ratio,
             dofs_state=self.rigid_solver.dofs_state,
             links_state=self.rigid_solver.links_state,
         )
@@ -809,12 +815,13 @@ class SAPCoupler(RBC):
         free_verts_state: array_class.VertsState,
         fixed_verts_state: array_class.VertsState,
         geoms_info: array_class.GeomsInfo,
+        friction_ratio: qd.Tensor,
         dofs_state: array_class.DofsState,
         links_state: array_class.LinksState,
     ) -> tuple[bool, bool]:
         has_contact = False
         overflow = False
-        for contact in qd.static(self.contact_handlers):
+        for contact in qd.static(self._contact_handlers_without_rigid_fem):
             overflow |= contact.detection(
                 i_step,
                 links_info=links_info,
@@ -826,6 +833,23 @@ class SAPCoupler(RBC):
             )
             has_contact |= contact.n_contact_pairs[None] > 0
             contact.compute_jacobian(
+                links_info=links_info,
+                dofs_state=dofs_state,
+                links_state=links_state,
+            )
+        if qd.static(self._enable_rigid_fem_contact):
+            overflow |= self.rigid_fem_contact.detection(
+                i_step,
+                links_info=links_info,
+                verts_info=verts_info,
+                faces_info=faces_info,
+                free_verts_state=free_verts_state,
+                fixed_verts_state=fixed_verts_state,
+                geoms_info=geoms_info,
+                friction_ratio=friction_ratio,
+            )
+            has_contact |= self.rigid_fem_contact.n_contact_pairs[None] > 0
+            self.rigid_fem_contact.compute_jacobian(
                 links_info=links_info,
                 dofs_state=dofs_state,
                 links_state=links_state,
@@ -4366,6 +4390,7 @@ class RigidFemTriTetContactHandler(RigidFEMContactHandler):
         f: qd.i32,
         verts_info: array_class.VertsInfo,
         geoms_info: array_class.GeomsInfo,
+        friction_ratio: qd.Tensor,
         free_verts_state: array_class.VertsState,
         fixed_verts_state: array_class.VertsState,
     ):
@@ -4481,7 +4506,11 @@ class RigidFemTriTetContactHandler(RigidFEMContactHandler):
                 self.contact_pairs[i_p].contact_pos = centroid
                 sap_info[i_p].k = rigid_k
                 sap_info[i_p].phi0 = rigid_phi0
-                sap_info[i_p].mu = qd.sqrt(self.fem_solver.elements_i[i_e].friction_mu * geoms_info.coup_friction[i_g])
+                sap_info[i_p].mu = qd.sqrt(
+                    self.fem_solver.elements_i[i_e].friction_mu
+                    * geoms_info.coup_friction[i_g]
+                    * friction_ratio[i_g, i_b]
+                )
             else:
                 overflow = True
 
@@ -4513,11 +4542,19 @@ class RigidFemTriTetContactHandler(RigidFEMContactHandler):
         free_verts_state: array_class.VertsState,
         fixed_verts_state: array_class.VertsState,
         geoms_info: array_class.GeomsInfo,
+        friction_ratio: qd.Tensor,
     ):
         overflow = False
         overflow |= self.coupler.rigid_tri_bvh.query(self.coupler.fem_surface_tet_aabb.aabbs)
         overflow |= self.compute_candidates(f, faces_info, verts_info, free_verts_state, fixed_verts_state)
-        overflow |= self.compute_pairs(f, verts_info, geoms_info, free_verts_state, fixed_verts_state)
+        overflow |= self.compute_pairs(
+            f,
+            verts_info,
+            geoms_info,
+            friction_ratio,
+            free_verts_state,
+            fixed_verts_state,
+        )
         return overflow
 
     @qd.func
