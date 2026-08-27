@@ -868,6 +868,10 @@ class FEMOptions(Options):
         Rayleigh Damping factor for the implicit solver. Defaults to 0.5. Only used when `use_implicit_solver` is True.
     damping_beta : float, optional
         Rayleigh Damping factor for the implicit solver. Defaults to 5e-4. Only used when `use_implicit_solver` is True.
+    enable_rigid_mode_deflation : bool, optional
+        Whether the implicit solver augments the per-vertex 3x3 block-Jacobi
+        preconditioner with six rigid modes per volumetric FEM entity.
+        Defaults to False. Only used when `use_implicit_solver` is True.
     enable_vertex_constraints : bool, optional
         Whether to enable vertex constraints. Defaults to False.
     enable_qualification_safety_extrema : bool, optional
@@ -903,6 +907,7 @@ class FEMOptions(Options):
     linesearch_tau: PositiveFloat = 0.5
     damping_alpha: NonNegativeFloat = 0.5
     damping_beta: NonNegativeFloat = 5e-4
+    enable_rigid_mode_deflation: StrictBool = False
     enable_vertex_constraints: StrictBool = False
     enable_qualification_safety_extrema: StrictBool = False
     enable_development_implicit_fem_positive_j_feasible_step: StrictBool = False

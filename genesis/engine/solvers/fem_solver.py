@@ -208,6 +208,7 @@ class FEMSolver(Solver):
         self._linesearch_tau = options.linesearch_tau
         self._damping_alpha = options.damping_alpha
         self._damping_beta = options.damping_beta
+        self._enable_rigid_mode_deflation = options.enable_rigid_mode_deflation
         self._enable_vertex_constraints = options.enable_vertex_constraints
         self._enable_qualification_safety_extrema = options.enable_qualification_safety_extrema
         self._enable_development_implicit_fem_positive_j_feasible_step = (
@@ -454,6 +455,59 @@ class FEMSolver(Solver):
         # UV coordinates for rendering (per-vertex UVs, initialized to zeros)
         self.surface_render_uvs = qd.field(dtype=gs.qd_vec2, shape=(max(n_vertices_max, 1),), needs_grad=False)
 
+    def init_rigid_mode_fields(self):
+        """Allocate the fixed rigid basis and its enabled-only coarse fields."""
+        self._rigid_mode_component_count = len(self._entities)
+
+        component_by_vertex = np.empty(self.n_vertices, dtype=np.int32)
+        basis = np.zeros((self.n_vertices, 6, 3), dtype=gs.np_float)
+        rest_positions = np.zeros((self.n_vertices, 3), dtype=gs.np_float)
+        for entity in self._entities:
+            rest_positions[entity.v_start : entity.v_start + entity.n_vertices] = tensor_to_array(
+                entity.init_positions, dtype=gs.np_float
+            )
+
+        masses = np.asarray(self.elements_v_info.mass.to_numpy(), dtype=gs.np_float)
+        for component, entity in enumerate(self._entities):
+            vertex_slice = slice(entity.v_start, entity.v_start + entity.n_vertices)
+            component_by_vertex[vertex_slice] = component
+            entity_positions = rest_positions[vertex_slice]
+            entity_masses = masses[vertex_slice]
+            total_mass = entity_masses.sum()
+            center = np.sum(entity_positions * entity_masses[:, None], axis=0) / total_mass
+            relative = entity_positions - center
+            basis[vertex_slice, 0, 0] = 1.0
+            basis[vertex_slice, 1, 1] = 1.0
+            basis[vertex_slice, 2, 2] = 1.0
+            basis[vertex_slice, 3] = np.cross(np.asarray((1.0, 0.0, 0.0)), relative)
+            basis[vertex_slice, 4] = np.cross(np.asarray((0.0, 1.0, 0.0)), relative)
+            basis[vertex_slice, 5] = np.cross(np.asarray((0.0, 0.0, 1.0)), relative)
+
+        self.rigid_mode_component_by_vertex = qd.field(
+            dtype=gs.qd_int, shape=(self.n_vertices,), needs_grad=False
+        )
+        self.rigid_mode_component_by_vertex.from_numpy(component_by_vertex)
+        self.rigid_mode_basis = qd.field(dtype=gs.qd_vec3, shape=(self.n_vertices, 6), needs_grad=False)
+        self.rigid_mode_basis.from_numpy(basis)
+
+        rigid_mode_vec6 = qd.types.vector(6, gs.qd_float)
+        rigid_mode_mat6 = qd.types.matrix(6, 6, gs.qd_float)
+        self.rigid_mode_A_basis = qd.field(
+            dtype=gs.qd_vec3, shape=(self._B, self.n_vertices, 6), needs_grad=False
+        )
+        self.rigid_mode_coarse_matrix = qd.field(
+            dtype=rigid_mode_mat6, shape=(self._B, self._rigid_mode_component_count), needs_grad=False
+        )
+        self.rigid_mode_coarse_inverse = qd.field(
+            dtype=rigid_mode_mat6, shape=(self._B, self._rigid_mode_component_count), needs_grad=False
+        )
+        self.rigid_mode_coarse_rhs = qd.field(
+            dtype=rigid_mode_vec6, shape=(self._B, self._rigid_mode_component_count), needs_grad=False
+        )
+        self.rigid_mode_coarse_coeff = qd.field(
+            dtype=rigid_mode_vec6, shape=(self._B, self._rigid_mode_component_count), needs_grad=False
+        )
+
     def _init_surface_info(self):
         self.vertices_on_surface = qd.field(dtype=gs.qd_bool, shape=(self.n_vertices,))
         self.elements_on_surface = qd.field(dtype=gs.qd_bool, shape=(self.n_elements,))
@@ -565,6 +619,9 @@ class FEMSolver(Solver):
 
             for entity in self._entities:
                 entity._add_to_solver()
+
+            if self._use_implicit_solver and self._enable_rigid_mode_deflation:
+                self.init_rigid_mode_fields()
 
         for mat in self._mats:
             mat.build(self)
@@ -987,6 +1044,95 @@ class FEMSolver(Solver):
             #                                            [0, 0, 1 / self.pcg_state_v[i_b, i_v].diag3x3[2, 2]]])
 
     @qd.func
+    def _func_rigid_mode_basis(self, i_b: qd.i32, i_v: qd.i32, i_mode: qd.i32):
+        basis = self.rigid_mode_basis[i_v, i_mode]
+        if qd.static(self._enable_vertex_constraints):
+            vc = self.vertex_constraints[i_v, i_b]
+            if vc.is_constrained and not vc.is_soft_constraint:
+                basis = qd.Vector.zero(gs.qd_float, 3)
+        return basis
+
+    @qd.kernel
+    def _init_rigid_mode_A_basis_and_coarse_matrix(self):
+        damping_alpha_dt = self._damping_alpha * self._substep_dt
+        damping_alpha_factor = damping_alpha_dt + 1.0
+        for i_b, i_v, i_mode in qd.ndrange(self._B, self.n_vertices, 6):
+            if not self.batch_active[i_b]:
+                continue
+            basis = self._func_rigid_mode_basis(i_b, i_v, i_mode)
+            self.rigid_mode_A_basis[i_b, i_v, i_mode] = (
+                self.elements_v_info[i_v].mass_over_dt2 * damping_alpha_factor * basis
+            )
+            if qd.static(self._enable_vertex_constraints):
+                vc = self.vertex_constraints[i_v, i_b]
+                if vc.is_constrained and vc.is_soft_constraint:
+                    self.rigid_mode_A_basis[i_b, i_v, i_mode] += vc.stiffness * basis
+
+        for i_b, i_c in qd.ndrange(self._B, self._rigid_mode_component_count):
+            self.rigid_mode_coarse_matrix[i_b, i_c] = qd.Matrix.zero(gs.qd_float, 6, 6)
+
+    @qd.kernel
+    def _accumulate_rigid_mode_elastic_A_basis(self):
+        damping_beta_over_dt = self._damping_beta / self._substep_dt
+        damping_beta_factor = damping_beta_over_dt + 1.0
+        for i_b, i_e in qd.ndrange(self._B, self.n_elements):
+            if not self.batch_active[i_b]:
+                continue
+            V = self.elements_i[i_e].V
+            B = self.elements_i[i_e].B
+            i_vs = self.elements_i[i_e].el2v
+            S = self._func_compute_element_mapping_matrix(i_vs, B, i_b)
+
+            for i_mode in qd.static(range(6)):
+                p9 = qd.Vector([0.0] * 9, dt=gs.qd_float)
+                for i, j in qd.static(qd.ndrange(3, 4)):
+                    p9[i * 3 : i * 3 + 3] = (
+                        p9[i * 3 : i * 3 + 3]
+                        + S[j, i] * self._func_rigid_mode_basis(i_b, i_vs[j], i_mode)
+                    )
+
+                new_p9 = qd.Vector([0.0] * 9, dt=gs.qd_float)
+                for i, j in qd.static(qd.ndrange(3, 3)):
+                    new_p9[i * 3 : i * 3 + 3] = (
+                        new_p9[i * 3 : i * 3 + 3]
+                        + self.elements_el_hessian[i_b, i, j, i_e] @ p9[j * 3 : j * 3 + 3]
+                    )
+
+                for i in qd.static(range(4)):
+                    contribution = (
+                        S[i, 0] * new_p9[0:3]
+                        + S[i, 1] * new_p9[3:6]
+                        + S[i, 2] * new_p9[6:9]
+                    ) * V * damping_beta_factor
+                    for j in qd.static(range(3)):
+                        qd.atomic_add(self.rigid_mode_A_basis[i_b, i_vs[i], i_mode][j], contribution[j])
+
+    @qd.kernel
+    def _reduce_rigid_mode_coarse_matrix(self):
+        for i_b, i_v in qd.ndrange(self._B, self.n_vertices):
+            if not self.batch_active[i_b]:
+                continue
+            i_c = self.rigid_mode_component_by_vertex[i_v]
+            for i_row in qd.static(range(6)):
+                basis = self._func_rigid_mode_basis(i_b, i_v, i_row)
+                for i_col in qd.static(range(6)):
+                    qd.atomic_add(
+                        self.rigid_mode_coarse_matrix[i_b, i_c][i_row, i_col],
+                        basis.dot(self.rigid_mode_A_basis[i_b, i_v, i_col]),
+                    )
+
+    @qd.kernel
+    def _invert_rigid_mode_coarse_matrix(self):
+        for i_b, i_c in qd.ndrange(self._B, self._rigid_mode_component_count):
+            self.rigid_mode_coarse_inverse[i_b, i_c] = self.rigid_mode_coarse_matrix[i_b, i_c].inverse()
+
+    def _prepare_rigid_mode_coarse_operator(self):
+        self._init_rigid_mode_A_basis_and_coarse_matrix()
+        self._accumulate_rigid_mode_elastic_A_basis()
+        self._reduce_rigid_mode_coarse_matrix()
+        self._invert_rigid_mode_coarse_matrix()
+
+    @qd.func
     def compute_Ap(self):
         damping_alpha_dt = self._damping_alpha * self._substep_dt
         damping_alpha_factor = damping_alpha_dt + 1.0
@@ -1148,10 +1294,211 @@ class FEMSolver(Solver):
                 self.pcg_state_v[i_b, i_v].z + self.pcg_state[i_b].beta * self.pcg_state_v[i_b, i_v].p
             )
 
+    @qd.kernel
+    def _init_pcg_solve_rigid_mode(self):
+        for i_b in range(self._B):
+            self.batch_pcg_active[i_b] = self.batch_active[i_b]
+            if not self.batch_pcg_active[i_b]:
+                continue
+            self.pcg_state[i_b].rTr = 0.0
+            self.pcg_state[i_b].rTr_initial = 0.0
+            self.pcg_state[i_b].termination_threshold = self._pcg_threshold
+            self.pcg_state[i_b].rTz = 0.0
+        for i_b, i_v in qd.ndrange(self._B, self.n_vertices):
+            if not self.batch_pcg_active[i_b]:
+                continue
+            self.pcg_state_v[i_b, i_v].x = 0
+            self.pcg_state_v[i_b, i_v].r = self.elements_v_energy[i_b, i_v].force
+
+    @qd.kernel
+    def _apply_rigid_mode_block_preconditioner(self):
+        for i_b, i_c in qd.ndrange(self._B, self._rigid_mode_component_count):
+            self.rigid_mode_coarse_rhs[i_b, i_c] = qd.Vector.zero(gs.qd_float, 6)
+        for i_b, i_v in qd.ndrange(self._B, self.n_vertices):
+            if not self.batch_pcg_active[i_b]:
+                continue
+            self.pcg_state_v[i_b, i_v].z = self.pcg_state_v[i_b, i_v].prec @ self.pcg_state_v[i_b, i_v].r
+
+    @qd.kernel
+    def _accumulate_rigid_mode_rhs(self):
+        for i_b, i_v in qd.ndrange(self._B, self.n_vertices):
+            if not self.batch_pcg_active[i_b]:
+                continue
+            i_c = self.rigid_mode_component_by_vertex[i_v]
+            for i_mode in qd.static(range(6)):
+                qd.atomic_add(
+                    self.rigid_mode_coarse_rhs[i_b, i_c][i_mode],
+                    self._func_rigid_mode_basis(i_b, i_v, i_mode).dot(self.pcg_state_v[i_b, i_v].r),
+                )
+
+    @qd.kernel
+    def _solve_rigid_mode_coarse_rhs(self):
+        for i_b, i_c in qd.ndrange(self._B, self._rigid_mode_component_count):
+            self.rigid_mode_coarse_coeff[i_b, i_c] = (
+                self.rigid_mode_coarse_inverse[i_b, i_c] @ self.rigid_mode_coarse_rhs[i_b, i_c]
+            )
+
+    @qd.kernel
+    def _add_rigid_mode_correction(self):
+        for i_b, i_v in qd.ndrange(self._B, self.n_vertices):
+            if not self.batch_pcg_active[i_b]:
+                continue
+            i_c = self.rigid_mode_component_by_vertex[i_v]
+            correction = qd.Vector.zero(gs.qd_float, 3)
+            for i_mode in qd.static(range(6)):
+                correction += self._func_rigid_mode_basis(i_b, i_v, i_mode) * self.rigid_mode_coarse_coeff[
+                    i_b, i_c
+                ][i_mode]
+            self.pcg_state_v[i_b, i_v].z += correction
+
+    def _apply_rigid_mode_preconditioner(self):
+        self._apply_rigid_mode_block_preconditioner()
+        self._accumulate_rigid_mode_rhs()
+        self._solve_rigid_mode_coarse_rhs()
+        self._add_rigid_mode_correction()
+
+    @qd.kernel
+    def _finish_init_pcg_solve_rigid_mode(self):
+        for i_b in range(self._B):
+            if not self.batch_pcg_active[i_b]:
+                continue
+            self.pcg_state[i_b].rTr = 0.0
+            self.pcg_state[i_b].rTz = 0.0
+        for i_b, i_v in qd.ndrange(self._B, self.n_vertices):
+            if not self.batch_pcg_active[i_b]:
+                continue
+            qd.atomic_add(self.pcg_state[i_b].rTr, self.pcg_state_v[i_b, i_v].r.dot(self.pcg_state_v[i_b, i_v].r))
+            qd.atomic_add(self.pcg_state[i_b].rTz, self.pcg_state_v[i_b, i_v].r.dot(self.pcg_state_v[i_b, i_v].z))
+        for i_b in range(self._B):
+            if not self.batch_pcg_active[i_b]:
+                continue
+            self.pcg_state[i_b].rTr_initial = self.pcg_state[i_b].rTr
+            self.pcg_state[i_b].termination_threshold = qd.max(
+                self._pcg_threshold,
+                self.pcg_state[i_b].rTr_initial * self._pcg_rtol * self._pcg_rtol,
+            )
+            valid = (
+                self.pcg_state[i_b].rTr >= 0.0
+                and not qd.math.isnan(self.pcg_state[i_b].rTr)
+                and not qd.math.isinf(self.pcg_state[i_b].rTr)
+                and self.pcg_state[i_b].termination_threshold >= 0.0
+                and not qd.math.isnan(self.pcg_state[i_b].termination_threshold)
+                and not qd.math.isinf(self.pcg_state[i_b].termination_threshold)
+            )
+            if not valid:
+                self.batch_pcg_breakdown[i_b] = True
+                self.batch_pcg_active[i_b] = False
+            else:
+                self.batch_pcg_active[i_b] = self.pcg_state[i_b].rTr > self.pcg_state[i_b].termination_threshold
+        for i_b, i_v in qd.ndrange(self._B, self.n_vertices):
+            if not self.batch_pcg_active[i_b]:
+                continue
+            self.pcg_state_v[i_b, i_v].p = self.pcg_state_v[i_b, i_v].z
+
+    @qd.kernel
+    def _rigid_mode_compute_Ap_and_pTAp(self):
+        self.compute_Ap()
+        for i_b in range(self._B):
+            if not self.batch_pcg_active[i_b]:
+                continue
+            self.pcg_state[i_b].pTAp = 0.0
+        for i_b, i_v in qd.ndrange(self._B, self.n_vertices):
+            if not self.batch_pcg_active[i_b]:
+                continue
+            qd.atomic_add(self.pcg_state[i_b].pTAp, self.pcg_state_v[i_b, i_v].p.dot(self.pcg_state_v[i_b, i_v].Ap))
+
+    @qd.kernel
+    def _rigid_mode_update_x_r(self):
+        for i_b in range(self._B):
+            if not self.batch_pcg_active[i_b]:
+                continue
+            valid = (
+                self.pcg_state[i_b].rTz > 0.0
+                and self.pcg_state[i_b].pTAp > 0.0
+                and not qd.math.isnan(self.pcg_state[i_b].rTz)
+                and not qd.math.isinf(self.pcg_state[i_b].rTz)
+                and not qd.math.isnan(self.pcg_state[i_b].pTAp)
+                and not qd.math.isinf(self.pcg_state[i_b].pTAp)
+            )
+            if not valid:
+                self.batch_pcg_breakdown[i_b] = True
+                self.batch_pcg_active[i_b] = False
+            else:
+                self.pcg_state[i_b].alpha = self.pcg_state[i_b].rTz / self.pcg_state[i_b].pTAp
+                self.pcg_state[i_b].rTr_new = 0.0
+                self.pcg_state[i_b].rTz_new = 0.0
+        for i_b, i_v in qd.ndrange(self._B, self.n_vertices):
+            if not self.batch_pcg_active[i_b]:
+                continue
+            self.pcg_state_v[i_b, i_v].x += self.pcg_state[i_b].alpha * self.pcg_state_v[i_b, i_v].p
+            self.pcg_state_v[i_b, i_v].r -= self.pcg_state[i_b].alpha * self.pcg_state_v[i_b, i_v].Ap
+
+    @qd.kernel
+    def _finish_rigid_mode_pcg_iter(self):
+        for i_b in range(self._B):
+            if not self.batch_pcg_active[i_b]:
+                continue
+            self.pcg_state[i_b].rTr_new = 0.0
+            self.pcg_state[i_b].rTz_new = 0.0
+        for i_b, i_v in qd.ndrange(self._B, self.n_vertices):
+            if not self.batch_pcg_active[i_b]:
+                continue
+            qd.atomic_add(self.pcg_state[i_b].rTr_new, self.pcg_state_v[i_b, i_v].r.dot(self.pcg_state_v[i_b, i_v].r))
+            qd.atomic_add(self.pcg_state[i_b].rTz_new, self.pcg_state_v[i_b, i_v].r.dot(self.pcg_state_v[i_b, i_v].z))
+
+        for i_b in range(self._B):
+            if not self.batch_pcg_active[i_b]:
+                continue
+            valid = (
+                self.pcg_state[i_b].rTr_new >= 0.0
+                and self.pcg_state[i_b].rTz_new >= 0.0
+                and not qd.math.isnan(self.pcg_state[i_b].rTr_new)
+                and not qd.math.isinf(self.pcg_state[i_b].rTr_new)
+                and not qd.math.isnan(self.pcg_state[i_b].rTz_new)
+                and not qd.math.isinf(self.pcg_state[i_b].rTz_new)
+            )
+            if not valid:
+                self.batch_pcg_breakdown[i_b] = True
+                self.batch_pcg_active[i_b] = False
+                self.pcg_state[i_b].rTr = self.pcg_state[i_b].rTr_new
+                self.pcg_state[i_b].rTz = self.pcg_state[i_b].rTz_new
+                continue
+            self.pcg_state[i_b].beta = self.pcg_state[i_b].rTz_new / self.pcg_state[i_b].rTz
+            self.pcg_state[i_b].rTr = self.pcg_state[i_b].rTr_new
+            self.pcg_state[i_b].rTz = self.pcg_state[i_b].rTz_new
+            if qd.math.isnan(self.pcg_state[i_b].beta) or qd.math.isinf(self.pcg_state[i_b].beta):
+                self.batch_pcg_breakdown[i_b] = True
+                self.batch_pcg_active[i_b] = False
+            else:
+                self.batch_pcg_active[i_b] = self.pcg_state[i_b].rTr > self.pcg_state[i_b].termination_threshold
+
+    @qd.kernel
+    def _update_rigid_mode_pcg_direction(self):
+        for i_b, i_v in qd.ndrange(self._B, self.n_vertices):
+            if not self.batch_pcg_active[i_b]:
+                continue
+            self.pcg_state_v[i_b, i_v].p = (
+                self.pcg_state_v[i_b, i_v].z + self.pcg_state[i_b].beta * self.pcg_state_v[i_b, i_v].p
+            )
+
+    def _one_rigid_mode_pcg_iter(self):
+        self._rigid_mode_compute_Ap_and_pTAp()
+        self._rigid_mode_update_x_r()
+        self._apply_rigid_mode_preconditioner()
+        self._finish_rigid_mode_pcg_iter()
+        self._update_rigid_mode_pcg_direction()
+
     def pcg_solve(self):
-        self.init_pcg_solve()
-        for i in range(self._n_pcg_iterations):
-            self.one_pcg_iter()
+        if self._enable_rigid_mode_deflation:
+            self._init_pcg_solve_rigid_mode()
+            self._apply_rigid_mode_preconditioner()
+            self._finish_init_pcg_solve_rigid_mode()
+            for i in range(self._n_pcg_iterations):
+                self._one_rigid_mode_pcg_iter()
+        else:
+            self.init_pcg_solve()
+            for i in range(self._n_pcg_iterations):
+                self.one_pcg_iter()
 
     @qd.kernel
     def init_linesearch(self, f: qd.i32):
@@ -1361,6 +1708,8 @@ class FEMSolver(Solver):
 
             # accumulate vertex force and preconditioner
             self.accumulate_vertex_force_preconditioner(f)
+            if self._enable_rigid_mode_deflation:
+                self._prepare_rigid_mode_coarse_operator()
 
             # solve for the vertex positions
             self.pcg_solve()

@@ -23,12 +23,54 @@ _TWO_TET_VERTS = np.array(
 )
 _TWO_TETS = np.array([[0, 1, 2, 3], [0, 2, 1, 4]], dtype=np.int64)
 
+_HETEROGENEOUS_CUBE_VERTS = np.array(
+    [
+        [0.0, 0.0, 0.0],
+        [1.0, 0.0, 0.0],
+        [1.0, 1.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [0.0, 0.0, 1.0],
+        [1.0, 0.0, 1.0],
+        [1.0, 1.0, 1.0],
+        [0.0, 1.0, 1.0],
+        [0.5, 0.5, 0.5],
+    ],
+    dtype=np.float64,
+)
+_HETEROGENEOUS_CUBE_TETS = np.array(
+    [
+        [3, 0, 2, 8],
+        [2, 0, 1, 8],
+        [5, 4, 6, 8],
+        [6, 4, 7, 8],
+        [1, 0, 5, 8],
+        [5, 0, 4, 8],
+        [7, 3, 6, 8],
+        [6, 3, 2, 8],
+        [4, 0, 7, 8],
+        [7, 0, 3, 8],
+        [2, 1, 6, 8],
+        [6, 1, 5, 8],
+    ],
+    dtype=np.int64,
+)
+
 
 def _write_two_tet_mesh(path):
     igl.writeMESH(str(path), _TWO_TET_VERTS, _TWO_TETS, np.empty((0, 3), dtype=np.int64))
 
 
-def _build_native_implicit_two_tet_scene(tmp_path, *, n_linesearch_iterations=0, n_envs=1):
+def _build_native_implicit_two_tet_scene(
+    tmp_path,
+    *,
+    n_linesearch_iterations=0,
+    n_envs=1,
+    enable_rigid_mode_deflation=False,
+    n_pcg_iterations=100,
+    pcg_rtol=0.0,
+    pcg_threshold=1.0e-6,
+    gravity=(0.0, 0.0, 0.0),
+):
     tmp_path.mkdir(parents=True, exist_ok=True)
     mesh_path = tmp_path / "two_tets.mesh"
     _write_two_tet_mesh(mesh_path)
@@ -37,16 +79,19 @@ def _build_native_implicit_two_tet_scene(tmp_path, *, n_linesearch_iterations=0,
         sim_options=gs.options.SimOptions(
             dt=0.05,
             substeps=1,
-            gravity=(0.0, 0.0, 0.0),
+            gravity=gravity,
         ),
         fem_options=gs.options.FEMOptions(
             enable_vertex_constraints=True,
             use_implicit_solver=True,
             n_newton_iterations=2,
-            n_pcg_iterations=100,
+            n_pcg_iterations=n_pcg_iterations,
             n_linesearch_iterations=n_linesearch_iterations,
             damping_alpha=0.0,
             damping_beta=0.0,
+            pcg_rtol=pcg_rtol,
+            pcg_threshold=pcg_threshold,
+            enable_rigid_mode_deflation=enable_rigid_mode_deflation,
         ),
         show_viewer=False,
         show_FPS=False,
@@ -86,6 +131,215 @@ def _native_constraint_slice(scene, entity):
         "is_soft_constraint": constraints.is_soft_constraint.to_numpy()[vertex_slice, 0],
         "stiffness": constraints.stiffness.to_numpy()[vertex_slice, 0],
     }
+
+
+def _native_implicit_pcg_metrics(scene):
+    pcg_state = scene.fem_solver.pcg_state
+    residual_squared = np.asarray(pcg_state.rTr.to_numpy(), dtype=np.float64)
+    initial_residual_squared = np.asarray(pcg_state.rTr_initial.to_numpy(), dtype=np.float64)
+    threshold = np.asarray(pcg_state.termination_threshold.to_numpy(), dtype=np.float64)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        relative_residual_norm = np.sqrt(residual_squared / initial_residual_squared)
+    return {
+        "residual_squared": residual_squared,
+        "initial_residual_squared": initial_residual_squared,
+        "threshold": threshold,
+        "relative_residual_norm": relative_residual_norm,
+    }
+
+
+def _write_heterogeneous_cube_mesh(path):
+    igl.writeMESH(
+        str(path),
+        _HETEROGENEOUS_CUBE_VERTS,
+        _HETEROGENEOUS_CUBE_TETS,
+        np.empty((0, 3), dtype=np.int64),
+    )
+
+
+def _build_native_implicit_heterogeneous_cube_scene(tmp_path, *, enable_rigid_mode_deflation, n_pcg_iterations=4):
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    mesh_path = tmp_path / "heterogeneous_cube.mesh"
+    _write_heterogeneous_cube_mesh(mesh_path)
+    material_path = tmp_path / "heterogeneous_material.npz"
+    np.savez(
+        material_path,
+        tet_E_nu=np.asarray([[1.0e2, 0.2]] * 6 + [[1.0e8, 0.2]] * 6, dtype=np.float64),
+        tet_density=np.full(12, 100.0, dtype=np.float64),
+    )
+
+    scene = gs.Scene(
+        sim_options=gs.options.SimOptions(
+            dt=0.05,
+            substeps=1,
+            gravity=(0.0, 0.0, -9.81),
+        ),
+        fem_options=gs.options.FEMOptions(
+            enable_floor=False,
+            use_implicit_solver=True,
+            n_newton_iterations=1,
+            n_pcg_iterations=n_pcg_iterations,
+            n_linesearch_iterations=0,
+            damping_alpha=0.0,
+            damping_beta=0.0,
+            enable_rigid_mode_deflation=enable_rigid_mode_deflation,
+        ),
+        coupler_options=gs.options.SAPCouplerOptions(
+            fem_floor_contact_type="none",
+            rigid_floor_contact_type="none",
+            enable_rigid_fem_contact=False,
+        ),
+        show_viewer=False,
+        show_FPS=False,
+    )
+    entity = scene.add_entity(
+        morph=gs.morphs.TetMesh(file=str(mesh_path), pos=(0.0, 0.0, 2.0)),
+        material=gs.materials.FEM.Elastic(
+            model="linear",
+            heterogeneous=gs.materials.FEM.HeterogeneousMaterial(file=str(material_path)),
+        ),
+    )
+    scene.build()
+    return scene, entity
+
+
+@pytest.mark.required
+@pytest.mark.parametrize("precision", ["64"])
+def test_rigid_mode_deflation_defaults_off(tmp_path):
+    options = gs.options.FEMOptions()
+    assert options.enable_rigid_mode_deflation is False
+
+    scene, entity = _build_native_implicit_two_tet_scene(tmp_path)
+    assert not hasattr(scene.fem_solver, "rigid_mode_coarse_matrix")
+    scene.step(update_visualizer=False)
+    assert np.isfinite(tensor_to_array(entity.get_state().pos)).all()
+
+
+@pytest.mark.required
+@pytest.mark.parametrize("precision", ["64"])
+def test_rigid_mode_deflation_converges_to_same_implicit_solution(tmp_path):
+    scenes = []
+    for enabled, directory in ((False, tmp_path / "baseline"), (True, tmp_path / "treatment")):
+        scene, entity = _build_native_implicit_two_tet_scene(
+            directory,
+            enable_rigid_mode_deflation=enabled,
+            n_pcg_iterations=120,
+            pcg_rtol=1.0e-10,
+            pcg_threshold=1.0e-20,
+        )
+        initial = tensor_to_array(entity.get_state().pos[0, 1]).copy()
+        target = initial + np.asarray((0.3, 0.0, 0.0), dtype=np.float64)
+        entity.set_vertex_constraints(
+            [1],
+            torch.as_tensor(target[None], dtype=gs.tc_float, device=gs.device),
+            is_soft_constraint=True,
+            stiffness=500.0,
+        )
+        scene.step(update_visualizer=False)
+        scenes.append((scene, entity))
+
+    baseline_state = scenes[0][1].get_state()
+    treatment_state = scenes[1][1].get_state()
+    np.testing.assert_allclose(
+        tensor_to_array(treatment_state.pos), tensor_to_array(baseline_state.pos), rtol=1.0e-8, atol=2.0e-8
+    )
+    np.testing.assert_allclose(
+        tensor_to_array(treatment_state.vel), tensor_to_array(baseline_state.vel), rtol=1.0e-8, atol=2.0e-8
+    )
+    for scene, _entity in scenes:
+        metrics = _native_implicit_pcg_metrics(scene)
+        assert all(
+            residual <= threshold * 1.01
+            for residual, threshold in zip(
+                metrics["residual_squared"],
+                metrics["threshold"],
+            )
+        )
+
+
+@pytest.mark.required
+@pytest.mark.parametrize("precision", ["64"])
+def test_rigid_mode_deflation_improves_rigid_translation_at_fixed_budget(tmp_path):
+    results = []
+    for enabled, directory in ((False, tmp_path / "baseline"), (True, tmp_path / "treatment")):
+        scene, entity = _build_native_implicit_heterogeneous_cube_scene(
+            directory,
+            enable_rigid_mode_deflation=enabled,
+            n_pcg_iterations=4,
+        )
+        scene.step(update_visualizer=False)
+        metrics = _native_implicit_pcg_metrics(scene)
+        vertex_slice = slice(entity.v_start, entity.v_start + entity.n_vertices)
+        velocities = tensor_to_array(entity.get_state().vel[0])
+        masses = np.asarray(scene.fem_solver.elements_v_info.mass.to_numpy()[vertex_slice], dtype=np.float64)
+        velocity = np.sum(velocities * masses[:, None], axis=0) / masses.sum()
+        results.append((metrics, velocity))
+
+    baseline_metrics, baseline_velocity = results[0]
+    treatment_metrics, treatment_velocity = results[1]
+    baseline_residual = baseline_metrics["relative_residual_norm"][0]
+    treatment_residual = treatment_metrics["relative_residual_norm"][0]
+    assert treatment_residual < 0.9 * baseline_residual
+    expected_velocity = -9.81 * 0.05
+    assert abs(treatment_velocity[2] - expected_velocity) < abs(baseline_velocity[2] - expected_velocity)
+
+
+@pytest.mark.required
+@pytest.mark.parametrize("precision", ["64"])
+def test_rigid_mode_deflation_keeps_batch_coarse_solves_isolated(tmp_path):
+    batched_scene, batched_entity = _build_native_implicit_two_tet_scene(
+        tmp_path / "batched",
+        n_envs=2,
+        enable_rigid_mode_deflation=True,
+        n_pcg_iterations=120,
+        pcg_rtol=1.0e-10,
+    )
+    batched_initial = tensor_to_array(batched_entity.get_state().pos)
+    batched_targets = np.stack(
+        (batched_initial[0, 1] + np.asarray((0.25, 0.0, 0.0)),
+         batched_initial[1, 1] + np.asarray((0.0, 0.25, 0.0)))
+    )
+    batched_entity.set_vertex_constraints(
+        [1],
+        torch.as_tensor(batched_targets, dtype=gs.tc_float, device=gs.device),
+        is_soft_constraint=True,
+        stiffness=500.0,
+    )
+    batched_scene.step(update_visualizer=False)
+    batched_state = batched_entity.get_state()
+
+    singles = []
+    for env_index in range(2):
+        scene, entity = _build_native_implicit_two_tet_scene(
+            tmp_path / f"single_{env_index}",
+            enable_rigid_mode_deflation=True,
+            n_pcg_iterations=120,
+            pcg_rtol=1.0e-10,
+        )
+        initial = tensor_to_array(entity.get_state().pos[0, 1]).copy()
+        delta = np.asarray((0.25, 0.0, 0.0)) if env_index == 0 else np.asarray((0.0, 0.25, 0.0))
+        entity.set_vertex_constraints(
+            [1],
+            torch.as_tensor((initial + delta)[None], dtype=gs.tc_float, device=gs.device),
+            is_soft_constraint=True,
+            stiffness=500.0,
+        )
+        scene.step(update_visualizer=False)
+        singles.append(entity)
+
+    for env_index, entity in enumerate(singles):
+        np.testing.assert_allclose(
+            tensor_to_array(batched_state.pos[env_index]),
+            tensor_to_array(entity.get_state().pos[0]),
+            rtol=1.0e-8,
+            atol=2.0e-8,
+        )
+        np.testing.assert_allclose(
+            tensor_to_array(batched_state.vel[env_index]),
+            tensor_to_array(entity.get_state().vel[0]),
+            rtol=1.0e-8,
+            atol=2.0e-8,
+        )
 
 
 @pytest.mark.required
