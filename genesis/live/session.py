@@ -8,9 +8,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
-import genesis as gs
 import numpy as np
 
+import genesis as gs
 from genesis.engine.controllers.box_end_effector import apply_static_box_anchors
 from genesis.utils.heterogeneous_materials import (
     SurfaceHeterogeneousMaterial,
@@ -23,12 +23,16 @@ from .actions import ActionRegistry, apply_probe_action
 from .capabilities import capability_report, surface_backend_status
 from .protocol import PROTOCOL, GenesisLiveError, error_response, ok_response
 from .snapshots import controller_snapshots, fused_observation, geometry_context
-from .visual_telemetry import GENESIS_NATIVE_DEBUG_CAMERA_RENDERER, VisualTelemetry
 from .visual_overlay import (
     VISUAL_OVERLAY_REST_ATOL_M,
     VisualOverlaySpec,
     load_visual_overlay_assets,
     validate_visual_overlay_spec,
+)
+from .visual_telemetry import (
+    GENESIS_NATIVE_DEBUG_CAMERA_RENDERER,
+    VisualTelemetry,
+    canonical_fixed_rgb_request,
 )
 
 DEFAULT_RENDER_EVERY_STEPS = 10
@@ -74,6 +78,12 @@ class ActiveProbeMeasurement:
     target_vertices: np.ndarray
     anchor_vertices: np.ndarray
     baseline_relative: np.ndarray
+    load_end_step: int | None = None
+    release_step: int | None = None
+    recovery_steps: int | None = None
+    controller_policy: dict[str, Any] | None = None
+    controller_telemetry: dict[str, Any] | None = None
+    force_summary: dict[str, Any] | None = None
     under_load: ProbeEndpoint | None = None
     released: bool = False
 
@@ -445,6 +455,7 @@ class GenesisLiveSession:
         self._visual_overlay_last_sync_step = None
         self._visual_overlay_last_sync_seconds = None
         self.visual_telemetry.reset_triptych_cameras()
+        self.visual_telemetry.reset_fixed_rgb_cameras()
         if self.scene is not None:
             self.scene.destroy()
         self.controllers.clear()
@@ -516,6 +527,7 @@ class GenesisLiveSession:
                 )
 
         self.visual_telemetry.register_triptych_cameras(self)
+        self.visual_telemetry.register_fixed_rgb_cameras(self)
         try:
             self.scene.build()
         except gs.GenesisException as exc:
@@ -768,6 +780,26 @@ class GenesisLiveSession:
         baseline_relative = np.mean(positions[target_vertices], axis=0) - np.mean(positions[anchor_vertices], axis=0)
         if not np.all(np.isfinite(baseline_relative)):
             raise GenesisLiveError("invalid_probe_measurement", "measurement baseline relative vector is non-finite")
+        schedule = measurement.get("schedule")
+        load_end_step = None
+        recovery_steps = None
+        if schedule is not None:
+            if not isinstance(schedule, dict) or set(schedule) != {"load_steps", "recovery_steps"}:
+                raise GenesisLiveError(
+                    "invalid_probe_measurement",
+                    "scheduled measurement requires exactly load_steps and recovery_steps",
+                )
+            load_steps = schedule.get("load_steps")
+            recovery_steps = schedule.get("recovery_steps")
+            if any(
+                isinstance(value, bool) or not isinstance(value, int) or value <= 0
+                for value in (load_steps, recovery_steps)
+            ):
+                raise GenesisLiveError(
+                    "invalid_probe_measurement",
+                    "scheduled measurement steps must be positive integers",
+                )
+            load_end_step = int(self.current_step) + int(load_steps)
         return ActiveProbeMeasurement(
             dispatch_token=dispatch_token,
             entity_name=entity_name,
@@ -777,29 +809,64 @@ class GenesisLiveSession:
             target_vertices=target_vertices,
             anchor_vertices=anchor_vertices,
             baseline_relative=baseline_relative.copy(),
+            load_end_step=load_end_step,
+            recovery_steps=recovery_steps,
         )
 
-    def publish_probe_measurement(self, controller_id: str, controller: Any, measurement: ActiveProbeMeasurement) -> None:
+    def publish_probe_measurement(
+        self, controller_id: str, controller: Any, measurement: ActiveProbeMeasurement
+    ) -> None:
         self.controllers[controller_id] = controller
         self.active_measurement_by_controller[controller_id] = measurement
 
-    def release_probe_measurement(self, controller_id: str) -> None:
+    def release_probe_measurement(self, controller_id: str, *, controller_state: dict[str, Any] | None = None) -> None:
         active = self.active_measurement_by_controller.get(controller_id)
         if active is not None:
+            if active.load_end_step is not None:
+                if active.under_load is None or self.current_step != active.load_end_step:
+                    raise GenesisLiveError(
+                        "invalid_probe_measurement",
+                        "scheduled probe release does not match its load endpoint",
+                    )
+                active.release_step = int(self.current_step)
+                if not isinstance(controller_state, dict):
+                    raise GenesisLiveError(
+                        "invalid_probe_measurement",
+                        "scheduled probe release lacks controller evidence",
+                    )
+                policy = controller_state.get("controller_policy")
+                telemetry = controller_state.get("controller_telemetry")
+                summary = telemetry.get("summary") if isinstance(telemetry, dict) else None
+                if not all(isinstance(value, dict) for value in (policy, telemetry, summary)):
+                    raise GenesisLiveError(
+                        "invalid_probe_measurement",
+                        "scheduled probe release lacks controller evidence",
+                    )
+                active.controller_policy = dict(policy)
+                active.controller_telemetry = dict(telemetry)
+                active.force_summary = dict(summary)
             active.released = True
 
     def _measurement_endpoint(self, active: ActiveProbeMeasurement) -> ProbeEndpoint:
-        positions = self._entity_positions_for_validation(active.entity_name, active.entity, checked_at="probe_measurement_endpoint")
-        relative = np.mean(positions[active.target_vertices], axis=0) - np.mean(positions[active.anchor_vertices], axis=0)
+        positions = self._entity_positions_for_validation(
+            active.entity_name, active.entity, checked_at="probe_measurement_endpoint"
+        )
+        relative = np.mean(positions[active.target_vertices], axis=0) - np.mean(
+            positions[active.anchor_vertices], axis=0
+        )
         vector = relative - active.baseline_relative
         if not np.all(np.isfinite(vector)):
             raise GenesisLiveError("invalid_probe_measurement", "probe endpoint vector is non-finite")
-        return ProbeEndpoint(simulation_step=int(self.current_step), vector_env_local_m=np.asarray(vector, dtype=np.float32))
+        return ProbeEndpoint(
+            simulation_step=int(self.current_step), vector_env_local_m=np.asarray(vector, dtype=np.float32)
+        )
 
-    def _completed_probe_measurement(self, active: ActiveProbeMeasurement, post_release: ProbeEndpoint) -> dict[str, Any]:
+    def _completed_probe_measurement(
+        self, active: ActiveProbeMeasurement, post_release: ProbeEndpoint
+    ) -> dict[str, Any]:
         if active.under_load is None or post_release.simulation_step <= active.under_load.simulation_step:
             raise GenesisLiveError("invalid_probe_measurement", "probe endpoint pair is not causally ordered")
-        return {
+        result = {
             "dispatch_token": active.dispatch_token,
             "identity": {
                 "entity": active.entity_name,
@@ -812,17 +879,59 @@ class GenesisLiveSession:
             "under_load": active.under_load.to_dict(),
             "post_release": post_release.to_dict(),
         }
+        if active.load_end_step is not None:
+            if (
+                active.release_step is None
+                or active.recovery_steps is None
+                or active.controller_policy is None
+                or active.controller_telemetry is None
+                or active.force_summary is None
+            ):
+                raise GenesisLiveError("invalid_probe_measurement", "scheduled probe evidence is incomplete")
+            result.update(
+                {
+                    "schedule": {
+                        "load_end_step": int(active.load_end_step),
+                        "release_step": int(active.release_step),
+                        "recovery_steps": int(active.recovery_steps),
+                    },
+                    "controller_policy": dict(active.controller_policy),
+                    "controller_telemetry": dict(active.controller_telemetry),
+                    "force_summary": dict(active.force_summary),
+                }
+            )
+        return result
 
     def _sample_active_measurements(self) -> dict[str, Any] | None:
         completed = None
         for controller_id, active in list(self.active_measurement_by_controller.items()):
             try:
-                if active.released:
-                    post_release = self._measurement_endpoint(active)
-                    completed = self._completed_probe_measurement(active, post_release)
-                    self.active_measurement_by_controller.pop(controller_id, None)
-                elif active.under_load is None:
-                    active.under_load = self._measurement_endpoint(active)
+                if active.load_end_step is None:
+                    if active.released:
+                        post_release = self._measurement_endpoint(active)
+                        completed = self._completed_probe_measurement(active, post_release)
+                        self.active_measurement_by_controller.pop(controller_id, None)
+                    elif active.under_load is None:
+                        active.under_load = self._measurement_endpoint(active)
+                elif not active.released:
+                    if self.current_step == active.load_end_step:
+                        active.under_load = self._measurement_endpoint(active)
+                    elif self.current_step > active.load_end_step and active.under_load is None:
+                        raise GenesisLiveError(
+                            "invalid_probe_measurement",
+                            "scheduled probe passed its load endpoint without a measurement",
+                        )
+                else:
+                    recovery_end_step = int(active.release_step or -1) + int(active.recovery_steps or -1)
+                    if self.current_step == recovery_end_step:
+                        post_release = self._measurement_endpoint(active)
+                        completed = self._completed_probe_measurement(active, post_release)
+                        self.active_measurement_by_controller.pop(controller_id, None)
+                    elif self.current_step > recovery_end_step:
+                        raise GenesisLiveError(
+                            "invalid_probe_measurement",
+                            "scheduled probe passed its recovery endpoint without a measurement",
+                        )
             except GenesisLiveError:
                 self.active_measurement_by_controller.pop(controller_id, None)
                 raise
@@ -843,7 +952,7 @@ class GenesisLiveSession:
         try:
             for local_step_index in range(steps):
                 for controller in list(self.controllers.values()):
-                    controller.advance_motion(steps=1)
+                    controller.prepare_step()
                 self.scene.step()
                 self.current_step += 1
                 self._validate_fem_state(checked_at="after_step")
@@ -1025,6 +1134,7 @@ class GenesisLiveSession:
             "normal",
             "normal_triptych",
             "part_segmentation_triptych",
+            "fixed_rgb_views",
         }:
             raise GenesisLiveError("unsupported_visual_mode", f"unsupported diagnostic visual mode: {mode}")
         if mode == "part_segmentation_triptych" and any(
@@ -1034,6 +1144,11 @@ class GenesisLiveSession:
                 "invalid_visual_request",
                 "part_segmentation_triptych requires a part_segmentation contract on every diagnostic entity",
             )
+        if mode == "fixed_rgb_views":
+            try:
+                canonical_fixed_rgb_request(visual)
+            except ValueError as exc:
+                raise GenesisLiveError("invalid_visual_request", str(exc)) from exc
         self._visual_render_every_steps(visual)
 
     def _visual_render_every_steps(self, visual) -> int | None:
@@ -1068,10 +1183,20 @@ class GenesisLiveSession:
             "normal_triptych": self.visual_telemetry.capture_normal_triptych,
             "part_segmentation_triptych": self.visual_telemetry.capture_part_segmentation_triptych,
         }
-        metadata = handlers[mode](self, frame_index=frame_index)
+        if mode == "fixed_rgb_views":
+            metadata = self.visual_telemetry.capture_fixed_rgb_views(
+                self,
+                visual=visual,
+                frame_index=frame_index,
+            )
+        else:
+            metadata = handlers[mode](self, frame_index=frame_index)
         metadata["frame_sequence_index"] = int(frame_sequence_index)
         metadata["render_every_steps"] = int(render_every_steps)
-        self.last_frame_index = int(metadata["stitched"]["frame_index"])
+        if "frame_index" in metadata:
+            self.last_frame_index = int(metadata["frame_index"])
+        else:
+            self.last_frame_index = int(metadata["stitched"]["frame_index"])
         return metadata
 
     def visual_overlay_trace(self, params: dict[str, Any]) -> dict[str, Any]:
@@ -1174,6 +1299,7 @@ class GenesisLiveSession:
             "normal": "normal triptych",
             "normal_triptych": "normal triptych",
             "part_segmentation_triptych": "part segmentation triptych",
+            "fixed_rgb_views": "fixed RGB views",
         }[mode]
         if not frames:
             return {
@@ -1184,7 +1310,7 @@ class GenesisLiveSession:
                 "renderer": {
                     "backend": GENESIS_NATIVE_DEBUG_CAMERA_RENDERER,
                     "mode": mode,
-                    "debug_camera": True,
+                    "debug_camera": mode != "fixed_rgb_views",
                     "reason": f"no {human_mode} frame boundary reached during this resume",
                 },
                 "render_every_steps": int(render_every_steps or DEFAULT_RENDER_EVERY_STEPS),

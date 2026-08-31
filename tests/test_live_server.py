@@ -1,9 +1,9 @@
+import hashlib
 import json
 import socket
 import subprocess
 import sys
 import time
-import hashlib
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -17,16 +17,23 @@ from genesis.engine.controllers.box_end_effector import BoxAnchorRecord
 from genesis.live.capabilities import capability_report
 from genesis.live.protocol import (
     ANCHOR_RELATIVE_PROBE_MEASUREMENT_CAPABILITY,
+    FIXED_RGB_VIEW_CAPABILITY,
     MAX_MESSAGE_BYTES,
     PROTOCOL,
     GenesisLiveError,
+    capabilities_for_report,
     encode_frame,
     recv_json,
     send_json,
 )
 from genesis.live.server import GenesisLiveServer
 from genesis.live.session import GenesisLiveSession
-from genesis.live.visual_telemetry import GENESIS_NATIVE_DEBUG_CAMERA_RENDERER
+from genesis.live.visual_telemetry import (
+    GENESIS_NATIVE_DEBUG_CAMERA_RENDERER,
+    VisualTelemetry,
+    canonical_fixed_rgb_request,
+    fixed_rgb_request_hash,
+)
 
 _TWO_TET_VERTS = np.array(
     [
@@ -39,6 +46,31 @@ _TWO_TET_VERTS = np.array(
     dtype=np.float64,
 )
 _TWO_TETS = np.array([[0, 1, 2, 3], [0, 2, 1, 4]], dtype=np.int64)
+
+
+def _fixed_rgb_request():
+    return {
+        "mode": "fixed_rgb_views",
+        "render_every_steps": 10,
+        "views": [
+            {
+                "name": "full",
+                "position": [1.0, 1.0, 1.0],
+                "look_at": [0.0, 0.0, 0.0],
+                "up": [0.0, 0.0, 1.0],
+                "resolution": [512, 512],
+                "fov_degrees": 40.0,
+            },
+            {
+                "name": "context",
+                "position": [2.0, 0.0, 1.0],
+                "look_at": [0.0, 0.0, 0.0],
+                "up": [0.0, 0.0, 1.0],
+                "resolution": [512, 512],
+                "fov_degrees": 40.0,
+            },
+        ],
+    }
 
 
 def _measurement_session_with_anchors(anchors: list[BoxAnchorRecord]) -> GenesisLiveSession:
@@ -78,13 +110,13 @@ def test_probe_measurement_lifecycle_emits_one_release_pair_and_retires_active_r
         target_vertices=np.array([1], dtype=np.int64),
     )
     session.scene = SimpleNamespace(step=lambda: None)
-    session.status = lambda: {}
+    session.status = dict
     session._validate_visual_request = lambda _visual: None
     session._visual_render_every_steps = lambda _visual: None
     session._validate_fem_state = lambda **_kwargs: None
     session._sync_visual_overlays = lambda **_kwargs: None
     session._visual_result_from_frames = lambda *_args, **_kwargs: {}
-    session.publish_probe_measurement("controller_1", SimpleNamespace(advance_motion=lambda **_kwargs: None), active)
+    session.publish_probe_measurement("controller_1", SimpleNamespace(prepare_step=lambda **_kwargs: None), active)
     compiled_resume = session.resume({"steps": 1})
     assert "completed_probe_measurement" not in compiled_resume
     assert active.under_load is not None
@@ -95,6 +127,48 @@ def test_probe_measurement_lifecycle_emits_one_release_pair_and_retires_active_r
     assert completed["dispatch_token"] == "runtime-token"
     assert completed["under_load"]["simulation_step"] < completed["post_release"]["simulation_step"]
     assert session.active_measurement_by_controller == {}
+
+
+def test_scheduled_probe_measurement_waits_for_load_and_recovery_endpoints():
+    anchor_id = "scheduled_anchor"
+    session = _measurement_session_with_anchors([_measurement_anchor(anchor_id, [0])])
+    active = session.prepare_probe_measurement(
+        measurement={
+            "dispatch_token": "scheduled-token",
+            "anchor_id": anchor_id,
+            "schedule": {"load_steps": 2, "recovery_steps": 2},
+        },
+        entity_name="body",
+        controller_id="controller_1",
+        target_vertices=np.array([1], dtype=np.int64),
+    )
+    session.scene = SimpleNamespace(step=lambda: None)
+    session.status = dict
+    session._validate_visual_request = lambda _visual: None
+    session._visual_render_every_steps = lambda _visual: None
+    session._validate_fem_state = lambda **_kwargs: None
+    session._sync_visual_overlays = lambda **_kwargs: None
+    session._visual_result_from_frames = lambda *_args, **_kwargs: {}
+    session.publish_probe_measurement("controller_1", SimpleNamespace(prepare_step=lambda **_kwargs: None), active)
+
+    load = session.resume({"steps": 2})
+    assert "completed_probe_measurement" not in load
+    assert active.under_load.simulation_step == 2
+    policy = {"policy_hash": "policy"}
+    telemetry = {"summary": {"active_pre_step_count": 2}}
+    session.release_probe_measurement(
+        "controller_1",
+        controller_state={"controller_policy": policy, "controller_telemetry": telemetry},
+    )
+    release = session.resume({"steps": 2})
+    completed = release["completed_probe_measurement"]
+
+    assert completed["schedule"] == {"load_end_step": 2, "release_step": 2, "recovery_steps": 2}
+    assert completed["under_load"]["simulation_step"] == 2
+    assert completed["post_release"]["simulation_step"] == 4
+    assert completed["controller_policy"] == policy
+    assert completed["controller_telemetry"] == telemetry
+    assert completed["force_summary"] == telemetry["summary"]
 
 
 def test_probe_measurement_rejects_invalid_physical_vertex_domain():
@@ -364,6 +438,52 @@ def test_live_session_rejects_unsupported_visual_modes(tmp_path):
 
     assert response["status"] == "error"
     assert response["error"]["code"] == "unsupported_visual_mode"
+
+
+def test_fixed_rgb_contract_is_advertised_and_rejects_camera_drift():
+    request = _fixed_rgb_request()
+
+    assert FIXED_RGB_VIEW_CAPABILITY in capabilities_for_report(False, diagnostic_scene=True)
+    assert canonical_fixed_rgb_request(request) == request
+    assert len(fixed_rgb_request_hash(request)) == 64
+
+    drifted = json.loads(json.dumps(request))
+    drifted["views"][0]["resolution"] = [256, 256]
+    with pytest.raises(ValueError, match="resolution"):
+        canonical_fixed_rgb_request(drifted)
+
+
+def test_fixed_rgb_capture_emits_clean_request_bound_views(monkeypatch, tmp_path):
+    class FakeCamera:
+        model = "pinhole"
+        debug = False
+        res = (512, 512)
+        fov = 40.0
+        near = 0.1
+        far = 20.0
+
+        def set_pose(self, *, pos, lookat, up):
+            self.pos = pos
+            self.lookat = lookat
+            self.up = up
+
+    telemetry = VisualTelemetry(tmp_path)
+    telemetry.fixed_rgb_cameras = {"full": FakeCamera(), "context": FakeCamera()}
+    monkeypatch.setattr(
+        "genesis.live.visual_telemetry._render_camera_rgb",
+        lambda *_args, **_kwargs: np.zeros((512, 512, 3), dtype=np.uint8),
+    )
+    request = _fixed_rgb_request()
+
+    result = telemetry.capture_fixed_rgb_views(SimpleNamespace(current_step=10), visual=request, frame_index=10)
+
+    assert result["view_order"] == ["full", "context"]
+    assert result["camera_specs"] == request["views"]
+    assert result["camera_specs_hash"] == fixed_rgb_request_hash(request)
+    assert result["overlays"] == result["debug_markers"] == []
+    assert [record["camera"]["debug"] for record in result["views"]] == [False, False]
+    assert [record["width"] for record in result["views"]] == [512, 512]
+    assert Path(result["metadata_path"]).is_file()
 
 
 def test_resume_reports_invalid_fem_state_before_visual_capture(monkeypatch, tmp_path):

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 
@@ -7,7 +8,6 @@ import numpy as np
 
 import genesis as gs
 from genesis.utils import spatial_selection as su
-
 
 DEFAULT_BOX_EE_SPEED = 0.6
 DEFAULT_MAX_DISTANCE_SCALE = 1.0
@@ -174,13 +174,15 @@ class BoxEndEffectorState:
     active: bool = False
     motion_active: bool = False
     optional: bool = False
+    controller_policy: dict[str, object] | None = None
+    controller_telemetry: dict[str, object] | None = None
 
     @property
     def selected_vertex_count(self) -> int:
         return int(self.selected_vertices.shape[0])
 
     def to_dict(self) -> dict[str, object]:
-        return {
+        payload = {
             "controller_id": self.controller_id,
             "frame": self.frame,
             "source_box": self.source_box.tolist(),
@@ -201,6 +203,11 @@ class BoxEndEffectorState:
             "motion_active": bool(self.motion_active),
             "optional": bool(self.optional),
         }
+        if self.controller_policy is not None:
+            payload["controller_policy"] = copy.deepcopy(self.controller_policy)
+        if self.controller_telemetry is not None:
+            payload["controller_telemetry"] = copy.deepcopy(self.controller_telemetry)
+        return payload
 
 
 def _selected_target_positions(entity, selected_vertices: np.ndarray, env_idx: int) -> np.ndarray:
@@ -319,12 +326,17 @@ class BoxEndEffectorController:
         env_idx: int = 0,
         object_to_env=None,
         world_to_env=None,
+        force_limited_policy: Mapping[str, object] | None = None,
     ):
         self.entity = entity
         self.controller_id = controller_id
         self.env_idx = env_idx
         self.object_to_env = object_to_env
         self.world_to_env = world_to_env
+        self._force_limited_policy = (
+            copy.deepcopy(dict(force_limited_policy)) if force_limited_policy is not None else None
+        )
+        self._force_limited_telemetry: dict[str, object] | None = None
         self._state = BoxEndEffectorState(
             controller_id=controller_id,
             frame="env_local",
@@ -332,6 +344,7 @@ class BoxEndEffectorController:
             env_local_box=np.zeros(6, dtype=_float_dtype()),
             selected_vertices=np.empty((0,), dtype=gs.np_int if gs._initialized else np.int32),
             target_positions=_empty_targets(),
+            controller_policy=self._force_limited_policy,
         )
         self._preexisting_constraint_mask = np.empty((0,), dtype=bool)
         self._preexisting_constraint_targets = _empty_targets()
@@ -343,6 +356,12 @@ class BoxEndEffectorController:
         self._motion_moved_distance = 0.0
         self._motion_speed = DEFAULT_BOX_EE_SPEED
         self._motion_estimated_steps = 0
+
+    def _state_policy_fields(self) -> dict[str, object]:
+        return {
+            "controller_policy": self._force_limited_policy,
+            "controller_telemetry": self._force_limited_telemetry,
+        }
 
     @property
     def state(self) -> BoxEndEffectorState:
@@ -485,11 +504,16 @@ class BoxEndEffectorController:
                 selection_tolerance=tolerance,
                 active=False,
                 optional=True,
+                **self._state_policy_fields(),
             )
             self._clear_preexisting_constraints()
             return self._state
 
         targets = _selected_target_positions(self.entity, selected, self.env_idx)
+        if self._force_limited_policy is not None:
+            if not is_soft_constraint:
+                gs.raise_exception("Force-limited BoxEE requires native FEM soft constraints.")
+            stiffness = float(self._force_limited_policy["total_stiffness_n_per_m"]) / float(selected.size)
         self._capture_preexisting_constraints(selected)
         self.entity.set_vertex_constraints(
             selected,
@@ -509,6 +533,7 @@ class BoxEndEffectorController:
             active=True,
             motion_active=False,
             optional=optional,
+            **self._state_policy_fields(),
         )
         self._clear_motion()
         return self._state
@@ -574,7 +599,77 @@ class BoxEndEffectorController:
             active=True,
             motion_active=True,
             optional=self._state.optional,
+            **self._state_policy_fields(),
         )
+        return self._state
+
+    def prepare_step(self, *, dt: float | None = None) -> BoxEndEffectorState:
+        """Advance commanded motion and cap the next native-FEM penalty-spring load."""
+        self.advance_motion(steps=1, dt=dt)
+        if self._force_limited_policy is None or not self._state.active or self._state.selected_vertex_count == 0:
+            return self._state
+
+        selected = self._state.selected_vertices
+        positions = su.fem_entity_positions(self.entity, env_idx=self.env_idx, use_current=True)[selected]
+        errors = self._state.target_positions - positions
+        nominal_stiffness = float(self._force_limited_policy["total_stiffness_n_per_m"]) / float(selected.size)
+        raw_forces = nominal_stiffness * errors
+        raw_net_force = np.sum(raw_forces, axis=0)
+        raw_magnitude = float(np.linalg.norm(raw_net_force))
+        max_force = float(self._force_limited_policy["max_net_spring_force_n"])
+        scale = min(1.0, max_force / raw_magnitude) if raw_magnitude > 0.0 else 1.0
+        applied_net_force = raw_net_force * scale
+        applied_magnitude = float(np.linalg.norm(applied_net_force))
+        if not np.all(np.isfinite(errors)) or not np.isfinite(raw_magnitude) or not np.isfinite(applied_magnitude):
+            gs.raise_exception("Force-limited BoxEE produced non-finite spring-force telemetry.")
+
+        self.entity.set_vertex_constraints(
+            selected,
+            target_poss=self._state.target_positions,
+            is_soft_constraint=True,
+            stiffness=nominal_stiffness * scale,
+            envs_idx=_envs_idx_arg(self.entity, self.env_idx),
+        )
+        previous = self._force_limited_telemetry or {}
+        previous_summary = previous.get("summary", {})
+        active_count = int(previous_summary.get("active_pre_step_count", 0)) + 1
+        cap_count = int(previous_summary.get("cap_active_pre_step_count", 0)) + int(scale < 1.0)
+        force_scope = {
+            "quantity": "net_spring_force",
+            "formula": "||sum_i f_i||",
+            "excludes": ["sum_of_magnitudes", "stress", "torque", "contact_force", "internal_force"],
+        }
+        self._force_limited_telemetry = {
+            "schema": "box_ee_controller_telemetry/v1",
+            "policy_hash": self._force_limited_policy["policy_hash"],
+            "policy_id": self._force_limited_policy["policy_id"],
+            "total_stiffness_n_per_m": float(self._force_limited_policy["total_stiffness_n_per_m"]),
+            "max_net_spring_force_n": max_force,
+            "selected_vertex_count": int(selected.size),
+            "nominal_per_vertex_stiffness_n_per_m": nominal_stiffness,
+            "requested_displacement_m": self._state.displacement.astype(float).tolist(),
+            "force_scope": force_scope,
+            "current": {
+                "raw_net_spring_force_vector_n": raw_net_force.astype(float).tolist(),
+                "raw_net_spring_force_magnitude_n": raw_magnitude,
+                "applied_net_spring_force_vector_n": applied_net_force.astype(float).tolist(),
+                "applied_net_spring_force_magnitude_n": applied_magnitude,
+                "stiffness_scale": scale,
+                "cap_active": bool(scale < 1.0),
+            },
+            "summary": {
+                "peak_raw_net_spring_force_magnitude_n": max(
+                    float(previous_summary.get("peak_raw_net_spring_force_magnitude_n", 0.0)), raw_magnitude
+                ),
+                "peak_applied_net_spring_force_magnitude_n": max(
+                    float(previous_summary.get("peak_applied_net_spring_force_magnitude_n", 0.0)), applied_magnitude
+                ),
+                "cap_active_pre_step_count": cap_count,
+                "active_pre_step_count": active_count,
+                "numerical_valid": True,
+            },
+        }
+        self._state.controller_telemetry = self._force_limited_telemetry
         return self._state
 
     def move_positive_y(
@@ -656,6 +751,7 @@ class BoxEndEffectorController:
             active=True,
             motion_active=self._motion_moved_distance < self._motion_distance,
             optional=self._state.optional,
+            **self._state_policy_fields(),
         )
         if not self._state.motion_active:
             self._clear_motion()
@@ -756,5 +852,6 @@ class BoxEndEffectorController:
             distance_scale=self._state.distance_scale,
             active=False,
             optional=self._state.optional,
+            **self._state_policy_fields(),
         )
         return self._state
