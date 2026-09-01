@@ -29,6 +29,23 @@ def _stats_np(array: np.ndarray) -> dict[str, float]:
     }
 
 
+def _compute_pressure_field_from_signed_distances(
+    signed_distances: np.ndarray,
+    hydroelastic_modulus: float,
+) -> tuple[np.ndarray, float]:
+    """Compute the ordinary FEM hydroelastic pressure field."""
+
+    distances = np.ascontiguousarray(np.asarray(signed_distances, dtype=np.float64))
+    if distances.ndim != 1 or not np.isfinite(distances).all():
+        gs.raise_exception("FEM signed distances must be a finite one-dimensional array")
+    if not np.isfinite(hydroelastic_modulus) or hydroelastic_modulus <= 0.0:
+        gs.raise_exception("FEM hydroelastic modulus must be finite and positive")
+    d_max = float(np.max(np.abs(distances)))
+    if d_max <= np.finfo(np.float64).eps:
+        gs.raise_exception("Pressure field max distance is too small")
+    return np.ascontiguousarray(np.abs(distances) / d_max * hydroelastic_modulus), d_max
+
+
 def assert_muscle(method):
     @wraps(method)
     def wrapper(self, *args, **kwargs):
@@ -742,14 +759,11 @@ class FEMEntity(Entity):
         signed_distance, *_ = igl.signed_distance(init_positions, init_positions, self._surface_tri_np)
         signed_distance = signed_distance.astype(gs.np_float, copy=False)
 
-        unsigned_distance = np.abs(signed_distance)
-        max_distance = np.max(unsigned_distance)
-        if max_distance < gs.EPS:
-            gs.raise_exception(
-                f"Pressure field max distance is too small: {max_distance}. "
-                "This might be due to a mesh having no internal vertices."
-            )
-        self.pressure_field_np = unsigned_distance / max_distance * self.material.hydroelastic_modulus  # normalize
+        self.pressure_field_np, _ = _compute_pressure_field_from_signed_distances(
+            signed_distance,
+            self.material.hydroelastic_modulus,
+        )
+        self.pressure_field_np = self.pressure_field_np.astype(gs.np_float, copy=False)
 
     # ------------------------------------------------------------------------------------
     # ---------------------------- checkpoint and buffer ---------------------------------

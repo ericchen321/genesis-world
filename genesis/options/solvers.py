@@ -162,6 +162,15 @@ class SAPCouplerOptions(BaseCouplerOptions):
         Vert would be preferable when the mesh is very coarse, such as a single cube or a tetrahedron.
     enable_rigid_fem_contact : bool, optional
         Whether to enable coupling between rigid and FEM solvers. Defaults to True.
+    enable_rigid_fem_contact_patch_preconditioner : bool, optional
+        Whether SAP PCG augments its ordinary FEM/rigid block preconditioner
+        with rank-aware six-mode rigid--FEM contact-patch coarse corrections.
+        Defaults to False.
+    enable_rigid_fem_contact_tet_schwarz_preconditioner : bool, optional
+        Whether the balanced rigid--FEM contact-patch preconditioner replaces
+        its local FEM level with exact overlapping surface-tetrahedron solves.
+        Requires ``enable_rigid_fem_contact_patch_preconditioner=True`` and
+        defaults to False.
     enable_qualification_post_final_sap_health : bool, optional
         Enable a qualification-only recomputation of the SAP convergence
         diagnostics after the final outer update. This is disabled by default
@@ -201,6 +210,8 @@ class SAPCouplerOptions(BaseCouplerOptions):
     enable_fem_self_tet_contact: StrictBool = True
     rigid_floor_contact_type: Literal["tet", "vert", "none"] = "tet"
     enable_rigid_fem_contact: StrictBool = True
+    enable_rigid_fem_contact_patch_preconditioner: StrictBool = False
+    enable_rigid_fem_contact_tet_schwarz_preconditioner: StrictBool = False
     rigid_rigid_contact_type: Literal["tet", "vert", "none"] = "tet"
     enable_qualification_post_final_sap_health: StrictBool = False
     enable_development_positive_j_feasible_step: StrictBool = False
@@ -872,6 +883,11 @@ class FEMOptions(Options):
         Whether the implicit solver augments the per-vertex 3x3 block-Jacobi
         preconditioner with six rigid modes per volumetric FEM entity.
         Defaults to False. Only used when `use_implicit_solver` is True.
+    true_residual_probe_global_substep : int, optional
+        Diagnostic-only global physical substep at which the implicit PCG
+        solver records true residuals after 0, 50, 100, 250, and 500 updates.
+        Defaults to None. Enabling it requires one Newton iteration and exactly
+        500 PCG iterations.
     enable_vertex_constraints : bool, optional
         Whether to enable vertex constraints. Defaults to False.
     enable_qualification_safety_extrema : bool, optional
@@ -908,11 +924,20 @@ class FEMOptions(Options):
     damping_alpha: NonNegativeFloat = 0.5
     damping_beta: NonNegativeFloat = 5e-4
     enable_rigid_mode_deflation: StrictBool = False
+    true_residual_probe_global_substep: NonNegativeInt | None = None
     enable_vertex_constraints: StrictBool = False
     enable_qualification_safety_extrema: StrictBool = False
     enable_development_implicit_fem_positive_j_feasible_step: StrictBool = False
     enable_development_implicit_fem_positive_j_alpha_one_only: StrictBool = False
     enable_development_direct_replay_min_j_query: StrictBool = False
+
+    def model_post_init(self, context: Any) -> None:
+        if self.true_residual_probe_global_substep is not None and (
+            not self.use_implicit_solver or self.n_newton_iterations != 1 or self.n_pcg_iterations != 500
+        ):
+            gs.raise_exception(
+                "`true_residual_probe_global_substep` requires implicit FEM with one Newton iteration and PCG500."
+            )
 
 
 class SFOptions(Options):

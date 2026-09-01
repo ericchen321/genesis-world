@@ -39,6 +39,68 @@ def _float_value(value: object, name: str) -> None:
 
 
 @dataclass(frozen=True, slots=True)
+class ImplicitFEMTrueResidualSample:
+    """One immutable scalar-only true-residual PCG checkpoint."""
+
+    completed_iteration: int
+    actual_iterations_by_batch: tuple[int, ...]
+    pcg_active_by_batch: tuple[bool, ...]
+    true_residual_squared_by_batch: tuple[float, ...]
+    recursive_residual_squared_by_batch: tuple[float, ...]
+
+    def __post_init__(self) -> None:
+        _nonnegative_int(self.completed_iteration, "completed_iteration")
+        batch_size = len(self.actual_iterations_by_batch)
+        if batch_size == 0 or any(
+            len(values) != batch_size
+            for values in (
+                self.pcg_active_by_batch,
+                self.true_residual_squared_by_batch,
+                self.recursive_residual_squared_by_batch,
+            )
+        ):
+            raise ValueError("true-residual sample fields must have one value per batch")
+        for value in self.actual_iterations_by_batch:
+            _nonnegative_int(value, "actual_iterations_by_batch value")
+        if any(type(value) is not bool for value in self.pcg_active_by_batch):
+            raise TypeError("pcg_active_by_batch must contain bool values")
+        for name in ("true_residual_squared_by_batch", "recursive_residual_squared_by_batch"):
+            for value in getattr(self, name):
+                _finite_nonnegative(value, f"{name} value")
+
+
+@dataclass(frozen=True, slots=True)
+class ImplicitFEMTrueResidualProbe:
+    """Five ordered scalar-only checkpoints from one implicit FEM PCG solve."""
+
+    global_substep_index: int
+    samples: tuple[ImplicitFEMTrueResidualSample, ...]
+
+    def __post_init__(self) -> None:
+        _nonnegative_int(self.global_substep_index, "global_substep_index")
+        if tuple(sample.completed_iteration for sample in self.samples) != (0, 50, 100, 250, 500):
+            raise ValueError("true-residual probe schedule must be exactly (0, 50, 100, 250, 500)")
+        batch_size = len(self.samples[0].actual_iterations_by_batch)
+        if any(len(sample.actual_iterations_by_batch) != batch_size for sample in self.samples):
+            raise ValueError("true-residual probe batch size must be constant")
+        for batch_index in range(batch_size):
+            actual = tuple(sample.actual_iterations_by_batch[batch_index] for sample in self.samples)
+            if any(next_value < value for value, next_value in zip(actual, actual[1:])):
+                raise ValueError("true-residual actual iteration counts must be nondecreasing")
+
+    @property
+    def finite(self) -> bool:
+        return all(
+            isfinite(value) and value >= 0.0
+            for sample in self.samples
+            for value in (
+                *sample.true_residual_squared_by_batch,
+                *sample.recursive_residual_squared_by_batch,
+            )
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class ImplicitFEMSubstepHealth:
     """Actual final state of FEM's independent implicit solve for one substep.
 
@@ -69,6 +131,11 @@ class ImplicitFEMSubstepHealth:
     """Legacy name for the squared absolute residual floor; retained for compatibility."""
     pcg_absolute_residual_squared_floor: float
     pcg_rtol: float
+    pcg_iterations_by_batch: tuple[int, ...] = (0,)
+    rigid_mode_deflation_enabled: bool = False
+    rigid_mode_coarse_matrix_finite_by_batch: tuple[bool, ...] | None = None
+    rigid_mode_coarse_inverse_finite_by_batch: tuple[bool, ...] | None = None
+    true_residual_probe: ImplicitFEMTrueResidualProbe | None = None
 
     def __post_init__(self) -> None:
         batch_size = len(self.batch_active_by_batch)
@@ -87,6 +154,29 @@ class ImplicitFEMSubstepHealth:
         )
         if batch_size == 0 or any(len(getattr(self, name)) != batch_size for name in fields):
             raise ValueError("implicit FEM fields must have one value per batch")
+        if len(self.pcg_iterations_by_batch) != batch_size:
+            raise ValueError("pcg_iterations_by_batch must have one value per batch")
+        for value in self.pcg_iterations_by_batch:
+            _nonnegative_int(value, "pcg_iterations_by_batch value")
+        if type(self.rigid_mode_deflation_enabled) is not bool:
+            raise TypeError("rigid_mode_deflation_enabled must be a bool")
+        coarse_fields = (
+            "rigid_mode_coarse_matrix_finite_by_batch",
+            "rigid_mode_coarse_inverse_finite_by_batch",
+        )
+        if self.rigid_mode_deflation_enabled:
+            for name in coarse_fields:
+                values = getattr(self, name)
+                if values is None or len(values) != batch_size:
+                    raise ValueError(f"{name} must have one value per batch when rigid-mode deflation is enabled")
+                if any(type(value) is not bool for value in values):
+                    raise TypeError(f"{name} must contain bool values")
+        elif any(getattr(self, name) is not None for name in coarse_fields):
+            raise ValueError("rigid-mode coarse finiteness must be None when deflation is disabled")
+        if self.true_residual_probe is not None and not isinstance(
+            self.true_residual_probe, ImplicitFEMTrueResidualProbe
+        ):
+            raise TypeError("true_residual_probe must be ImplicitFEMTrueResidualProbe or None")
         for name in (
             "batch_active_by_batch",
             "pcg_active_by_batch",
@@ -118,7 +208,7 @@ class ImplicitFEMSubstepHealth:
 
     @property
     def finite(self) -> bool:
-        return all(
+        return (self.true_residual_probe is None or self.true_residual_probe.finite) and all(
             isfinite(value) and value >= 0.0
             for value in (
                 *self.pcg_initial_residual_squared_by_batch,
@@ -383,6 +473,18 @@ class SAPSubstepSolverHealth:
     post_final_impulse_norm_by_batch: tuple[float, ...] = ()
     positive_j_feasible_step: PositiveJFeasibleStep | None = None
     implicit_fem_positive_j_feasible_step: ImplicitFEMPositiveJFeasibleStep | None = None
+    rigid_fem_contact_patch_preconditioner_enabled: bool = False
+    rigid_fem_contact_patch_min_active_count_by_batch: tuple[int, ...] = ()
+    rigid_fem_contact_patch_min_rank_by_batch: tuple[int, ...] = ()
+    rigid_fem_contact_patch_max_rank_by_batch: tuple[int, ...] = ()
+    rigid_fem_contact_patch_all_coarse_finite_by_batch: tuple[bool, ...] = ()
+    rigid_fem_contact_tet_schwarz_preconditioner_enabled: bool = False
+    rigid_fem_contact_tet_schwarz_min_active_block_count_by_batch: tuple[int, ...] = ()
+    rigid_fem_contact_tet_schwarz_max_vertex_overlap_by_batch: tuple[int, ...] = ()
+    rigid_fem_contact_tet_schwarz_max_link_overlap_by_batch: tuple[int, ...] = ()
+    rigid_fem_contact_tet_schwarz_max_link_rank_by_batch: tuple[int, ...] = ()
+    rigid_fem_contact_tet_schwarz_min_factor_pivot_by_batch: tuple[float, ...] = ()
+    rigid_fem_contact_tet_schwarz_all_factors_valid_by_batch: tuple[bool, ...] = ()
 
     def __post_init__(self) -> None:
         _nonnegative_int(self.global_substep_index, "global_substep_index")
@@ -489,6 +591,86 @@ class SAPSubstepSolverHealth:
                     _float_value(value, name)
         elif any(getattr(self, name) for name in post_final_fields):
             raise ValueError("unavailable post-final SAP health must be empty")
+        if type(self.rigid_fem_contact_patch_preconditioner_enabled) is not bool:
+            raise TypeError("rigid_fem_contact_patch_preconditioner_enabled must be bool")
+        patch_fields = (
+            "rigid_fem_contact_patch_min_active_count_by_batch",
+            "rigid_fem_contact_patch_min_rank_by_batch",
+            "rigid_fem_contact_patch_max_rank_by_batch",
+            "rigid_fem_contact_patch_all_coarse_finite_by_batch",
+        )
+        if self.rigid_fem_contact_patch_preconditioner_enabled and self.contact_solve_executed:
+            if any(len(getattr(self, name)) != batch_size for name in patch_fields):
+                raise ValueError("enabled rigid--FEM contact-patch health must cover every solved batch")
+            for name in patch_fields[:3]:
+                for value in getattr(self, name):
+                    _nonnegative_int(value, f"{name} value")
+            if any(
+                value > 6
+                for name in patch_fields[1:3]
+                for value in getattr(self, name)
+            ):
+                raise ValueError("rigid--FEM contact-patch ranks must lie in [0, 6]")
+            if any(
+                minimum > maximum
+                for minimum, maximum in zip(
+                    self.rigid_fem_contact_patch_min_rank_by_batch,
+                    self.rigid_fem_contact_patch_max_rank_by_batch,
+                )
+            ):
+                raise ValueError("rigid--FEM contact-patch minimum rank cannot exceed maximum rank")
+            if any(
+                type(value) is not bool
+                for value in self.rigid_fem_contact_patch_all_coarse_finite_by_batch
+            ):
+                raise TypeError("rigid_fem_contact_patch_all_coarse_finite_by_batch must contain bool values")
+        elif any(len(getattr(self, name)) != 0 for name in patch_fields):
+            raise ValueError("unexecuted or disabled rigid--FEM contact-patch health must be empty")
+        if type(self.rigid_fem_contact_tet_schwarz_preconditioner_enabled) is not bool:
+            raise TypeError("rigid_fem_contact_tet_schwarz_preconditioner_enabled must be bool")
+        schwarz_fields = (
+            "rigid_fem_contact_tet_schwarz_min_active_block_count_by_batch",
+            "rigid_fem_contact_tet_schwarz_max_vertex_overlap_by_batch",
+            "rigid_fem_contact_tet_schwarz_max_link_overlap_by_batch",
+            "rigid_fem_contact_tet_schwarz_max_link_rank_by_batch",
+            "rigid_fem_contact_tet_schwarz_min_factor_pivot_by_batch",
+            "rigid_fem_contact_tet_schwarz_all_factors_valid_by_batch",
+        )
+        if self.rigid_fem_contact_tet_schwarz_preconditioner_enabled and self.contact_solve_executed:
+            if any(len(getattr(self, name)) != batch_size for name in schwarz_fields):
+                raise ValueError("enabled rigid--FEM contact-tet Schwarz health must cover every solved batch")
+            for name in schwarz_fields[:4]:
+                for value in getattr(self, name):
+                    _nonnegative_int(value, f"{name} value")
+            if any(value > 6 for value in self.rigid_fem_contact_tet_schwarz_max_link_rank_by_batch):
+                raise ValueError("rigid--FEM contact-tet Schwarz link ranks must lie in [0, 6]")
+            for value in self.rigid_fem_contact_tet_schwarz_min_factor_pivot_by_batch:
+                _finite_nonnegative(value, "rigid_fem_contact_tet_schwarz_min_factor_pivot_by_batch value")
+            if any(
+                active > 0 and (vertex_overlap < 1 or link_overlap < 1)
+                for active, vertex_overlap, link_overlap in zip(
+                    self.rigid_fem_contact_tet_schwarz_min_active_block_count_by_batch,
+                    self.rigid_fem_contact_tet_schwarz_max_vertex_overlap_by_batch,
+                    self.rigid_fem_contact_tet_schwarz_max_link_overlap_by_batch,
+                )
+            ):
+                raise ValueError("positive Schwarz active-block count requires positive vertex and link overlap")
+            if any(
+                type(value) is not bool
+                for value in self.rigid_fem_contact_tet_schwarz_all_factors_valid_by_batch
+            ):
+                raise TypeError("rigid_fem_contact_tet_schwarz_all_factors_valid_by_batch must contain bool values")
+            if any(
+                active > 0 and valid and pivot <= 0.0
+                for active, valid, pivot in zip(
+                    self.rigid_fem_contact_tet_schwarz_min_active_block_count_by_batch,
+                    self.rigid_fem_contact_tet_schwarz_all_factors_valid_by_batch,
+                    self.rigid_fem_contact_tet_schwarz_min_factor_pivot_by_batch,
+                )
+            ):
+                raise ValueError("valid active Schwarz factors require a positive minimum pivot")
+        elif any(len(getattr(self, name)) != 0 for name in schwarz_fields):
+            raise ValueError("unexecuted or disabled rigid--FEM contact-tet Schwarz health must be empty")
 
     @property
     def solver_converged(self) -> bool:
@@ -516,6 +698,19 @@ class SAPSubstepSolverHealth:
         if self.max_rigid_fem_penetration_m is not None:
             values = (*values, self.max_rigid_fem_penetration_m)
         if not all(isfinite(value) and value >= 0.0 for value in values):
+            return False
+        if self.rigid_fem_contact_patch_preconditioner_enabled and not all(
+            self.rigid_fem_contact_patch_all_coarse_finite_by_batch
+        ):
+            return False
+        if self.rigid_fem_contact_tet_schwarz_preconditioner_enabled and not all(
+            self.rigid_fem_contact_tet_schwarz_all_factors_valid_by_batch
+        ):
+            return False
+        if self.rigid_fem_contact_tet_schwarz_preconditioner_enabled and not all(
+            isfinite(value) and value >= 0.0
+            for value in self.rigid_fem_contact_tet_schwarz_min_factor_pivot_by_batch
+        ):
             return False
         if self.positive_j_feasible_step is None:
             return True

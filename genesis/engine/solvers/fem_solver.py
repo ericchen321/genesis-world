@@ -15,6 +15,8 @@ from genesis.engine.solver_health import (
     FEMPrincipalStrainWitness,
     FEMSubstepSafetyExtrema,
     ImplicitFEMPositiveJFeasibleStep,
+    ImplicitFEMTrueResidualProbe,
+    ImplicitFEMTrueResidualSample,
 )
 from genesis.engine.states.solvers import FEMSolverState
 from genesis.utils.misc import qd_to_torch, tensor_to_array
@@ -27,6 +29,7 @@ if TYPE_CHECKING:
 
 DEVELOPMENT_IMPLICIT_FEM_POSITIVE_J_FLOOR = 0.20
 DEVELOPMENT_IMPLICIT_FEM_POSITIVE_J_SCHEDULE_LENGTH = 8
+TRUE_RESIDUAL_PROBE_SCHEDULE = (0, 50, 100, 250, 500)
 
 
 def _linear_corotated_safety_extrema(
@@ -209,6 +212,7 @@ class FEMSolver(Solver):
         self._damping_alpha = options.damping_alpha
         self._damping_beta = options.damping_beta
         self._enable_rigid_mode_deflation = options.enable_rigid_mode_deflation
+        self._true_residual_probe_global_substep = options.true_residual_probe_global_substep
         self._enable_vertex_constraints = options.enable_vertex_constraints
         self._enable_qualification_safety_extrema = options.enable_qualification_safety_extrema
         self._enable_development_implicit_fem_positive_j_feasible_step = (
@@ -243,10 +247,25 @@ class FEMSolver(Solver):
     def init_batch_fields(self):
         self.batch_active = qd.field(dtype=gs.qd_bool, shape=(self._B,), needs_grad=False)
         self.batch_pcg_active = qd.field(dtype=gs.qd_bool, shape=(self._B,), needs_grad=False)
+        self.batch_pcg_iterations = qd.field(dtype=gs.qd_int, shape=(self._B,), needs_grad=False)
         self.batch_linesearch_active = qd.field(dtype=gs.qd_bool, shape=(self._B,), needs_grad=False)
         self.batch_pcg_budget_exhausted = qd.field(dtype=gs.qd_bool, shape=(self._B,), needs_grad=False)
         self.batch_pcg_breakdown = qd.field(dtype=gs.qd_bool, shape=(self._B,), needs_grad=False)
         self.batch_linesearch_budget_exhausted = qd.field(dtype=gs.qd_bool, shape=(self._B,), needs_grad=False)
+        if self._true_residual_probe_global_substep is not None:
+            probe_shape = (len(TRUE_RESIDUAL_PROBE_SCHEDULE), self._B)
+            self.true_residual_probe_actual_iterations = qd.field(
+                dtype=gs.qd_int, shape=probe_shape, needs_grad=False
+            )
+            self.true_residual_probe_pcg_active = qd.field(
+                dtype=gs.qd_bool, shape=probe_shape, needs_grad=False
+            )
+            self.true_residual_probe_true_rTr = qd.field(
+                dtype=gs.qd_float, shape=probe_shape, needs_grad=False
+            )
+            self.true_residual_probe_recursive_rTr = qd.field(
+                dtype=gs.qd_float, shape=probe_shape, needs_grad=False
+            )
 
         pcg_state = qd.types.struct(
             rTr=gs.qd_float,
@@ -512,9 +531,7 @@ class FEMSolver(Solver):
         self.vertices_on_surface = qd.field(dtype=gs.qd_bool, shape=(self.n_vertices,))
         self.elements_on_surface = qd.field(dtype=gs.qd_bool, shape=(self.n_elements,))
         self.compute_surface_vertices()
-        self.compute_surface_elements()
         vertices_on_surface_np = self.vertices_on_surface.to_numpy()
-        elements_on_surface_np = self.elements_on_surface.to_numpy()
         (surface_vertices_np,) = vertices_on_surface_np.nonzero()
         self.surface_vertices = qd.field(
             dtype=qd.i32,
@@ -522,7 +539,24 @@ class FEMSolver(Solver):
             needs_grad=False,
         )
         self.surface_vertices.from_numpy(surface_vertices_np.astype(np.int32, copy=False))
-        (surface_elements_np,) = elements_on_surface_np.nonzero()
+
+        # ``surface.tri2el`` is the explicit face-to-owner map populated by
+        # FEMEntity.  The old implementation marked a tet as a surface tet
+        # when *any* of its vertices happened to lie on the boundary.  That
+        # admits interior-only elements and is not the same contact universe
+        # as the explicit exterior triangles.  Keep the diagnostic boolean
+        # kernel available for legacy analysis, but make the public surface
+        # element list the unique, sorted mechanical owners of those faces.
+        surface_triangle_owners = np.asarray(self.surface.tri2el.to_numpy(), dtype=np.int64)
+        if surface_triangle_owners.shape != (self.n_surfaces,):
+            raise RuntimeError("FEM surface owner table has an unexpected shape")
+        surface_elements_np = np.unique(surface_triangle_owners).astype(np.int32, copy=False)
+        if surface_elements_np.size and (
+            np.any(surface_elements_np < 0) or np.any(surface_elements_np >= self.n_elements)
+        ):
+            raise RuntimeError("FEM surface owner table contains an invalid mechanical element")
+        self.elements_on_surface.fill(False)
+        self._mark_surface_elements_from_explicit_owners(surface_elements_np)
         self.surface_elements = qd.field(
             dtype=qd.i32,
             shape=(len(surface_elements_np),),
@@ -555,6 +589,7 @@ class FEMSolver(Solver):
 
     @qd.kernel
     def compute_surface_elements(self):
+        """Diagnostic legacy vertex-adjacent surface-element classification."""
         for i_e in range(self.n_elements):
             i_v = self.elements_i[i_e].el2v
             self.elements_on_surface[i_e] = (
@@ -563,6 +598,12 @@ class FEMSolver(Solver):
                 or self.vertices_on_surface[i_v[2]]
                 or self.vertices_on_surface[i_v[3]]
             )
+
+    @qd.kernel
+    def _mark_surface_elements_from_explicit_owners(self, owners: qd.types.ndarray()):
+        """Mark the exact mechanical owner set for a host-built owner array."""
+        for i in range(owners.shape[0]):
+            self.elements_on_surface[owners[i]] = True
 
     def init_ckpt(self):
         self._ckpt = dict()
@@ -1133,24 +1174,25 @@ class FEMSolver(Solver):
         self._invert_rigid_mode_coarse_matrix()
 
     @qd.func
-    def compute_Ap(self):
+    def compute_Ap(self, use_solution: qd.template()):
         damping_alpha_dt = self._damping_alpha * self._substep_dt
         damping_alpha_factor = damping_alpha_dt + 1.0
         damping_beta_over_dt = self._damping_beta / self._substep_dt
         damping_beta_factor = damping_beta_over_dt + 1.0
         for i_b, i_v in qd.ndrange(self._B, self.n_vertices):
-            if not self.batch_pcg_active[i_b]:
+            if not (self.batch_active[i_b] if qd.static(use_solution) else self.batch_pcg_active[i_b]):
                 continue
+            vector = self.pcg_state_v[i_b, i_v].x if qd.static(use_solution) else self.pcg_state_v[i_b, i_v].p
             self.pcg_state_v[i_b, i_v].Ap = (
-                self.elements_v_info[i_v].mass_over_dt2 * damping_alpha_factor * self.pcg_state_v[i_b, i_v].p
+                self.elements_v_info[i_v].mass_over_dt2 * damping_alpha_factor * vector
             )
             if qd.static(self._enable_vertex_constraints):
                 vc = self.vertex_constraints[i_v, i_b]
                 if vc.is_constrained and vc.is_soft_constraint:
-                    self.pcg_state_v[i_b, i_v].Ap += vc.stiffness * self.pcg_state_v[i_b, i_v].p
+                    self.pcg_state_v[i_b, i_v].Ap += vc.stiffness * vector
 
         for i_b, i_e in qd.ndrange(self._B, self.n_elements):
-            if not self.batch_pcg_active[i_b]:
+            if not (self.batch_active[i_b] if qd.static(use_solution) else self.batch_pcg_active[i_b]):
                 continue
             V = self.elements_i[i_e].V
             B = self.elements_i[i_e].B
@@ -1160,7 +1202,12 @@ class FEMSolver(Solver):
             p9 = qd.Vector([0.0] * 9, dt=gs.qd_float)
 
             for i, j in qd.static(qd.ndrange(3, 4)):
-                p9[i * 3 : i * 3 + 3] = p9[i * 3 : i * 3 + 3] + S[j, i] * self.pcg_state_v[i_b, i_vs[j]].p
+                vector = (
+                    self.pcg_state_v[i_b, i_vs[j]].x
+                    if qd.static(use_solution)
+                    else self.pcg_state_v[i_b, i_vs[j]].p
+                )
+                p9[i * 3 : i * 3 + 3] = p9[i * 3 : i * 3 + 3] + S[j, i] * vector
 
             new_p9 = qd.Vector([0.0] * 9, dt=gs.qd_float)
 
@@ -1218,7 +1265,7 @@ class FEMSolver(Solver):
 
     @qd.kernel
     def one_pcg_iter(self):
-        self.compute_Ap()
+        self.compute_Ap(False)
 
         # compute pTAp
         for i_b in range(self._B):
@@ -1397,7 +1444,7 @@ class FEMSolver(Solver):
 
     @qd.kernel
     def _rigid_mode_compute_Ap_and_pTAp(self):
-        self.compute_Ap()
+        self.compute_Ap(False)
         for i_b in range(self._B):
             if not self.batch_pcg_active[i_b]:
                 continue
@@ -1488,17 +1535,78 @@ class FEMSolver(Solver):
         self._finish_rigid_mode_pcg_iter()
         self._update_rigid_mode_pcg_direction()
 
+    @qd.kernel
+    def _count_active_pcg_iterations(self):
+        for i_b in range(self._B):
+            if self.batch_pcg_active[i_b]:
+                self.batch_pcg_iterations[i_b] += 1
+
+    @qd.kernel
+    def _capture_true_residual_probe(self, sample_index: qd.i32):
+        self.compute_Ap(True)
+        for i_b in range(self._B):
+            self.true_residual_probe_actual_iterations[sample_index, i_b] = self.batch_pcg_iterations[i_b]
+            self.true_residual_probe_pcg_active[sample_index, i_b] = self.batch_pcg_active[i_b]
+            self.true_residual_probe_true_rTr[sample_index, i_b] = 0.0
+            self.true_residual_probe_recursive_rTr[sample_index, i_b] = self.pcg_state[i_b].rTr
+        for i_b, i_v in qd.ndrange(self._B, self.n_vertices):
+            if not self.batch_active[i_b]:
+                continue
+            residual = self.elements_v_energy[i_b, i_v].force - self.pcg_state_v[i_b, i_v].Ap
+            qd.atomic_add(self.true_residual_probe_true_rTr[sample_index, i_b], residual.dot(residual))
+
+    def _true_residual_probe_enabled_now(self):
+        return (
+            self._true_residual_probe_global_substep is not None
+            and self.sim.cur_substep_global == self._true_residual_probe_global_substep
+        )
+
+    def get_true_residual_probe(self):
+        """Return the bounded scalar receipt for the configured completed substep."""
+        if not self._true_residual_probe_enabled_now():
+            return None
+        actual = np.asarray(self.true_residual_probe_actual_iterations.to_numpy(), dtype=np.int64)
+        active = np.asarray(self.true_residual_probe_pcg_active.to_numpy(), dtype=np.bool_)
+        true_rtr = np.asarray(self.true_residual_probe_true_rTr.to_numpy(), dtype=np.float64)
+        recursive_rtr = np.asarray(self.true_residual_probe_recursive_rTr.to_numpy(), dtype=np.float64)
+        samples = tuple(
+            ImplicitFEMTrueResidualSample(
+                completed_iteration=completed_iteration,
+                actual_iterations_by_batch=tuple(int(value) for value in actual[sample_index]),
+                pcg_active_by_batch=tuple(bool(value) for value in active[sample_index]),
+                true_residual_squared_by_batch=tuple(float(value) for value in true_rtr[sample_index]),
+                recursive_residual_squared_by_batch=tuple(float(value) for value in recursive_rtr[sample_index]),
+            )
+            for sample_index, completed_iteration in enumerate(TRUE_RESIDUAL_PROBE_SCHEDULE)
+        )
+        return ImplicitFEMTrueResidualProbe(
+            global_substep_index=int(self._true_residual_probe_global_substep),
+            samples=samples,
+        )
+
     def pcg_solve(self):
+        self.batch_pcg_iterations.fill(0)
+        capture_probe = self._true_residual_probe_enabled_now()
         if self._enable_rigid_mode_deflation:
             self._init_pcg_solve_rigid_mode()
             self._apply_rigid_mode_preconditioner()
             self._finish_init_pcg_solve_rigid_mode()
+            if capture_probe:
+                self._capture_true_residual_probe(0)
             for i in range(self._n_pcg_iterations):
+                self._count_active_pcg_iterations()
                 self._one_rigid_mode_pcg_iter()
+                if capture_probe and i + 1 in TRUE_RESIDUAL_PROBE_SCHEDULE:
+                    self._capture_true_residual_probe(TRUE_RESIDUAL_PROBE_SCHEDULE.index(i + 1))
         else:
             self.init_pcg_solve()
+            if capture_probe:
+                self._capture_true_residual_probe(0)
             for i in range(self._n_pcg_iterations):
+                self._count_active_pcg_iterations()
                 self.one_pcg_iter()
+                if capture_probe and i + 1 in TRUE_RESIDUAL_PROBE_SCHEDULE:
+                    self._capture_true_residual_probe(TRUE_RESIDUAL_PROBE_SCHEDULE.index(i + 1))
 
     @qd.kernel
     def init_linesearch(self, f: qd.i32):

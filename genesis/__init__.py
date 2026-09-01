@@ -528,6 +528,8 @@ from .engine.solver_health import (
     FEMPrincipalStrainWitness,
     FEMSubstepSafetyExtrema,
     ImplicitFEMSubstepHealth,
+    ImplicitFEMTrueResidualProbe,
+    ImplicitFEMTrueResidualSample,
     SAPControlStepSolverHealth,
     SAPSubstepSolverHealth,
     SolverHealthError,

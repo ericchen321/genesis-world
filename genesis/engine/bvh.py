@@ -81,6 +81,11 @@ class LBVH(RBC):
         Number of groups to use for radix sort. More groups may improve performance but will use more memory.
     max_stack_depth : int
         Maximum stack depth for BVH traversal. Defaults to STACK_SIZE.
+    max_query_results : int, optional
+        Explicit global query-result capacity.  When omitted, the capacity is
+        ``n_batches * n_aabbs * max_n_query_result_per_aabb``.  The explicit
+        form is useful when the query side contains a smaller active subset
+        than the BVH side.
 
     Attributes
     -----
@@ -135,6 +140,7 @@ class LBVH(RBC):
         max_n_query_result_per_aabb: int = 8,
         n_radix_sort_groups: int = 256,
         max_stack_depth: int = STACK_SIZE,
+        max_query_results: int | None = None,
     ):
         if aabb.n_aabbs < 1:
             gs.raise_exception("The number of AABBs must be at least 1.")
@@ -144,7 +150,12 @@ class LBVH(RBC):
         self.n_aabbs = aabb.n_aabbs
         self.n_batches = aabb.n_batches
 
-        self.max_query_results = max(1, min(self.n_aabbs * max_n_query_result_per_aabb * self.n_batches, 0x7FFFFFFF))
+        default_max_query_results = self.n_aabbs * max_n_query_result_per_aabb * self.n_batches
+        if max_query_results is None:
+            max_query_results = max(1, min(default_max_query_results, 0x7FFFFFFF))
+        if type(max_query_results) is not int or max_query_results < 1 or max_query_results > 0x7FFFFFFF:
+            gs.raise_exception("LBVH max_query_results must be a positive int32-sized value.")
+        self.max_query_results = int(max_query_results)
         self.max_stack_depth = max_stack_depth
 
         self.aabb_centers = qd.field(gs.qd_vec3, shape=(self.n_batches, self.n_aabbs))
@@ -513,7 +524,6 @@ class LBVH(RBC):
                             stack_depth += 1
 
         return overflow
-
 
 @qd.data_oriented
 class FEMSurfaceTetLBVH(LBVH):
