@@ -4,3 +4,4 @@ sandbox_mode = "danger-full-access"
 max_depth = 2
 [features]
 goals = true
+multi_agent_v2 = true

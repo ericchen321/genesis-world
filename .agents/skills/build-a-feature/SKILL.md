@@ -7,10 +7,10 @@ description: Explore the codebase, produce a concrete implementation plan, imple
 
 Build a feature (or patch, fix) in four explicit phases, using one distinct sub-agent for each phase:
 
-1. **Explore** (5.4 mini model, high reasoning)
-2. **Plan** (latest full model, x-high reasoning, or high reasoning if x-high is unavailable)
+1. **Explore** (5.6 Luna model, max reasoning)
+2. **Plan** (latest full model, max reasoning)
 3. **Implement** (latest full model, high reasoning)
-4. **Validate** (5.4 mini model, high reasoning)
+4. **Validate** (5.6 Luna model, max reasoning)
 
 Do not skip phases unless with user's explicit instruction. Do not jump into implementation before exploration and planning are complete.
 
