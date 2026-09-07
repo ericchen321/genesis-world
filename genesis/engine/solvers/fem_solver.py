@@ -1351,26 +1351,14 @@ class FEMSolver(Solver):
             self.pcg_state[i_b].rTr_initial = 0.0
             self.pcg_state[i_b].termination_threshold = self._pcg_threshold
             self.pcg_state[i_b].rTz = 0.0
-        for i_b, i_v in qd.ndrange(self._B, self.n_vertices):
-            if not self.batch_pcg_active[i_b]:
-                continue
-            self.pcg_state_v[i_b, i_v].x = 0
-            self.pcg_state_v[i_b, i_v].r = self.elements_v_energy[i_b, i_v].force
-
-    @qd.kernel
-    def _apply_rigid_mode_block_preconditioner(self):
         for i_b, i_c in qd.ndrange(self._B, self._rigid_mode_component_count):
             self.rigid_mode_coarse_rhs[i_b, i_c] = qd.Vector.zero(gs.qd_float, 6)
         for i_b, i_v in qd.ndrange(self._B, self.n_vertices):
             if not self.batch_pcg_active[i_b]:
                 continue
+            self.pcg_state_v[i_b, i_v].x = 0
+            self.pcg_state_v[i_b, i_v].r = self.elements_v_energy[i_b, i_v].force
             self.pcg_state_v[i_b, i_v].z = self.pcg_state_v[i_b, i_v].prec @ self.pcg_state_v[i_b, i_v].r
-
-    @qd.kernel
-    def _accumulate_rigid_mode_rhs(self):
-        for i_b, i_v in qd.ndrange(self._B, self.n_vertices):
-            if not self.batch_pcg_active[i_b]:
-                continue
             i_c = self.rigid_mode_component_by_vertex[i_v]
             for i_mode in qd.static(range(6)):
                 qd.atomic_add(
@@ -1386,7 +1374,12 @@ class FEMSolver(Solver):
             )
 
     @qd.kernel
-    def _add_rigid_mode_correction(self):
+    def _finish_init_pcg_solve_rigid_mode(self):
+        for i_b in range(self._B):
+            if not self.batch_pcg_active[i_b]:
+                continue
+            self.pcg_state[i_b].rTr = 0.0
+            self.pcg_state[i_b].rTz = 0.0
         for i_b, i_v in qd.ndrange(self._B, self.n_vertices):
             if not self.batch_pcg_active[i_b]:
                 continue
@@ -1397,23 +1390,6 @@ class FEMSolver(Solver):
                     i_b, i_c
                 ][i_mode]
             self.pcg_state_v[i_b, i_v].z += correction
-
-    def _apply_rigid_mode_preconditioner(self):
-        self._apply_rigid_mode_block_preconditioner()
-        self._accumulate_rigid_mode_rhs()
-        self._solve_rigid_mode_coarse_rhs()
-        self._add_rigid_mode_correction()
-
-    @qd.kernel
-    def _finish_init_pcg_solve_rigid_mode(self):
-        for i_b in range(self._B):
-            if not self.batch_pcg_active[i_b]:
-                continue
-            self.pcg_state[i_b].rTr = 0.0
-            self.pcg_state[i_b].rTz = 0.0
-        for i_b, i_v in qd.ndrange(self._B, self.n_vertices):
-            if not self.batch_pcg_active[i_b]:
-                continue
             qd.atomic_add(self.pcg_state[i_b].rTr, self.pcg_state_v[i_b, i_v].r.dot(self.pcg_state_v[i_b, i_v].r))
             qd.atomic_add(self.pcg_state[i_b].rTz, self.pcg_state_v[i_b, i_v].r.dot(self.pcg_state_v[i_b, i_v].z))
         for i_b in range(self._B):
@@ -1444,18 +1420,19 @@ class FEMSolver(Solver):
 
     @qd.kernel
     def _rigid_mode_compute_Ap_and_pTAp(self):
-        self.compute_Ap(False)
         for i_b in range(self._B):
             if not self.batch_pcg_active[i_b]:
                 continue
+            self.batch_pcg_iterations[i_b] += 1
             self.pcg_state[i_b].pTAp = 0.0
+        self.compute_Ap(False)
         for i_b, i_v in qd.ndrange(self._B, self.n_vertices):
             if not self.batch_pcg_active[i_b]:
                 continue
             qd.atomic_add(self.pcg_state[i_b].pTAp, self.pcg_state_v[i_b, i_v].p.dot(self.pcg_state_v[i_b, i_v].Ap))
 
     @qd.kernel
-    def _rigid_mode_update_x_r(self):
+    def _rigid_mode_update_x_r_and_coarse_rhs(self):
         for i_b in range(self._B):
             if not self.batch_pcg_active[i_b]:
                 continue
@@ -1472,16 +1449,23 @@ class FEMSolver(Solver):
                 self.batch_pcg_active[i_b] = False
             else:
                 self.pcg_state[i_b].alpha = self.pcg_state[i_b].rTz / self.pcg_state[i_b].pTAp
-                self.pcg_state[i_b].rTr_new = 0.0
-                self.pcg_state[i_b].rTz_new = 0.0
+        for i_b, i_c in qd.ndrange(self._B, self._rigid_mode_component_count):
+            self.rigid_mode_coarse_rhs[i_b, i_c] = qd.Vector.zero(gs.qd_float, 6)
         for i_b, i_v in qd.ndrange(self._B, self.n_vertices):
             if not self.batch_pcg_active[i_b]:
                 continue
             self.pcg_state_v[i_b, i_v].x += self.pcg_state[i_b].alpha * self.pcg_state_v[i_b, i_v].p
             self.pcg_state_v[i_b, i_v].r -= self.pcg_state[i_b].alpha * self.pcg_state_v[i_b, i_v].Ap
+            self.pcg_state_v[i_b, i_v].z = self.pcg_state_v[i_b, i_v].prec @ self.pcg_state_v[i_b, i_v].r
+            i_c = self.rigid_mode_component_by_vertex[i_v]
+            for i_mode in qd.static(range(6)):
+                qd.atomic_add(
+                    self.rigid_mode_coarse_rhs[i_b, i_c][i_mode],
+                    self._func_rigid_mode_basis(i_b, i_v, i_mode).dot(self.pcg_state_v[i_b, i_v].r),
+                )
 
     @qd.kernel
-    def _finish_rigid_mode_pcg_iter(self):
+    def _finish_rigid_mode_pcg_iter_and_update_p(self):
         for i_b in range(self._B):
             if not self.batch_pcg_active[i_b]:
                 continue
@@ -1490,6 +1474,13 @@ class FEMSolver(Solver):
         for i_b, i_v in qd.ndrange(self._B, self.n_vertices):
             if not self.batch_pcg_active[i_b]:
                 continue
+            i_c = self.rigid_mode_component_by_vertex[i_v]
+            correction = qd.Vector.zero(gs.qd_float, 3)
+            for i_mode in qd.static(range(6)):
+                correction += self._func_rigid_mode_basis(i_b, i_v, i_mode) * self.rigid_mode_coarse_coeff[
+                    i_b, i_c
+                ][i_mode]
+            self.pcg_state_v[i_b, i_v].z += correction
             qd.atomic_add(self.pcg_state[i_b].rTr_new, self.pcg_state_v[i_b, i_v].r.dot(self.pcg_state_v[i_b, i_v].r))
             qd.atomic_add(self.pcg_state[i_b].rTz_new, self.pcg_state_v[i_b, i_v].r.dot(self.pcg_state_v[i_b, i_v].z))
 
@@ -1519,21 +1510,12 @@ class FEMSolver(Solver):
             else:
                 self.batch_pcg_active[i_b] = self.pcg_state[i_b].rTr > self.pcg_state[i_b].termination_threshold
 
-    @qd.kernel
-    def _update_rigid_mode_pcg_direction(self):
         for i_b, i_v in qd.ndrange(self._B, self.n_vertices):
             if not self.batch_pcg_active[i_b]:
                 continue
             self.pcg_state_v[i_b, i_v].p = (
                 self.pcg_state_v[i_b, i_v].z + self.pcg_state[i_b].beta * self.pcg_state_v[i_b, i_v].p
             )
-
-    def _one_rigid_mode_pcg_iter(self):
-        self._rigid_mode_compute_Ap_and_pTAp()
-        self._rigid_mode_update_x_r()
-        self._apply_rigid_mode_preconditioner()
-        self._finish_rigid_mode_pcg_iter()
-        self._update_rigid_mode_pcg_direction()
 
     @qd.kernel
     def _count_active_pcg_iterations(self):
@@ -1589,13 +1571,15 @@ class FEMSolver(Solver):
         capture_probe = self._true_residual_probe_enabled_now()
         if self._enable_rigid_mode_deflation:
             self._init_pcg_solve_rigid_mode()
-            self._apply_rigid_mode_preconditioner()
+            self._solve_rigid_mode_coarse_rhs()
             self._finish_init_pcg_solve_rigid_mode()
             if capture_probe:
                 self._capture_true_residual_probe(0)
             for i in range(self._n_pcg_iterations):
-                self._count_active_pcg_iterations()
-                self._one_rigid_mode_pcg_iter()
+                self._rigid_mode_compute_Ap_and_pTAp()
+                self._rigid_mode_update_x_r_and_coarse_rhs()
+                self._solve_rigid_mode_coarse_rhs()
+                self._finish_rigid_mode_pcg_iter_and_update_p()
                 if capture_probe and i + 1 in TRUE_RESIDUAL_PROBE_SCHEDULE:
                     self._capture_true_residual_probe(TRUE_RESIDUAL_PROBE_SCHEDULE.index(i + 1))
         else:

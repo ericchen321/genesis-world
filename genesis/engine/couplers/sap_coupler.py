@@ -5,16 +5,18 @@ import math
 import igl
 import numpy as np
 import quadrants as qd
+import torch
 
 import genesis as gs
 import genesis.utils.element as eu
 import genesis.utils.array_class as array_class
 import genesis.utils.geom as gu
+from genesis.utils.misc import qd_to_torch
 from genesis.constants import IntEnum
 from genesis.engine.bvh import (
     AABB,
-    LBVH,
     FEMSurfaceTetLBVH,
+    RigidLocalTriBVHForest,
     RigidTetLBVH,
 )
 from genesis.engine.rigid_fem_contact import (
@@ -349,6 +351,11 @@ class SAPCoupler(RBC):
         )
         self._rigid_fem_contact_completed = None
         self._rigid_fem_whitelist_receipt = None
+        self._rigid_fem_public_capacity = 0
+        self._rigid_fem_public_i32 = None
+        self._rigid_fem_public_f64 = None
+        self._rigid_fem_public_i32_host = None
+        self._rigid_fem_public_f64_host = None
 
         if options.rigid_rigid_contact_type == "tet":
             self._rigid_rigid_contact_type = RigidRigidContactType.TET
@@ -452,6 +459,12 @@ class SAPCoupler(RBC):
             face_enabled, self._rigid_fem_whitelist_receipt = _build_rigid_fem_face_whitelist(self.rigid_solver)
             self.rigid_fem_face_enabled = qd.field(gs.qd_bool, shape=(self.rigid_solver.n_faces,))
             self.rigid_fem_face_enabled.from_numpy(face_enabled)
+            compact_to_global_face = np.flatnonzero(face_enabled).astype(np.int32, copy=False)
+            self.n_rigid_fem_faces = len(compact_to_global_face)
+            self.rigid_fem_compact_to_global_face = qd.field(
+                gs.qd_int, shape=(self.n_rigid_fem_faces,), needs_grad=False
+            )
+            self.rigid_fem_compact_to_global_face.from_numpy(compact_to_global_face)
             self.rigid_fem_contact = RigidFemTriTetContactHandler(self.sim)
             self.contact_handlers.append(self.rigid_fem_contact)
             if self._enable_development_direct_replay_finger_contact_flags:
@@ -637,13 +650,20 @@ class SAPCoupler(RBC):
             )
 
         if self._enable_rigid_fem_contact:
-            self.rigid_tri_aabb = AABB(self.sim._B, self.rigid_solver.n_faces)
-            max_n_query_result_per_aabb = (
+            old_per_aabb = (
                 max(self.rigid_solver.n_faces, self.fem_solver.n_surface_elements)
                 * MAX_N_QUERY_RESULT_PER_AABB
                 // self.rigid_solver.n_faces
             )
-            self.rigid_tri_bvh = LBVH(self.rigid_tri_aabb, max_n_query_result_per_aabb)
+            old_max_query_results = max(
+                1,
+                min(self.sim._B * self.rigid_solver.n_faces * old_per_aabb, 0x7FFFFFFF),
+            )
+            self.rigid_local_tri_bvh_forest = RigidLocalTriBVHForest(
+                self,
+                self.rigid_fem_compact_to_global_face.to_numpy(),
+                old_max_query_results,
+            )
 
         if self.rigid_solver.is_active and self._rigid_rigid_contact_type == RigidRigidContactType.TET:
             self.rigid_tet_aabb = AABB(self.sim._B, self.n_rigid_volume_elems)
@@ -1170,6 +1190,8 @@ class SAPCoupler(RBC):
             free_verts_state=self.rigid_solver.free_verts_state,
             fixed_verts_state=self.rigid_solver.fixed_verts_state,
             geoms_info=self.rigid_solver.geoms_info,
+            geoms_pos=self.rigid_solver.geoms_state.pos,
+            geoms_quat=self.rigid_solver.geoms_state.quat,
             friction_ratio=self.rigid_solver.geoms_state.friction_ratio,
             dofs_state=self.rigid_solver.dofs_state,
             links_state=self.rigid_solver.links_state,
@@ -1225,6 +1247,8 @@ class SAPCoupler(RBC):
         free_verts_state: array_class.VertsState,
         fixed_verts_state: array_class.VertsState,
         geoms_info: array_class.GeomsInfo,
+        geoms_pos: qd.Tensor,
+        geoms_quat: qd.Tensor,
         friction_ratio: qd.Tensor,
         dofs_state: array_class.DofsState,
         links_state: array_class.LinksState,
@@ -1256,6 +1280,8 @@ class SAPCoupler(RBC):
                 free_verts_state=free_verts_state,
                 fixed_verts_state=fixed_verts_state,
                 geoms_info=geoms_info,
+                geoms_pos=geoms_pos,
+                geoms_quat=geoms_quat,
                 friction_ratio=friction_ratio,
             )
             has_contact |= self.rigid_fem_contact.n_contact_pairs[None] > 0
@@ -1798,6 +1824,30 @@ class SAPCoupler(RBC):
             )
         return np.array(flags != 0, dtype=np.bool_, order="C", copy=True)
 
+    @qd.kernel
+    def _pack_rigid_fem_public_prefix(
+        self,
+        n_contacts: qd.i32,
+        public_i32: qd.types.ndarray(),
+        public_f64: qd.types.ndarray(),
+    ):
+        pairs = qd.static(self.rigid_fem_contact.contact_pairs)
+        for i_p in range(n_contacts):
+            public_i32[i_p, 0] = pairs[i_p].batch_idx
+            public_i32[i_p, 1] = pairs[i_p].link_idx
+            public_i32[i_p, 2] = pairs[i_p].rigid_geom_idx
+            public_i32[i_p, 3] = pairs[i_p].rigid_face_idx
+            public_i32[i_p, 4] = pairs[i_p].geom_idx0
+            public_i32[i_p, 5] = pairs[i_p].public_mode
+            for axis in qd.static(range(3)):
+                public_f64[i_p, axis] = pairs[i_p].contact_pos[axis]
+                public_f64[i_p, 3 + axis] = pairs[i_p].normal[axis]
+                public_f64[i_p, 6 + axis] = pairs[i_p].tangent0[axis]
+                public_f64[i_p, 9 + axis] = pairs[i_p].tangent1[axis]
+                public_f64[i_p, 13 + axis] = pairs[i_p].public_gamma[axis]
+                public_f64[i_p, 16 + axis] = pairs[i_p].public_relative_velocity[axis]
+            public_f64[i_p, 12] = pairs[i_p].sap_info.phi0
+
     def get_rigid_fem_contacts(self):
         if not self._enable_rigid_fem_contact or not hasattr(self, "rigid_fem_contact"):
             raise RigidFEMContactUnavailableError("scene has no usable SAP rigid--FEM contact subsystem")
@@ -1806,30 +1856,49 @@ class SAPCoupler(RBC):
 
         handler = self.rigid_fem_contact
         n_contacts = int(handler.n_contact_pairs[None])
-
-        def take(field, dtype, width=None):
-            value = np.asarray(field.to_numpy())[:n_contacts]
-            expected_shape = (n_contacts,) if width is None else (n_contacts, width)
-            value = np.array(value, dtype=dtype, order="C", copy=True)
-            if value.shape != expected_shape:
-                raise RigidFEMContactUnavailableError(
-                    f"internal SAP contact field shape {value.shape} does not match {expected_shape}"
+        if n_contacts == 0:
+            public_i32 = np.empty((0, 6), dtype=np.int32)
+            public_f64 = np.empty((0, 19), dtype=np.float64)
+        else:
+            if n_contacts > self._rigid_fem_public_capacity:
+                capacity = 1 << (n_contacts - 1).bit_length()
+                self._rigid_fem_public_capacity = capacity
+                self._rigid_fem_public_i32 = qd.ndarray(qd.i32, shape=(capacity, 6))
+                self._rigid_fem_public_f64 = qd.ndarray(gs.qd_float, shape=(capacity, 19))
+                self._rigid_fem_public_i32_host = torch.empty(
+                    (capacity, 6), dtype=torch.int32, pin_memory=True, device="cpu"
                 )
-            return value
+                self._rigid_fem_public_f64_host = torch.empty(
+                    (capacity, 19), dtype=torch.float64, pin_memory=True, device="cpu"
+                )
+            self._pack_rigid_fem_public_prefix(
+                n_contacts, self._rigid_fem_public_i32, self._rigid_fem_public_f64
+            )
+            device_i32 = qd_to_torch(self._rigid_fem_public_i32, copy=False)
+            device_f64 = qd_to_torch(self._rigid_fem_public_f64, copy=False)
+            self._rigid_fem_public_i32_host[:n_contacts].copy_(device_i32[:n_contacts], non_blocking=True)
+            self._rigid_fem_public_f64_host[:n_contacts].copy_(device_f64[:n_contacts], non_blocking=True)
+            torch.cuda.current_stream().synchronize()
+            public_i32 = np.array(
+                self._rigid_fem_public_i32_host[:n_contacts].numpy(), dtype=np.int32, order="C", copy=True
+            )
+            public_f64 = np.array(
+                self._rigid_fem_public_f64_host[:n_contacts].numpy(), dtype=np.float64, order="C", copy=True
+            )
 
-        env_idx = take(handler.contact_pairs.batch_idx, np.int64)
-        rigid_link_idx = take(handler.contact_pairs.link_idx, np.int64)
-        rigid_geom_idx = take(handler.contact_pairs.rigid_geom_idx, np.int64)
-        rigid_face_idx = take(handler.contact_pairs.rigid_face_idx, np.int64)
-        fem_element_global = take(handler.contact_pairs.geom_idx0, np.int64)
-        point_m = take(handler.contact_pairs.contact_pos, np.float64, 3)
-        normal_world = take(handler.contact_pairs.normal, np.float64, 3)
-        tangent0 = take(handler.contact_pairs.tangent0, np.float64, 3)
-        tangent1 = take(handler.contact_pairs.tangent1, np.float64, 3)
-        signed_gap_m = take(handler.contact_pairs.sap_info.phi0, np.float64)
-        gamma = take(handler.contact_pairs.public_gamma, np.float64, 3)
-        relative_velocity = take(handler.contact_pairs.public_relative_velocity, np.float64, 3)
-        mode_values = take(handler.contact_pairs.public_mode, np.int64)
+        env_idx = public_i32[:, 0].astype(np.int64, copy=True)
+        rigid_link_idx = public_i32[:, 1].astype(np.int64, copy=True)
+        rigid_geom_idx = public_i32[:, 2].astype(np.int64, copy=True)
+        rigid_face_idx = public_i32[:, 3].astype(np.int64, copy=True)
+        fem_element_global = public_i32[:, 4].astype(np.int64, copy=True)
+        mode_values = public_i32[:, 5].astype(np.int64, copy=True)
+        point_m = np.array(public_f64[:, 0:3], order="C", copy=True)
+        normal_world = np.array(public_f64[:, 3:6], order="C", copy=True)
+        tangent0 = np.array(public_f64[:, 6:9], order="C", copy=True)
+        tangent1 = np.array(public_f64[:, 9:12], order="C", copy=True)
+        signed_gap_m = np.array(public_f64[:, 12], order="C", copy=True)
+        gamma = np.array(public_f64[:, 13:16], order="C", copy=True)
+        relative_velocity = np.array(public_f64[:, 16:19], order="C", copy=True)
 
         rigid_entity_idx = np.empty((n_contacts,), dtype=np.int64)
         fem_entity_idx = np.empty((n_contacts,), dtype=np.int64)
@@ -2091,7 +2160,12 @@ class SAPCoupler(RBC):
             self.update_fem_surface_tet_bvh(i_step)
 
         if self._enable_rigid_fem_contact:
-            self.update_rigid_tri_bvh()
+            self.rigid_local_tri_bvh_forest.update_world_root_aabbs(
+                links_info=self.rigid_solver.links_info,
+                geoms_info=self.rigid_solver.geoms_info,
+                geoms_state=self.rigid_solver.geoms_state,
+                static_rigid_sim_config=self.rigid_solver._static_rigid_sim_config,
+            )
 
         if self.rigid_solver.is_active and self._rigid_rigid_contact_type == RigidRigidContactType.TET:
             self.update_rigid_tet_bvh()
@@ -2099,18 +2173,6 @@ class SAPCoupler(RBC):
     def update_fem_surface_tet_bvh(self, i_step: qd.i32):
         self.compute_fem_surface_tet_aabb(i_step)
         self.fem_surface_tet_bvh.build()
-
-    def update_rigid_tri_bvh(self):
-        self.compute_rigid_tri_aabb(
-            links_info=self.rigid_solver.links_info,
-            faces_info=self.rigid_solver.faces_info,
-            geoms_info=self.rigid_solver.geoms_info,
-            free_verts_state=self.rigid_solver.free_verts_state,
-            fixed_verts_state=self.rigid_solver.fixed_verts_state,
-            verts_info=self.rigid_solver.verts_info,
-            static_rigid_sim_config=self.rigid_solver._static_rigid_sim_config,
-        )
-        self.rigid_tri_bvh.build()
 
     def update_rigid_tet_bvh(self):
         self.compute_rigid_tet_aabb()
@@ -2129,55 +2191,6 @@ class SAPCoupler(RBC):
                 pos_v = self.fem_solver.elements_v[i_step, i_vs[i], i_b].pos
                 aabbs[i_b, i_se].min = qd.min(aabbs[i_b, i_se].min, pos_v)
                 aabbs[i_b, i_se].max = qd.max(aabbs[i_b, i_se].max, pos_v)
-
-    @qd.kernel
-    def compute_rigid_tri_aabb(
-        self,
-        links_info: array_class.LinksInfo,
-        faces_info: array_class.FacesInfo,
-        geoms_info: array_class.GeomsInfo,
-        free_verts_state: array_class.VertsState,
-        fixed_verts_state: array_class.VertsState,
-        verts_info: array_class.VertsInfo,
-        static_rigid_sim_config: qd.template(),
-    ):
-        aabbs = qd.static(self.rigid_tri_aabb.aabbs)
-        for i_b, i_f in qd.ndrange(self.rigid_solver._B, self.rigid_solver.n_faces):
-            valid_face = self.rigid_fem_face_enabled[i_f]
-            if valid_face == False:
-                aabbs[i_b, i_f].min.fill(np.inf)
-                aabbs[i_b, i_f].max.fill(-np.inf)
-            else:
-                i_g = verts_info.geom_idx[faces_info.verts_idx[i_f][0]]
-                i_l = geoms_info.link_idx[i_g]
-                geom_start = qd.i32(0)
-                geom_end = qd.i32(0)
-                if qd.static(static_rigid_sim_config.batch_links_info):
-                    geom_start = links_info.geom_start[i_l, i_b]
-                    geom_end = links_info.geom_end[i_l, i_b]
-                else:
-                    geom_start = links_info.geom_start[i_l]
-                    geom_end = links_info.geom_end[i_l]
-                valid_geometry = i_g >= geom_start
-                if valid_geometry:
-                    valid_geometry = i_g < geom_end
-                if valid_geometry == False:
-                    aabbs[i_b, i_f].min.fill(np.inf)
-                    aabbs[i_b, i_f].max.fill(-np.inf)
-                else:
-                    tri_vertices = qd.Matrix.zero(gs.qd_float, 3, 3)
-                    for i in qd.static(range(3)):
-                        i_v = faces_info.verts_idx[i_f][i]
-                        i_fv = verts_info.verts_state_idx[i_v]
-                        if verts_info.is_fixed[i_v]:
-                            tri_vertices[:, i] = fixed_verts_state.pos[i_fv]
-                        else:
-                            tri_vertices[:, i] = free_verts_state.pos[i_fv, i_b]
-                    pos_v0 = tri_vertices[:, 0]
-                    pos_v1 = tri_vertices[:, 1]
-                    pos_v2 = tri_vertices[:, 2]
-                    aabbs[i_b, i_f].min = qd.min(pos_v0, pos_v1, pos_v2)
-                    aabbs[i_b, i_f].max = qd.max(pos_v0, pos_v1, pos_v2)
 
     @qd.kernel
     def compute_rigid_tet_aabb(self):
@@ -3711,10 +3724,15 @@ class SAPCoupler(RBC):
                         self.rigid_fem_contact_patch_raw_fem[i_b, i_v, i_mode][axis],
                         weight * world_mode[axis],
                     )
-            for i_d in range(self.rigid_solver.n_dofs):
+            i_link = pairs[i_row].link_idx
+            support_start = self.rigid_fem_contact.link_support_offsets[i_link]
+            support_end = self.rigid_fem_contact.link_support_offsets[i_link + 1]
+            for support_index in range(support_start, support_end):
+                slot = support_index - support_start
+                i_d = self.rigid_fem_contact.link_support_dofs[support_index]
                 qd.atomic_add(
                     self.rigid_fem_contact_patch_raw_rigid[i_b, i_d, i_mode],
-                    -self.rigid_fem_contact.Jt[i_row, i_d].dot(world_mode),
+                    -self.rigid_fem_contact.J_rigid[i_row, slot].dot(world_mode),
                 )
 
     @qd.kernel
@@ -7337,6 +7355,13 @@ class RigidFemTriTetContactHandler(RigidFEMContactHandler):
         self.n_contact_candidates_overflow = qd.field(gs.qd_int, shape=())
         self.max_contact_candidates = max(self.fem_solver.n_surface_elements, self.rigid_solver.n_faces) * self.fem_solver._B * 8
         self.contact_candidates = self.contact_candidate_type.field(shape=(self.max_contact_candidates,))
+        self.active_tet = qd.field(gs.qd_bool, shape=(self.fem_solver._B, self.fem_solver.n_elements))
+        self.tet_clip_plane_points = qd.field(
+            gs.qd_vec3, shape=(self.fem_solver._B, self.fem_solver.n_elements, 4)
+        )
+        self.tet_clip_plane_normals = qd.field(
+            gs.qd_vec3, shape=(self.fem_solver._B, self.fem_solver.n_elements, 4)
+        )
         self.contact_pair_type = qd.types.struct(
             batch_idx=gs.qd_int,  # batch index
             normal=gs.qd_vec3,  # contact plane normal
@@ -7362,9 +7387,64 @@ class RigidFemTriTetContactHandler(RigidFEMContactHandler):
         self.n_contact_pairs_attempted = qd.field(gs.qd_int, shape=())
         self.n_contact_pairs_dropped = qd.field(gs.qd_int, shape=())
         self.n_contact_pairs_overflow = qd.field(gs.qd_int, shape=())
-        self.Jt = qd.field(gs.qd_vec3, shape=(self.max_contact_pairs, self.rigid_solver.n_dofs))
-        self.M_inv_Jt = qd.field(gs.qd_vec3, shape=(self.max_contact_pairs, self.rigid_solver.n_dofs))
+        links_by_index = {link.idx: link for link in self.rigid_solver.links}
+        support_offsets = np.zeros(self.rigid_solver.n_links + 1, dtype=np.int32)
+        support_dofs = []
+        support_source_links = []
+        link_owner_entity = np.zeros(self.rigid_solver.n_links, dtype=np.int32)
+        entity_slot_by_index = {entity.idx: slot for slot, entity in enumerate(self.rigid_solver.entities)}
+        for link_index in range(self.rigid_solver.n_links):
+            link = links_by_index[link_index]
+            link_owner_entity[link_index] = entity_slot_by_index[link.entity.idx]
+            current = link
+            while current is not None:
+                for i_d in range(current.dof_end - 1, current.dof_start - 1, -1):
+                    support_dofs.append(i_d)
+                    support_source_links.append(current.idx)
+                current = links_by_index.get(current.parent_idx)
+            support_offsets[link_index + 1] = len(support_dofs)
+        entity_dof_start = np.asarray([entity.dof_start for entity in self.rigid_solver.entities], dtype=np.int32)
+        entity_dof_count = np.asarray([entity.n_dofs for entity in self.rigid_solver.entities], dtype=np.int32)
+        self.max_link_support = int(np.max(np.diff(support_offsets), initial=0))
+        self.max_entity_dofs = int(np.max(entity_dof_count, initial=0))
+        self.link_support_offsets = qd.field(gs.qd_int, shape=support_offsets.shape, needs_grad=False)
+        self.link_support_dofs = qd.field(gs.qd_int, shape=(len(support_dofs),), needs_grad=False)
+        self.link_support_source_links = qd.field(
+            gs.qd_int, shape=(len(support_source_links),), needs_grad=False
+        )
+        self.link_owner_entity = qd.field(gs.qd_int, shape=link_owner_entity.shape, needs_grad=False)
+        self.entity_dof_start = qd.field(gs.qd_int, shape=entity_dof_start.shape, needs_grad=False)
+        self.entity_dof_count = qd.field(gs.qd_int, shape=entity_dof_count.shape, needs_grad=False)
+        self.link_support_offsets.from_numpy(support_offsets)
+        self.link_support_dofs.from_numpy(np.asarray(support_dofs, dtype=np.int32))
+        self.link_support_source_links.from_numpy(np.asarray(support_source_links, dtype=np.int32))
+        self.link_owner_entity.from_numpy(link_owner_entity)
+        self.entity_dof_start.from_numpy(entity_dof_start)
+        self.entity_dof_count.from_numpy(entity_dof_count)
+        self.J_rigid = qd.field(gs.qd_vec3, shape=(self.max_contact_pairs, self.max_link_support))
+        self.rigid_delassus_work = qd.field(
+            gs.qd_vec3, shape=(self.max_contact_pairs, self.max_entity_dofs)
+        )
         self.W = qd.field(gs.qd_mat3, shape=(self.max_contact_pairs,))
+
+    @qd.func
+    def compute_jacobian(
+        self, links_info: array_class.LinksInfo, dofs_state: array_class.DofsState, links_state: array_class.LinksState
+    ):
+        pairs = qd.static(self.contact_pairs)
+        for i_p in range(self.n_contact_pairs[None]):
+            i_b = pairs[i_p].batch_idx
+            i_link = pairs[i_p].link_idx
+            support_start = self.link_support_offsets[i_link]
+            support_end = self.link_support_offsets[i_link + 1]
+            for support_index in range(support_start, support_end):
+                slot = support_index - support_start
+                i_d = self.link_support_dofs[support_index]
+                source_link = self.link_support_source_links[support_index]
+                angular = dofs_state.cdof_ang[i_d, i_b]
+                linear = dofs_state.cdof_vel[i_d, i_b]
+                offset = pairs[i_p].contact_pos - links_state.root_COM[source_link, i_b]
+                self.J_rigid[i_p, slot] = linear + angular.cross(offset)
 
     @qd.func
     def _append_candidate(
@@ -7388,6 +7468,7 @@ class RigidFemTriTetContactHandler(RigidFEMContactHandler):
                 self.contact_candidates[i_c].geom_idx0 = i_q
                 self.contact_candidates[i_c].geom_idx1 = i_a
                 self.contact_candidates[i_c].vert_idx1 = vert_idx1
+                self.active_tet[i_b, i_q] = True
             else:
                 qd.atomic_add(self.n_contact_candidates_dropped[None], 1)
                 self.n_contact_candidates_overflow[None] = 1
@@ -7399,7 +7480,7 @@ class RigidFemTriTetContactHandler(RigidFEMContactHandler):
         return qd.i32(overflow)
 
     @qd.func
-    def _compute_candidates_legacy_view(
+    def _compute_candidates_from_local_forest(
         self,
         f: qd.i32,
         faces_info: array_class.FacesInfo,
@@ -7407,63 +7488,57 @@ class RigidFemTriTetContactHandler(RigidFEMContactHandler):
         free_verts_state: array_class.VertsState,
         fixed_verts_state: array_class.VertsState,
     ):
-        """Keep the historical dense global-query path feature-disabled."""
         overflow = qd.i32(0)
         result_count = qd.min(
-            self.coupler.rigid_tri_bvh.query_result_count[None],
-            self.coupler.rigid_tri_bvh.max_query_results,
+            self.coupler.rigid_local_tri_bvh_forest.query_result_count[None],
+            self.coupler.rigid_local_tri_bvh_forest.max_query_results,
         )
         for i_r in range(result_count):
-            query_record = self.coupler.rigid_tri_bvh.query_result[i_r]
+            query_record = self.coupler.rigid_local_tri_bvh_forest.query_result[i_r]
             i_b = query_record[0]
-            i_a = query_record[1]
+            i_a = self.coupler.rigid_fem_compact_to_global_face[query_record[1]]
             i_sq = query_record[2]
-            valid_face = i_a >= 0
-            if valid_face:
-                valid_face = self.coupler.rigid_fem_face_enabled[i_a]
-            if valid_face == True:
-                i_cell = i_sq
-                i_q = self.fem_solver.surface_elements[i_sq]
-                g0 = self.coupler.fem_pressure_gradient[i_b, i_q]
-                vert_idx1 = qd.Vector.zero(gs.qd_int, 3)
-                tri_vertices = qd.Matrix.zero(gs.qd_float, 3, 3)
-                for i in qd.static(range(3)):
-                    i_v = faces_info.verts_idx[i_a][i]
-                    i_fv = verts_info.verts_state_idx[i_v]
-                    if verts_info.is_fixed[i_v]:
-                        tri_vertices[:, i] = fixed_verts_state.pos[i_fv]
-                    else:
-                        tri_vertices[:, i] = free_verts_state.pos[i_fv, i_b]
-                    vert_idx1[i] = i_v
-                pos_v0 = tri_vertices[:, 0]
-                pos_v1 = tri_vertices[:, 1]
-                pos_v2 = tri_vertices[:, 2]
-                normal = (pos_v1 - pos_v0).cross(pos_v2 - pos_v0)
-                magnitude_sqr = normal.norm_sqr()
-                valid_normal = magnitude_sqr >= gs.EPS
-                if valid_normal == True:
-                    normal *= qd.rsqrt(magnitude_sqr)
-                    valid_normal = g0.dot(normal) >= gs.EPS
-                if valid_normal == True:
-                    intersection_code = qd.int32(0)
-                    for i in qd.static(range(4)):
-                        i_v = self.fem_solver.elements_i[i_q].el2v[i]
-                        pos_v = self.fem_solver.elements_v[f, i_v, i_b].pos
-                        distance = (pos_v - pos_v0).dot(normal)
-                        if distance > 0.0:
-                            intersection_code |= 1 << i
-                    intersects = intersection_code != 0
-                    if intersects == True:
-                        intersects = intersection_code != 15
-                    if intersects == True:
-                        overflow |= self._append_candidate(
-                            i_b,
-                            normal,
-                            pos_v0,
-                            i_q,
-                            i_a,
-                            vert_idx1,
-                        )
+            i_q = self.fem_solver.surface_elements[i_sq]
+            g0 = self.coupler.fem_pressure_gradient[i_b, i_q]
+            vert_idx1 = qd.Vector.zero(gs.qd_int, 3)
+            tri_vertices = qd.Matrix.zero(gs.qd_float, 3, 3)
+            for i in qd.static(range(3)):
+                i_v = faces_info.verts_idx[i_a][i]
+                i_fv = verts_info.verts_state_idx[i_v]
+                if verts_info.is_fixed[i_v]:
+                    tri_vertices[:, i] = fixed_verts_state.pos[i_fv]
+                else:
+                    tri_vertices[:, i] = free_verts_state.pos[i_fv, i_b]
+                vert_idx1[i] = i_v
+            pos_v0 = tri_vertices[:, 0]
+            pos_v1 = tri_vertices[:, 1]
+            pos_v2 = tri_vertices[:, 2]
+            normal = (pos_v1 - pos_v0).cross(pos_v2 - pos_v0)
+            magnitude_sqr = normal.norm_sqr()
+            valid_normal = magnitude_sqr >= gs.EPS
+            if valid_normal == True:
+                normal *= qd.rsqrt(magnitude_sqr)
+                valid_normal = g0.dot(normal) >= gs.EPS
+            if valid_normal == True:
+                intersection_code = qd.int32(0)
+                for i in qd.static(range(4)):
+                    i_v = self.fem_solver.elements_i[i_q].el2v[i]
+                    pos_v = self.fem_solver.elements_v[f, i_v, i_b].pos
+                    distance = (pos_v - pos_v0).dot(normal)
+                    if distance > 0.0:
+                        intersection_code |= 1 << i
+                intersects = intersection_code != 0
+                if intersects == True:
+                    intersects = intersection_code != 15
+                if intersects == True:
+                    overflow |= self._append_candidate(
+                        i_b,
+                        normal,
+                        pos_v0,
+                        i_q,
+                        i_a,
+                        vert_idx1,
+                    )
         return overflow != 0
 
     @qd.func
@@ -7479,13 +7554,34 @@ class RigidFemTriTetContactHandler(RigidFEMContactHandler):
         self.n_contact_candidates_attempted[None] = 0
         self.n_contact_candidates_dropped[None] = 0
         self.n_contact_candidates_overflow[None] = 0
-        return self._compute_candidates_legacy_view(
+        for i_b, i_e in qd.ndrange(self.fem_solver._B, self.fem_solver.n_elements):
+            self.active_tet[i_b, i_e] = False
+        return self._compute_candidates_from_local_forest(
             f,
             faces_info,
             verts_info,
             free_verts_state,
             fixed_verts_state,
         )
+
+    @qd.func
+    def _populate_active_tet_clip_planes(self, f: qd.i32):
+        normal_signs = qd.Vector([1.0, -1.0, 1.0, -1.0])
+        for i_b, i_e in qd.ndrange(self.fem_solver._B, self.fem_solver.n_elements):
+            if not self.active_tet[i_b, i_e]:
+                continue
+            tet_vertices = qd.Matrix.zero(gs.qd_float, 3, 4)
+            for i in qd.static(range(4)):
+                i_v = self.fem_solver.elements_i[i_e].el2v[i]
+                tet_vertices[:, i] = self.fem_solver.elements_v[f, i_v, i_b].pos
+            for face in qd.static(range(4)):
+                x = tet_vertices[:, (face + 1) % 4]
+                normal = (tet_vertices[:, (face + 2) % 4] - x).cross(
+                    tet_vertices[:, (face + 3) % 4] - x
+                ) * normal_signs[face]
+                normal /= normal.norm()
+                self.tet_clip_plane_points[i_b, i_e, face] = x
+                self.tet_clip_plane_normals[i_b, i_e, face] = normal
 
     @qd.func
     def compute_pairs(
@@ -7505,7 +7601,6 @@ class RigidFemTriTetContactHandler(RigidFEMContactHandler):
         """
         sap_info = qd.static(self.contact_pairs.sap_info)
         overflow = False
-        normal_signs = qd.Vector([1.0, -1.0, 1.0, -1.0])  # make normal point outward
         self.n_contact_pairs[None] = 0
         self.n_contact_pairs_attempted[None] = 0
         self.n_contact_pairs_dropped[None] = 0
@@ -7516,8 +7611,6 @@ class RigidFemTriTetContactHandler(RigidFEMContactHandler):
             i_e = self.contact_candidates[i_c].geom_idx0
 
             tri_vertices = qd.Matrix.zero(gs.qd_float, 3, 3)  # 3 vertices of the triangle
-            tet_vertices = qd.Matrix.zero(gs.qd_float, 3, 4)  # 4 vertices of tet 0
-            tet_pressures = qd.Vector.zero(gs.qd_float, 4)  # pressures at the vertices of tet 0
             for i in qd.static(range(3)):
                 i_v = self.contact_candidates[i_c].vert_idx1[i]
                 i_fv = verts_info.verts_state_idx[i_v]
@@ -7525,10 +7618,6 @@ class RigidFemTriTetContactHandler(RigidFEMContactHandler):
                     tri_vertices[:, i] = fixed_verts_state.pos[i_fv]
                 else:
                     tri_vertices[:, i] = free_verts_state.pos[i_fv, i_b]
-            for i in qd.static(range(4)):
-                i_v = self.fem_solver.elements_i[i_e].el2v[i]
-                tet_vertices[:, i] = self.fem_solver.elements_v[f, i_v, i_b].pos
-                tet_pressures[i] = self.coupler.fem_pressure[i_v]
 
             polygon_vertices = qd.Matrix.zero(gs.qd_float, 3, 7)  # maximum 7 vertices
             polygon_n_vertices = 3
@@ -7541,11 +7630,8 @@ class RigidFemTriTetContactHandler(RigidFEMContactHandler):
             for face in range(4):
                 if clipping_active:
                     clipped_n_vertices = 0
-                    x = tet_vertices[:, (face + 1) % 4]
-                    normal = (tet_vertices[:, (face + 2) % 4] - x).cross(
-                        tet_vertices[:, (face + 3) % 4] - x
-                    ) * normal_signs[face]
-                    normal /= normal.norm()
+                    x = self.tet_clip_plane_points[i_b, i_e, face]
+                    normal = self.tet_clip_plane_normals[i_b, i_e, face]
 
                     for i in range(polygon_n_vertices):
                         distances[i] = (polygon_vertices[:, i] - x).dot(normal)
@@ -7571,6 +7657,13 @@ class RigidFemTriTetContactHandler(RigidFEMContactHandler):
 
             if polygon_n_vertices < 3:
                 continue
+
+            tet_vertices = qd.Matrix.zero(gs.qd_float, 3, 4)  # 4 vertices of tet 0
+            tet_pressures = qd.Vector.zero(gs.qd_float, 4)  # pressures at the vertices of tet 0
+            for i in qd.static(range(4)):
+                i_v = self.fem_solver.elements_i[i_e].el2v[i]
+                tet_vertices[:, i] = self.fem_solver.elements_v[f, i_v, i_b].pos
+                tet_pressures[i] = self.coupler.fem_pressure[i_v]
 
             total_area = 0.0
             total_area_weighted_centroid = qd.Vector.zero(gs.qd_float, 3)
@@ -7613,8 +7706,6 @@ class RigidFemTriTetContactHandler(RigidFEMContactHandler):
             i_g = verts_info.geom_idx[self.contact_candidates[i_c].vert_idx1[0]]
             i_l = geoms_info.link_idx[i_g]
             i_f = self.contact_candidates[i_c].geom_idx1
-            if self.coupler.rigid_fem_face_enabled[i_f] == False:
-                continue
             pair_attempted = qd.atomic_add(self.n_contact_pairs_attempted[None], 1)
             i_p = qd.i32(0)
             pair_slot_available = pair_attempted < self.max_contact_pairs
@@ -7681,11 +7772,22 @@ class RigidFemTriTetContactHandler(RigidFEMContactHandler):
         free_verts_state: array_class.VertsState,
         fixed_verts_state: array_class.VertsState,
         geoms_info: array_class.GeomsInfo,
+        geoms_pos: qd.Tensor,
+        geoms_quat: qd.Tensor,
         friction_ratio: qd.Tensor,
     ):
         overflow = False
-        overflow |= self.coupler.rigid_tri_bvh.query(self.coupler.fem_surface_tet_aabb.aabbs)
+        overflow |= self.coupler.rigid_local_tri_bvh_forest.query(
+            f,
+            faces_info,
+            verts_info,
+            free_verts_state,
+            fixed_verts_state,
+            geoms_pos,
+            geoms_quat,
+        )
         overflow |= self.compute_candidates(f, faces_info, verts_info, free_verts_state, fixed_verts_state)
+        self._populate_active_tet_clip_planes(f)
         overflow |= self.compute_pairs(
             f,
             verts_info,
@@ -7703,19 +7805,47 @@ class RigidFemTriTetContactHandler(RigidFEMContactHandler):
         rigid_global_info: array_class.RigidGlobalInfo,
     ):
         dt2_inv = 1.0 / self.sim._substep_dt**2
-        # rigid
-        self.coupler.rigid_solve_jacobian(
-            self.Jt,
-            self.M_inv_Jt,
-            self.n_contact_pairs[None],
-            self.contact_pairs.batch_idx,
-            3,
-            entities_info=entities_info,
-            rigid_global_info=rigid_global_info,
-        )
-        self.W.fill(0.0)
-        for i_p, i_d, i, j in qd.ndrange(self.n_contact_pairs[None], self.rigid_solver.n_dofs, 3, 3):
-            self.W[i_p][i, j] += self.M_inv_Jt[i_p, i_d][i] * self.Jt[i_p, i_d][j]
+        for i_p in range(self.n_contact_pairs[None]):
+            self.W[i_p] = qd.Matrix.zero(gs.qd_float, 3, 3)
+            i_link = self.contact_pairs[i_p].link_idx
+            i_entity = self.link_owner_entity[i_link]
+            entity_start = self.entity_dof_start[i_entity]
+            entity_count = self.entity_dof_count[i_entity]
+            support_start = self.link_support_offsets[i_link]
+            support_end = self.link_support_offsets[i_link + 1]
+            for local_dof in range(entity_count):
+                self.rigid_delassus_work[i_p, local_dof] = qd.Vector.zero(gs.qd_float, 3)
+            for support_index in range(support_start, support_end):
+                slot = support_index - support_start
+                local_dof = self.link_support_dofs[support_index] - entity_start
+                self.rigid_delassus_work[i_p, local_dof] = self.J_rigid[i_p, slot]
+
+            i_b = self.contact_pairs[i_p].batch_idx
+            for local_dof_ in range(entity_count):
+                local_dof = entity_count - local_dof_ - 1
+                i_d = entity_start + local_dof
+                value = self.rigid_delassus_work[i_p, local_dof]
+                for local_j in range(local_dof + 1, entity_count):
+                    j_d = entity_start + local_j
+                    value -= rigid_global_info.mass_mat_L[j_d, i_d, i_b] * self.rigid_delassus_work[i_p, local_j]
+                self.rigid_delassus_work[i_p, local_dof] = value
+            for local_dof in range(entity_count):
+                i_d = entity_start + local_dof
+                self.rigid_delassus_work[i_p, local_dof] *= rigid_global_info.mass_mat_D_inv[i_d, i_b]
+            for local_dof in range(entity_count):
+                i_d = entity_start + local_dof
+                value = self.rigid_delassus_work[i_p, local_dof]
+                for local_j in range(local_dof):
+                    j_d = entity_start + local_j
+                    value -= rigid_global_info.mass_mat_L[i_d, j_d, i_b] * self.rigid_delassus_work[i_p, local_j]
+                self.rigid_delassus_work[i_p, local_dof] = value
+            for support_index in range(support_start, support_end):
+                slot = support_index - support_start
+                local_dof = self.link_support_dofs[support_index] - entity_start
+                response = self.rigid_delassus_work[i_p, local_dof]
+                jacobian = self.J_rigid[i_p, slot]
+                for row, col in qd.static(qd.ndrange(3, 3)):
+                    self.W[i_p][row, col] += response[row] * jacobian[col]
 
         # fem
         mechanical_weights0 = qd.static(self.contact_pairs.mechanical_weights0)
@@ -7753,8 +7883,13 @@ class RigidFemTriTetContactHandler(RigidFEMContactHandler):
             Jx = Jx + self.contact_pairs[i_p].mechanical_weights0[i] * x0[i_b, i_v]
 
         # rigid
-        for i in range(self.rigid_solver.n_dofs):
-            Jx = Jx - self.Jt[i_p, i] * x1[i_b, i]
+        i_link = self.contact_pairs[i_p].link_idx
+        support_start = self.link_support_offsets[i_link]
+        support_end = self.link_support_offsets[i_link + 1]
+        for support_index in range(support_start, support_end):
+            slot = support_index - support_start
+            i_d = self.link_support_dofs[support_index]
+            Jx = Jx - self.J_rigid[i_p, slot] * x1[i_b, i_d]
         result = qd.Vector.zero(gs.qd_float, 3)
         result[0] = Jx.dot(self.contact_pairs[i_p].tangent0)
         result[1] = Jx.dot(self.contact_pairs[i_p].tangent1)
@@ -7777,8 +7912,13 @@ class RigidFemTriTetContactHandler(RigidFEMContactHandler):
             y0[i_b, i_v] += self.contact_pairs[i_p].mechanical_weights0[i] * x_
 
         # rigid
-        for i in range(self.rigid_solver.n_dofs):
-            y1[i_b, i] -= self.Jt[i_p, i].dot(x_)
+        i_link = self.contact_pairs[i_p].link_idx
+        support_start = self.link_support_offsets[i_link]
+        support_end = self.link_support_offsets[i_link + 1]
+        for support_index in range(support_start, support_end):
+            slot = support_index - support_start
+            i_d = self.link_support_dofs[support_index]
+            y1[i_b, i_d] -= self.J_rigid[i_p, slot].dot(x_)
 
     @qd.func
     def add_Jt_A_J_diag3x3(self, y, i_p, A):

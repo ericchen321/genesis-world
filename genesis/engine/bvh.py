@@ -1,6 +1,9 @@
+import numpy as np
 import quadrants as qd
 
 import genesis as gs
+import genesis.utils.array_class as array_class
+import genesis.utils.geom as gu
 from genesis.repr_base import RBC
 
 # A constant stack size should be sufficient for BVH traversal.
@@ -524,6 +527,234 @@ class LBVH(RBC):
                             stack_depth += 1
 
         return overflow
+
+
+@qd.data_oriented
+class RigidLocalTriBVHForest(RBC):
+    def __init__(self, coupler, compact_to_global_face, max_query_results: int):
+        self.coupler = coupler
+        self.rigid_solver = coupler.rigid_solver
+        self.fem_solver = coupler.fem_solver
+        self.n_batches = coupler.sim._B
+        self.max_query_results = max_query_results
+
+        compact_to_global_face = np.asarray(compact_to_global_face, dtype=gs.np_int)
+        enabled_geoms = []
+        nodes_aabb_min = []
+        nodes_aabb_max = []
+        nodes_compact_face = []
+        nodes_escape = []
+        geom_root = []
+        geom_end = []
+
+        for geom in self.rigid_solver.geoms:
+            compact_faces = np.flatnonzero(
+                (compact_to_global_face >= geom.face_start) & (compact_to_global_face < geom.face_end)
+            ).astype(gs.np_int, copy=False)
+            if len(compact_faces) == 0:
+                continue
+
+            enabled_geoms.append(geom.idx)
+            geom_root.append(len(nodes_compact_face))
+            init_verts = np.asarray(geom.init_verts, dtype=gs.np_float)
+            init_faces = np.asarray(geom.init_faces, dtype=gs.np_int)
+
+            def build_node(node_compact_faces):
+                node_idx = len(nodes_compact_face)
+                global_faces = compact_to_global_face[node_compact_faces]
+                local_faces = global_faces - geom.face_start
+                triangles = init_verts[init_faces[local_faces]]
+                nodes_aabb_min.append(triangles.min(axis=(0, 1)))
+                nodes_aabb_max.append(triangles.max(axis=(0, 1)))
+                nodes_compact_face.append(-1)
+                nodes_escape.append(-1)
+
+                if len(node_compact_faces) == 1:
+                    nodes_compact_face[node_idx] = int(node_compact_faces[0])
+                else:
+                    centroids = triangles.mean(axis=1)
+                    axis = int(np.argmax(centroids.max(axis=0) - centroids.min(axis=0)))
+                    ordered = sorted(
+                        zip(centroids[:, axis], node_compact_faces),
+                        key=lambda item: (item[0], item[1]),
+                    )
+                    ordered_faces = np.asarray([item[1] for item in ordered], dtype=gs.np_int)
+                    middle = len(ordered_faces) // 2
+                    build_node(ordered_faces[:middle])
+                    build_node(ordered_faces[middle:])
+
+                nodes_escape[node_idx] = len(nodes_compact_face)
+
+            build_node(compact_faces)
+            geom_end.append(len(nodes_compact_face))
+
+        self.n_enabled_geoms = len(enabled_geoms)
+        self.n_nodes = len(nodes_compact_face)
+        self.geom_indices = qd.field(gs.qd_int, shape=(self.n_enabled_geoms,), needs_grad=False)
+        self.geom_root = qd.field(gs.qd_int, shape=(self.n_enabled_geoms,), needs_grad=False)
+        self.geom_end = qd.field(gs.qd_int, shape=(self.n_enabled_geoms,), needs_grad=False)
+        self.node_aabb_min = qd.field(gs.qd_vec3, shape=(self.n_nodes,), needs_grad=False)
+        self.node_aabb_max = qd.field(gs.qd_vec3, shape=(self.n_nodes,), needs_grad=False)
+        self.node_compact_face = qd.field(gs.qd_int, shape=(self.n_nodes,), needs_grad=False)
+        self.node_escape = qd.field(gs.qd_int, shape=(self.n_nodes,), needs_grad=False)
+        self.world_root_aabb_min = qd.field(
+            gs.qd_vec3, shape=(self.n_batches, self.n_enabled_geoms), needs_grad=False
+        )
+        self.world_root_aabb_max = qd.field(
+            gs.qd_vec3, shape=(self.n_batches, self.n_enabled_geoms), needs_grad=False
+        )
+        self.query_result = qd.field(gs.qd_ivec3, shape=(self.max_query_results,), needs_grad=False)
+        self.query_result_count = qd.field(qd.i32, shape=(), needs_grad=False)
+
+        self.geom_indices.from_numpy(np.asarray(enabled_geoms, dtype=gs.np_int))
+        self.geom_root.from_numpy(np.asarray(geom_root, dtype=gs.np_int))
+        self.geom_end.from_numpy(np.asarray(geom_end, dtype=gs.np_int))
+        self.node_aabb_min.from_numpy(np.asarray(nodes_aabb_min, dtype=gs.np_float))
+        self.node_aabb_max.from_numpy(np.asarray(nodes_aabb_max, dtype=gs.np_float))
+        self.node_compact_face.from_numpy(np.asarray(nodes_compact_face, dtype=gs.np_int))
+        self.node_escape.from_numpy(np.asarray(nodes_escape, dtype=gs.np_int))
+
+    @qd.func
+    def _aabbs_intersect(self, aabb_min0, aabb_max0, aabb_min1, aabb_max1):
+        return (
+            aabb_min0[0] <= aabb_max1[0]
+            and aabb_max0[0] >= aabb_min1[0]
+            and aabb_min0[1] <= aabb_max1[1]
+            and aabb_max0[1] >= aabb_min1[1]
+            and aabb_min0[2] <= aabb_max1[2]
+            and aabb_max0[2] >= aabb_min1[2]
+        )
+
+    @qd.kernel
+    def update_world_root_aabbs(
+        self,
+        links_info: qd.template(),
+        geoms_info: qd.template(),
+        geoms_state: qd.template(),
+        static_rigid_sim_config: qd.template(),
+    ):
+        for i_b, i_fg in qd.ndrange(self.n_batches, self.n_enabled_geoms):
+            i_g = self.geom_indices[i_fg]
+            i_l = geoms_info.link_idx[i_g]
+            geom_start = qd.i32(0)
+            geom_end = qd.i32(0)
+            if qd.static(static_rigid_sim_config.batch_links_info):
+                geom_start = links_info.geom_start[i_l, i_b]
+                geom_end = links_info.geom_end[i_l, i_b]
+            else:
+                geom_start = links_info.geom_start[i_l]
+                geom_end = links_info.geom_end[i_l]
+            valid_geometry = i_g >= geom_start
+            if valid_geometry:
+                valid_geometry = i_g < geom_end
+            if valid_geometry == False:
+                self.world_root_aabb_min[i_b, i_fg].fill(np.inf)
+                self.world_root_aabb_max[i_b, i_fg].fill(-np.inf)
+            else:
+                root = self.geom_root[i_fg]
+                local_min = self.node_aabb_min[root]
+                local_max = self.node_aabb_max[root]
+                world_min = qd.Vector.zero(gs.qd_float, 3)
+                world_max = qd.Vector.zero(gs.qd_float, 3)
+                world_min.fill(np.inf)
+                world_max.fill(-np.inf)
+                for corner_index in qd.static(range(8)):
+                    local_corner = qd.Vector.zero(gs.qd_float, 3)
+                    for axis in qd.static(range(3)):
+                        local_corner[axis] = qd.select(
+                            (corner_index & (1 << axis)) != 0, local_max[axis], local_min[axis]
+                        )
+                    world_corner = gu.qd_transform_by_trans_quat(
+                        local_corner, geoms_state.pos[i_g, i_b], geoms_state.quat[i_g, i_b]
+                    )
+                    world_min = qd.min(world_min, world_corner)
+                    world_max = qd.max(world_max, world_corner)
+                self.world_root_aabb_min[i_b, i_fg] = world_min
+                self.world_root_aabb_max[i_b, i_fg] = world_max
+
+    @qd.func
+    def query(
+        self,
+        f: qd.i32,
+        faces_info: array_class.FacesInfo,
+        verts_info: array_class.VertsInfo,
+        free_verts_state: array_class.VertsState,
+        fixed_verts_state: array_class.VertsState,
+        geoms_pos: qd.Tensor,
+        geoms_quat: qd.Tensor,
+    ):
+        self.query_result_count[None] = 0
+        overflow = False
+        tet_aabbs = qd.static(self.coupler.fem_surface_tet_aabb.aabbs)
+
+        for i_b, i_sq in qd.ndrange(self.n_batches, self.fem_solver.n_surface_elements):
+            world_tet_min = tet_aabbs[i_b, i_sq].min
+            world_tet_max = tet_aabbs[i_b, i_sq].max
+            for i_fg in range(self.n_enabled_geoms):
+                if self._aabbs_intersect(
+                    world_tet_min,
+                    world_tet_max,
+                    self.world_root_aabb_min[i_b, i_fg],
+                    self.world_root_aabb_max[i_b, i_fg],
+                ):
+                    i_g = self.geom_indices[i_fg]
+                    local_tet_min = qd.Vector.zero(gs.qd_float, 3)
+                    local_tet_max = qd.Vector.zero(gs.qd_float, 3)
+                    local_tet_min.fill(np.inf)
+                    local_tet_max.fill(-np.inf)
+                    i_e = self.fem_solver.surface_elements[i_sq]
+                    for i in qd.static(range(4)):
+                        i_v = self.fem_solver.elements_i[i_e].el2v[i]
+                        world_pos = self.fem_solver.elements_v[f, i_v, i_b].pos
+                        local_pos = gu.qd_inv_transform_by_trans_quat(
+                            world_pos, geoms_pos[i_g, i_b], geoms_quat[i_g, i_b]
+                        )
+                        local_tet_min = qd.min(local_tet_min, local_pos)
+                        local_tet_max = qd.max(local_tet_max, local_pos)
+
+                    node_idx = self.geom_root[i_fg]
+                    geom_end = self.geom_end[i_fg]
+                    while node_idx < geom_end:
+                        if self._aabbs_intersect(
+                            local_tet_min,
+                            local_tet_max,
+                            self.node_aabb_min[node_idx],
+                            self.node_aabb_max[node_idx],
+                        ):
+                            compact_face = self.node_compact_face[node_idx]
+                            if compact_face >= 0:
+                                global_face = self.coupler.rigid_fem_compact_to_global_face[compact_face]
+                                world_tri_min = qd.Vector.zero(gs.qd_float, 3)
+                                world_tri_max = qd.Vector.zero(gs.qd_float, 3)
+                                world_tri_min.fill(np.inf)
+                                world_tri_max.fill(-np.inf)
+                                for i in qd.static(range(3)):
+                                    i_v = faces_info.verts_idx[global_face][i]
+                                    i_fv = verts_info.verts_state_idx[i_v]
+                                    world_pos = qd.Vector.zero(gs.qd_float, 3)
+                                    if verts_info.is_fixed[i_v]:
+                                        world_pos = fixed_verts_state.pos[i_fv]
+                                    else:
+                                        world_pos = free_verts_state.pos[i_fv, i_b]
+                                    world_tri_min = qd.min(world_tri_min, world_pos)
+                                    world_tri_max = qd.max(world_tri_max, world_pos)
+                                if self._aabbs_intersect(
+                                    world_tet_min,
+                                    world_tet_max,
+                                    world_tri_min,
+                                    world_tri_max,
+                                ):
+                                    result_index = qd.atomic_add(self.query_result_count[None], 1)
+                                    if result_index < self.max_query_results:
+                                        self.query_result[result_index] = gs.qd_ivec3(i_b, compact_face, i_sq)
+                                    else:
+                                        overflow = True
+                            node_idx += 1
+                        else:
+                            node_idx = self.node_escape[node_idx]
+
+        return overflow
+
 
 @qd.data_oriented
 class FEMSurfaceTetLBVH(LBVH):
