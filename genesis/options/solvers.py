@@ -210,6 +210,9 @@ class SAPCouplerOptions(BaseCouplerOptions):
     enable_fem_self_tet_contact: StrictBool = True
     rigid_floor_contact_type: Literal["tet", "vert", "none"] = "tet"
     enable_rigid_fem_contact: StrictBool = True
+    # Zero leaves finite bilateral vertex/link snap coupling disabled and unallocated.
+    max_rigid_fem_snap_constraints: NonNegativeInt = 0
+    enable_rigid_fem_snap_coarse_preconditioner: StrictBool = False
     enable_rigid_fem_contact_patch_preconditioner: StrictBool = False
     enable_rigid_fem_contact_tet_schwarz_preconditioner: StrictBool = False
     rigid_rigid_contact_type: Literal["tet", "vert", "none"] = "tet"

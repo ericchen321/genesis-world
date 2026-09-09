@@ -343,6 +343,10 @@ class SAPCoupler(RBC):
                 "Must be one of 'vert' or 'none'."
             )
         self._enable_rigid_fem_contact = options.enable_rigid_fem_contact
+        self._max_rigid_fem_snap_constraints = options.max_rigid_fem_snap_constraints
+        self.rigid_fem_snap = None
+        self._enable_rigid_fem_snap_coarse_preconditioner = options.enable_rigid_fem_snap_coarse_preconditioner
+        self.rigid_fem_snap_coarse = None
         self._enable_rigid_fem_contact_patch_preconditioner = (
             options.enable_rigid_fem_contact_patch_preconditioner
         )
@@ -455,6 +459,12 @@ class SAPCoupler(RBC):
             if self._enable_sap_joint_limits:
                 self.joint_limit_constraint_handler = RigidJointLimitConstraintHandler(self.sim)
 
+        if self._max_rigid_fem_snap_constraints:
+            if not (self.rigid_solver.is_active and self.fem_solver.is_active):
+                gs.raise_exception("Rigid/FEM snap capacity requires both solvers to be active")
+            self.rigid_fem_snap = RigidFEMVertexSnapHandler(self.sim, self._max_rigid_fem_snap_constraints)
+            self.contact_handlers.append(self.rigid_fem_snap)
+
         if self._enable_rigid_fem_contact:
             face_enabled, self._rigid_fem_whitelist_receipt = _build_rigid_fem_face_whitelist(self.rigid_solver)
             self.rigid_fem_face_enabled = qd.field(gs.qd_bool, shape=(self.rigid_solver.n_faces,))
@@ -506,6 +516,10 @@ class SAPCoupler(RBC):
                 gs.raise_exception("development positive-J feasible step requires an active FEM solver")
             self._init_development_positive_j_feasible_step_fields()
         self._init_pcg_fields()
+        if self._enable_rigid_fem_snap_coarse_preconditioner:
+            if self.rigid_fem_snap is None or self._enable_rigid_fem_contact_patch_preconditioner:
+                gs.raise_exception("Snap coarse preconditioning requires snap capacity and the ordinary PCG path")
+            self.rigid_fem_snap_coarse = RigidFEMSnapCoarsePreconditioner(self)
         if self._enable_rigid_fem_contact_patch_preconditioner:
             self._init_rigid_fem_contact_patch_preconditioner_fields()
         if self._enable_rigid_fem_contact_tet_schwarz_preconditioner:
@@ -513,6 +527,8 @@ class SAPCoupler(RBC):
         self._init_linesearch_fields()
 
     def reset(self, envs_idx=None):
+        if self.rigid_fem_snap is not None:
+            self.rigid_fem_snap.clear()
         self._rigid_fem_contact_completed = None
         self._last_completed_solver_health = None
         self._last_contact_overflow = False
@@ -1315,6 +1331,8 @@ class SAPCoupler(RBC):
             and not self._enable_development_positive_j_alpha_one_only
         ):
             self._record_development_positive_j_no_contact(i_step)
+        if self.rigid_fem_snap_coarse is not None and not (self.has_contact or self.has_active_joint_limit):
+            self.rigid_fem_snap_coarse.active.fill(False)
         if self._enable_rigid_fem_contact:
             if self._enable_development_direct_replay_finger_contact_flags:
                 # The performance direct-replay path exports only two link
@@ -1328,6 +1346,11 @@ class SAPCoupler(RBC):
                 int(self.sim.cur_substep_global),
                 float(self.sim._substep_dt),
             )
+        if self.rigid_fem_snap is not None:
+            self.rigid_fem_snap.finalize_public_state()
+            self.rigid_fem_snap.completed_substep = (
+                int(self.sim.cur_substep_global), float(self.sim._substep_dt),
+            )
         # Final FEM geometric safety extrema are captured only after the
         # simulator completed ``substep_post_coupling``.  Publishing here
         # would inspect an intermediate physical-substep state.
@@ -1335,6 +1358,32 @@ class SAPCoupler(RBC):
             self._last_completed_solver_health = self._capture_completed_solver_health()
         else:
             self._last_completed_solver_health = None
+
+    def add_rigid_fem_snap_constraints(
+        self, fem_entity, verts_idx_local, rigid_links, stiffness_npm, damping_time_s=0.01, env_idx=0,
+    ):
+        if self.rigid_fem_snap is None:
+            gs.raise_exception("Configure max_rigid_fem_snap_constraints before adding snap rows")
+        return self.rigid_fem_snap.add(fem_entity, verts_idx_local, rigid_links, stiffness_npm,
+                                      damping_time_s, env_idx)
+
+    def clear_rigid_fem_snap_constraints(self):
+        if self.rigid_fem_snap is not None:
+            self.rigid_fem_snap.clear()
+
+    def get_rigid_fem_snap_constraints(self):
+        if self.rigid_fem_snap is None:
+            return {"rows": [], "completed_physical_substep_index": None, "substep_dt_s": None}
+        result = self.rigid_fem_snap.readback()
+        result["coarse_preconditioner_enabled"] = self.rigid_fem_snap_coarse is not None
+        if self.rigid_fem_snap_coarse is not None:
+            coarse = self.rigid_fem_snap_coarse
+            active = coarse.active.to_numpy()
+            result["coarse_active_group_count_by_batch"] = active.sum(axis=1).tolist()
+            result["coarse_active_groups_by_batch"] = [
+                [{"group_id": int(group), "youngs_modulus_pa": coarse.groups[group]["youngs_modulus_pa"]}
+                 for group in np.flatnonzero(mask)] for mask in active]
+        return result
 
     def _field_vector(self, field, *, dtype, label):
         value = np.asarray(field.to_numpy(), dtype=dtype)
@@ -2219,6 +2268,9 @@ class SAPCoupler(RBC):
         if self._enable_rigid_fem_contact_tet_schwarz_preconditioner:
             self._reset_rigid_fem_contact_tet_schwarz_health()
         self._init_sap_solve(i_step, dofs_state=self.rigid_solver.dofs_state)
+        use_snap_coarse = self.rigid_fem_snap_coarse is not None
+        if use_snap_coarse:
+            self.rigid_fem_snap_coarse.refresh(i_step)
         for iter in range(self._n_sap_iterations):
             # init gradient and preconditioner
             self.compute_unconstrained_gradient_diag(i_step, iter)
@@ -2227,7 +2279,10 @@ class SAPCoupler(RBC):
             self.compute_constraint_contact_gradient_hessian_diag_prec()
             self.check_sap_convergence(rigid_global_info=self.rigid_solver._rigid_global_info)
             # solve for the vertex velocity
-            if self._enable_rigid_fem_contact_patch_preconditioner:
+            if use_snap_coarse:
+                self.rigid_fem_snap_coarse.prepare()
+                self._rigid_fem_snap_coarse_pcg_solve()
+            elif self._enable_rigid_fem_contact_patch_preconditioner:
                 self._prepare_rigid_fem_contact_patch_preconditioner()
                 self._rigid_fem_contact_patch_pcg_solve()
             else:
@@ -5078,6 +5133,22 @@ class SAPCoupler(RBC):
         for _ in range(self._n_pcg_iterations):
             self._one_rigid_fem_contact_patch_pcg_iter()
 
+    def _rigid_fem_snap_coarse_pcg_solve(self):
+        # These split PCG seams apply P0 and delay rTz/beta until z is corrected.
+        self._init_rigid_fem_contact_patch_pcg_baseline(
+            entities_info=self.rigid_solver.entities_info,
+            rigid_global_info=self.rigid_solver._rigid_global_info,
+        )
+        self.rigid_fem_snap_coarse.apply()
+        self._finish_rigid_fem_contact_patch_pcg_initialization()
+        for _ in range(self._n_pcg_iterations):
+            self._begin_rigid_fem_contact_patch_pcg_iter(
+                entities_info=self.rigid_solver.entities_info,
+                rigid_global_info=self.rigid_solver._rigid_global_info,
+            )
+            self.rigid_fem_snap_coarse.apply()
+            self._finish_rigid_fem_contact_patch_pcg_iter()
+
     @qd.func
     def compute_total_energy(
         self,
@@ -6437,6 +6508,315 @@ class RigidFEMContactHandler(RigidContactHandler):
         Compute the contact velocity in the contact frame.
         """
         return self.compute_Jx(i_p, self.coupler.fem_state_v.v, self.coupler.rigid_state_dof.v)
+
+
+@qd.data_oriented
+class RigidFEMSnapCoarsePreconditioner:
+    """Add six material-region FEM motion columns to the ordinary coupled PCG preconditioner."""
+
+    def __init__(self, coupler):
+        self.coupler = coupler
+        self.fem = coupler.fem_solver
+        self.snap = coupler.rigid_fem_snap
+        self.native = coupler.rigid_fem_contact if coupler._enable_rigid_fem_contact else None
+        self.floor = (coupler.fem_floor_tet_contact
+                      if coupler._fem_floor_contact_type == FEMFloorContactType.TET else None)
+        self._has_native = self.native is not None
+        self._has_floor = self.floor is not None
+        self._B = coupler._B
+        self.n_vertices = self.fem.n_vertices
+        mu, lam = self.fem.elements_i.mu.to_numpy(), self.fem.elements_i.lam.to_numpy()
+        tetrahedra = self.fem.elements_i.el2v.to_numpy()
+        supports, self.groups = [], []
+        preferred = np.full(self.n_vertices, -1, dtype=gs.np_int)
+        preferred_E = np.full(self.n_vertices, -np.inf)
+        for entity in self.fem.entities:
+            elements = slice(entity.el_start, entity.el_start + entity.n_elements)
+            materials, inverse = np.unique(np.column_stack((mu[elements], lam[elements])), axis=0,
+                                           return_inverse=True)
+            for material_idx, (group_mu, group_lam) in enumerate(materials):
+                vertices = np.unique(tetrahedra[elements][inverse == material_idx])
+                young = group_mu * (3 * group_lam + 2 * group_mu) / (group_lam + group_mu)
+                group = len(supports)
+                support = np.zeros(self.n_vertices, dtype=np.bool_)
+                support[vertices] = True
+                supports.append(support)
+                selected = vertices[young > preferred_E[vertices]]
+                preferred[selected], preferred_E[selected] = group, young
+                self.groups.append({"fem_entity_idx": int(entity.idx), "mu": float(group_mu),
+                                    "lambda": float(group_lam), "youngs_modulus_pa": float(young),
+                                    "vertex_count": int(len(vertices))})
+        self.n_groups = len(supports)
+        self.support = qd.field(gs.qd_bool, shape=(self.n_groups, self.n_vertices))
+        self.support.from_numpy(np.asarray(supports))
+        self.preferred_group = qd.field(gs.qd_int, shape=(self.n_vertices,))
+        self.preferred_group.from_numpy(preferred)
+        self.count = qd.field(gs.qd_int, shape=(self.n_groups,))
+        self.count.from_numpy(np.asarray([s.sum() for s in supports], dtype=gs.np_int))
+        self.active = qd.field(gs.qd_bool, shape=(self._B, self.n_groups))
+        self.centroid = qd.field(gs.qd_vec3, shape=(self._B, self.n_groups))
+        self.basis = qd.field(gs.qd_vec3, shape=(self._B, self.n_groups, self.n_vertices, 6))
+        vec6, mat6 = qd.types.vector(6, gs.qd_float), qd.types.matrix(6, 6, gs.qd_float)
+        self.norm_squared = qd.field(vec6, shape=(self._B, self.n_groups))
+        self.matrix = qd.field(mat6, shape=(self._B, self.n_groups))
+        self.inverse = qd.field(mat6, shape=(self._B, self.n_groups))
+        self.rhs = qd.field(vec6, shape=(self._B, self.n_groups))
+        self.coeff = qd.field(vec6, shape=(self._B, self.n_groups))
+
+    def refresh(self, i_step):
+        self.refresh_basis(i_step)
+
+    @qd.kernel
+    def refresh_basis(self, i_step: qd.i32):
+        self.active.fill(False)
+        self.centroid.fill(0.0)
+        self.norm_squared.fill(0.0)
+        self.basis.fill(0.0)
+        for row in range(self.snap.n_contact_pairs[None]):
+            pair = self.snap.contact_pairs[row]
+            self.active[pair.batch_idx, self.preferred_group[pair.vertex_idx]] = True
+        if qd.static(self._has_native):
+            for row in range(self.native.n_contact_pairs[None]):
+                pair = self.native.contact_pairs[row]
+                vertices = self.fem.elements_i[pair.geom_idx0].el2v
+                for corner in qd.static(range(4)):
+                    self.active[pair.batch_idx, self.preferred_group[vertices[corner]]] = True
+        if qd.static(self._has_floor):
+            for row in range(self.floor.n_contact_pairs[None]):
+                pair = self.floor.contact_pairs[row]
+                vertices = self.fem.elements_i[pair.geom_idx].el2v
+                for corner in qd.static(range(4)):
+                    self.active[pair.batch_idx, self.preferred_group[vertices[corner]]] = True
+        for batch, group, vertex in qd.ndrange(self._B, self.n_groups, self.n_vertices):
+            if self.active[batch, group] and self.support[group, vertex]:
+                self.centroid[batch, group] += self.fem.elements_v[i_step, vertex, batch].pos / self.count[group]
+        for batch, group, vertex, mode in qd.ndrange(self._B, self.n_groups, self.n_vertices, 6):
+            if self.active[batch, group] and self.support[group, vertex]:
+                axis = qd.Vector.zero(gs.qd_float, 3)
+                value = qd.Vector.zero(gs.qd_float, 3)
+                if mode < 3:
+                    axis[mode] = 1.0
+                    value = axis
+                else:
+                    axis[mode - 3] = 1.0
+                    value = axis.cross(self.fem.elements_v[i_step, vertex, batch].pos - self.centroid[batch, group])
+                self.basis[batch, group, vertex, mode] = value
+                self.norm_squared[batch, group][mode] += value.norm_sqr()
+        for batch, group, vertex, mode in qd.ndrange(self._B, self.n_groups, self.n_vertices, 6):
+            if self.active[batch, group] and self.support[group, vertex]:
+                self.basis[batch, group, vertex, mode] /= qd.sqrt(self.norm_squared[batch, group][mode])
+
+    @qd.kernel
+    def load_column(self, group: qd.i32, mode: qd.i32):
+        for batch in range(self._B):
+            self.coupler.batch_pcg_active[batch] = self.coupler.batch_active[batch] and self.active[batch, group]
+        for batch, vertex in qd.ndrange(self._B, self.n_vertices):
+            self.coupler.pcg_fem_state_v[batch, vertex].p = self.basis[batch, group, vertex, mode]
+        self.coupler.pcg_rigid_state_dof.p.fill(0.0)
+
+    @qd.kernel
+    def product_and_reduce(self, group: qd.i32, column: qd.i32,
+                           rigid_global_info: array_class.RigidGlobalInfo):
+        self.coupler.compute_pcg_matrix_vector_product(rigid_global_info=rigid_global_info)
+        for batch, vertex, row in qd.ndrange(self._B, self.n_vertices, 6):
+            if self.coupler.batch_pcg_active[batch]:
+                self.matrix[batch, group][row, column] += self.basis[batch, group, vertex, row].dot(
+                    self.coupler.pcg_fem_state_v[batch, vertex].Ap)
+
+    @qd.kernel
+    def invert(self):
+        for batch, group in qd.ndrange(self._B, self.n_groups):
+            if self.coupler.batch_active[batch] and self.active[batch, group]:
+                self.inverse[batch, group] = self.matrix[batch, group].inverse()
+
+    def prepare(self):
+        self.matrix.fill(0.0)
+        for group in range(self.n_groups):
+            for mode in range(6):
+                self.load_column(group, mode)
+                self.product_and_reduce(group, mode, self.coupler.rigid_solver._rigid_global_info)
+        self.invert()
+
+    @qd.kernel
+    def apply(self):
+        self.rhs.fill(0.0)
+        for batch, group, vertex, mode in qd.ndrange(self._B, self.n_groups, self.n_vertices, 6):
+            if self.coupler.batch_pcg_active[batch] and self.active[batch, group]:
+                self.rhs[batch, group][mode] += self.basis[batch, group, vertex, mode].dot(
+                    self.coupler.pcg_fem_state_v[batch, vertex].r)
+        for batch, group in qd.ndrange(self._B, self.n_groups):
+            if self.coupler.batch_pcg_active[batch] and self.active[batch, group]:
+                self.coeff[batch, group] = self.inverse[batch, group] @ self.rhs[batch, group]
+        for batch, vertex in qd.ndrange(self._B, self.n_vertices):
+            if self.coupler.batch_pcg_active[batch]:
+                correction = qd.Vector.zero(gs.qd_float, 3)
+                for group, mode in qd.ndrange(self.n_groups, 6):
+                    if self.active[batch, group]:
+                        correction += self.basis[batch, group, vertex, mode] * self.coeff[batch, group][mode]
+                self.coupler.pcg_fem_state_v[batch, vertex].z += correction
+
+
+@qd.data_oriented
+class RigidFEMVertexSnapHandler(RigidFEMContactHandler):
+    """Persistent finite Kelvin--Voigt vertex/link rows in world coordinates."""
+
+    def __init__(self, simulator, capacity):
+        super().__init__(simulator)
+        self.name = "RigidFEMVertexSnapHandler"
+        self.max_contact_pairs = capacity
+        self.contact_pairs = qd.types.struct(
+            batch_idx=gs.qd_int, vertex_idx=gs.qd_int, link_idx=gs.qd_int,
+            local_anchor=gs.qd_vec3, contact_pos=gs.qd_vec3, link_origin=gs.qd_vec3,
+            vertex_pos=gs.qd_vec3, gap=gs.qd_vec3, vhat=gs.qd_vec3,
+            stiffness=gs.qd_float, damping_time=gs.qd_float, weight=gs.qd_float,
+            public_gamma=gs.qd_vec3, sap_info=self.sap_contact_info_type,
+        ).field(shape=(capacity,))
+        self.Jt = qd.field(gs.qd_vec3, shape=(capacity, self.rigid_solver.n_dofs))
+        self.bindings = []
+        self.completed_substep = None
+        self.n_contact_pairs[None] = 0
+
+    def add(self, fem_entity, verts_idx_local, rigid_links, stiffness_npm, damping_time_s, env_idx):
+        indices = np.asarray(verts_idx_local, dtype=np.int64)
+        stiffness = np.asarray(stiffness_npm, dtype=np.float64)
+        links = tuple(rigid_links)
+        count = len(indices)
+        if indices.shape != (count,) or stiffness.shape != (count,) or len(links) != count or count == 0:
+            gs.raise_exception("Snap requires one vertex, rigid link and stiffness per row")
+        if not any(fem_entity is entity for entity in self.fem_solver.entities):
+            gs.raise_exception("Snap FEM entity belongs to another scene")
+        if np.any(indices < 0) or np.any(indices >= fem_entity.n_vertices) or not 0 <= env_idx < self.sim._B:
+            gs.raise_exception("Snap vertex or environment index is out of range")
+        if not np.all(np.isfinite(stiffness)) or np.any(stiffness <= 0):
+            gs.raise_exception("Snap stiffness must be finite and positive")
+        if not np.isfinite(damping_time_s) or damping_time_s < 0:
+            gs.raise_exception("Snap damping time must be finite and nonnegative")
+        if any(not any(link is candidate for candidate in self.rigid_solver.links) for link in links):
+            gs.raise_exception("Snap rigid link belongs to another scene")
+        start = len(self.bindings)
+        if start + count > self.max_contact_pairs:
+            gs.raise_exception("Snap row capacity exceeded")
+        positions = fem_entity.get_state(track_grad=False).pos.detach().cpu().numpy().reshape(self.sim._B, -1, 3)
+        new_bindings = []
+        for local_vertex, link, k in zip(indices, links, stiffness):
+            p = link.get_pos(relative=False).detach().cpu().numpy().reshape(self.sim._B, 3)[env_idx]
+            q = link.get_quat(relative=False).detach().cpu().numpy().reshape(self.sim._B, 4)[env_idx]
+            x = positions[env_idx, local_vertex]
+            local_anchor = gu.quat_to_R(q).T @ (x - p)
+            new_bindings.append({
+                "row_id": start + len(new_bindings), "env_idx": int(env_idx),
+                "fem_entity_idx": int(fem_entity.idx), "fem_entity_name": str(fem_entity.name),
+                "vertex_idx_local": int(local_vertex), "vertex_idx_global": int(fem_entity.v_start + local_vertex),
+                "rigid_entity_idx": int(link.entity.idx), "rigid_entity_name": str(link.entity.name),
+                "rigid_link_idx": int(link.idx), "rigid_link_name": str(link.name),
+                "local_anchor_m": local_anchor.tolist(), "stiffness_npm": float(k),
+                "damping_time_s": float(damping_time_s), "capture_vertex_position_m": x.tolist(),
+            })
+        # Publish the active prefix only after the complete batch was captured and written.
+        pairs = self.contact_pairs
+        for row in new_bindings:
+            i = row["row_id"]
+            pairs.batch_idx[i] = row["env_idx"]
+            pairs.vertex_idx[i] = row["vertex_idx_global"]
+            pairs.link_idx[i] = row["rigid_link_idx"]
+            pairs.local_anchor[i] = row["local_anchor_m"]
+            pairs.stiffness[i] = row["stiffness_npm"]
+            pairs.damping_time[i] = row["damping_time_s"]
+            pairs.public_gamma[i] = (0.0, 0.0, 0.0)
+        self.bindings.extend(new_bindings)
+        self.n_contact_pairs[None] = len(self.bindings)
+        return np.arange(start, len(self.bindings), dtype=np.int64)
+
+    def clear(self):
+        self.n_contact_pairs[None] = 0
+        self.bindings.clear()
+        self.completed_substep = None
+        if self.coupler.rigid_fem_snap_coarse is not None:
+            self.coupler.rigid_fem_snap_coarse.active.fill(False)
+
+    def readback(self):
+        count = len(self.bindings)
+        gamma = self.contact_pairs.public_gamma.to_numpy()[:count]
+        origins = self.contact_pairs.link_origin.to_numpy()[:count]
+        anchors = self.contact_pairs.contact_pos.to_numpy()[:count]
+        rows = [dict(row, impulse_world_ns=gamma[i].tolist(),
+                     substep_link_origin_m=origins[i].tolist(), substep_anchor_world_m=anchors[i].tolist())
+                for i, row in enumerate(self.bindings)]
+        return {"rows": rows,
+                "completed_physical_substep_index": None if self.completed_substep is None else self.completed_substep[0],
+                "substep_dt_s": None if self.completed_substep is None else self.completed_substep[1]}
+
+    @qd.func
+    def detection(self, f: qd.i32, links_info: array_class.LinksInfo, verts_info: array_class.VertsInfo,
+                  faces_info: array_class.FacesInfo, free_verts_state: array_class.VertsState,
+                  fixed_verts_state: array_class.VertsState, geoms_info: array_class.GeomsInfo):
+        for i in range(self.n_contact_pairs[None]):
+            self.contact_pairs[i].vertex_pos = self.fem_solver.elements_v[
+                f, self.contact_pairs[i].vertex_idx, self.contact_pairs[i].batch_idx].pos
+        return False
+
+    @qd.func
+    def compute_jacobian(self, links_info: array_class.LinksInfo, dofs_state: array_class.DofsState,
+                         links_state: array_class.LinksState):
+        for i in range(self.n_contact_pairs[None]):
+            link = self.contact_pairs[i].link_idx
+            batch = self.contact_pairs[i].batch_idx
+            origin = links_state.pos[link, batch]
+            anchor = origin + gu.qd_transform_by_quat(self.contact_pairs[i].local_anchor, links_state.quat[link, batch])
+            self.contact_pairs[i].link_origin = origin
+            self.contact_pairs[i].contact_pos = anchor
+            self.contact_pairs[i].gap = self.contact_pairs[i].vertex_pos - anchor
+        RigidContactHandler.compute_jacobian(self, links_info, dofs_state, links_state)
+
+    @qd.func
+    def compute_regularization(self, entities_info: array_class.EntitiesInfo,
+                               rigid_global_info: array_class.RigidGlobalInfo):
+        h = self.sim._substep_dt
+        for i in range(self.n_contact_pairs[None]):
+            tau = self.contact_pairs[i].damping_time
+            self.contact_pairs[i].weight = h * self.contact_pairs[i].stiffness * (h + tau)
+            self.contact_pairs[i].vhat = -self.contact_pairs[i].gap / (h + tau)
+
+    @qd.func
+    def compute_contact_gamma_G(self, sap_info, i_p, vc):
+        weight = self.contact_pairs[i_p].weight
+        sap_info[i_p].gamma = weight * (self.contact_pairs[i_p].vhat - vc)
+        sap_info[i_p].G = weight * qd.Matrix.identity(gs.qd_float, 3)
+
+    @qd.func
+    def compute_contact_energy_gamma_G(self, sap_info, i_p, vc):
+        self.compute_contact_gamma_G(sap_info, i_p, vc)
+        difference = vc - self.contact_pairs[i_p].vhat
+        sap_info[i_p].energy = 0.5 * self.contact_pairs[i_p].weight * difference.norm_sqr()
+
+    @qd.func
+    def compute_contact_energy(self, sap_info, i_p, vc):
+        self.compute_contact_energy_gamma_G(sap_info, i_p, vc)
+
+    @qd.func
+    def compute_Jx(self, i_p, fem_x, rigid_x):
+        batch = self.contact_pairs[i_p].batch_idx
+        result = fem_x[batch, self.contact_pairs[i_p].vertex_idx]
+        for dof in range(self.rigid_solver.n_dofs):
+            result -= self.Jt[i_p, dof] * rigid_x[batch, dof]
+        return result
+
+    @qd.func
+    def add_Jt_x(self, fem_y, rigid_y, i_p, value):
+        batch = self.contact_pairs[i_p].batch_idx
+        fem_y[batch, self.contact_pairs[i_p].vertex_idx] += value
+        for dof in range(self.rigid_solver.n_dofs):
+            rigid_y[batch, dof] -= self.Jt[i_p, dof].dot(value)
+
+    @qd.func
+    def add_Jt_A_J_diag3x3(self, target, i_p, matrix):
+        target[self.contact_pairs[i_p].batch_idx, self.contact_pairs[i_p].vertex_idx] += matrix
+
+    @qd.kernel
+    def finalize_public_state(self):
+        for i in range(self.n_contact_pairs[None]):
+            self.compute_contact_gamma_G(self.contact_pairs.sap_info, i, self.compute_contact_velocity(i))
+            self.contact_pairs[i].public_gamma = self.contact_pairs[i].sap_info.gamma
 
 
 @qd.func

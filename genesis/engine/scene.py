@@ -1100,6 +1100,32 @@ class Scene(RBC):
         self._forward_ready = True
 
     @gs.assert_built
+    def add_rigid_fem_snap_constraints(
+        self, fem_entity, verts_idx_local, rigid_links, stiffness_npm, damping_time_s=0.01, env_idx=0,
+    ):
+        """Capture finite bilateral FEM-vertex/rigid-link attachments at current local offsets.
+
+        Both FEM and articulated rigid velocities receive equal/opposite point reactions.
+        Attachment topology is not included in whole-batch state snapshots.
+        """
+        return self._sim.coupler.add_rigid_fem_snap_constraints(
+            fem_entity, verts_idx_local, rigid_links, stiffness_npm, damping_time_s, env_idx,
+        )
+
+    @gs.assert_built
+    def clear_rigid_fem_snap_constraints(self):
+        """Remove all persistent snap rows; ordinary contacts remain enabled."""
+        self._sim.coupler.clear_rigid_fem_snap_constraints()
+
+    @gs.assert_built
+    def get_rigid_fem_snap_constraints(self):
+        """Read active bindings and impulses from the last completed physical substep.
+
+        Impulses are not accumulated over the entire public control step.
+        """
+        return self._sim.coupler.get_rigid_fem_snap_constraints()
+
+    @gs.assert_built
     def get_rigid_fem_contacts(self):
         """Return an immutable copy of the last completed SAP rigid--FEM contact batch.
 
