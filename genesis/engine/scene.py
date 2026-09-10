@@ -1113,9 +1113,9 @@ class Scene(RBC):
         )
 
     @gs.assert_built
-    def clear_rigid_fem_snap_constraints(self):
-        """Remove all persistent snap rows; ordinary contacts remain enabled."""
-        self._sim.coupler.clear_rigid_fem_snap_constraints()
+    def clear_rigid_fem_snap_constraints(self, fem_entity=None):
+        """Remove all snap rows, or only rows bound to the supplied FEM entity."""
+        self._sim.coupler.clear_rigid_fem_snap_constraints(fem_entity)
 
     @gs.assert_built
     def get_rigid_fem_snap_constraints(self):
@@ -1124,6 +1124,13 @@ class Scene(RBC):
         Impulses are not accumulated over the entire public control step.
         """
         return self._sim.coupler.get_rigid_fem_snap_constraints()
+
+    @gs.assert_built
+    def get_fem_fem_contacts(self):
+        """Fresh host copy of native FEM--FEM contacts from the last physical substep."""
+        if not hasattr(self._sim._coupler, "get_fem_fem_contacts"):
+            raise gs.RigidFEMContactUnavailableError("Scene has no SAP FEM--FEM contact subsystem")
+        return self._sim._coupler.get_fem_fem_contacts()
 
     @gs.assert_built
     def get_rigid_fem_contacts(self):

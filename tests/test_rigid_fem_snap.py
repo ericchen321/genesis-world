@@ -67,6 +67,69 @@ def test_native_support_activates_coarse_before_any_snap(snap_runtime, tmp_path)
     assert coupler.rigid_fem_snap_coarse.active.to_numpy()[0, 0]
 
 
+def test_fem_fem_support_keeps_both_coarse_groups_after_handoff(snap_runtime, tmp_path):
+    outer = np.asarray([[-.025, -.020, .10], [.025, -.020, .10], [0., .025, .10], [0., 0., .14]])
+    vertices = np.vstack((outer, outer.mean(axis=0)))
+    tets = np.asarray([[0, 1, 2, 4], [0, 1, 4, 3], [0, 4, 2, 3], [4, 1, 2, 3]])
+    path = tmp_path / "fem_fem_handoff.mesh"
+    igl.writeMESH(str(path), vertices, tets, np.empty((0, 3), dtype=np.int64))
+    scene = gs.Scene(
+        sim_options=gs.options.SimOptions(dt=.001, substeps=1, gravity=(0., 0., 0.)),
+        rigid_options=gs.options.RigidOptions(enable_collision=True),
+        fem_options=gs.options.FEMOptions(use_implicit_solver=True, enable_floor=False),
+        coupler_options=gs.options.SAPCouplerOptions(
+            fem_floor_contact_type="none", rigid_floor_contact_type="none", rigid_rigid_contact_type="none",
+            enable_fem_self_tet_contact=True, enable_rigid_fem_contact=True,
+            max_rigid_fem_snap_constraints=4, enable_rigid_fem_snap_coarse_preconditioner=True),
+        show_viewer=False,
+    )
+    rigids, fems = [], []
+    for name, x, young in (("A", 0., 5e6), ("B", .2, 3e9)):
+        rigids.append(scene.add_entity(
+            morph=gs.morphs.Box(pos=(x, 0., .09), size=(.04, .04, .04)),
+            material=gs.materials.Rigid(enable_coup_collision=True), name=f"rigid_{name}"))
+        fems.append(scene.add_entity(
+            morph=gs.morphs.TetMesh(file=str(path), pos=(x, 0., 0.)),
+            material=gs.materials.FEM.Elastic(E=young, nu=.35, rho=950., model="linear_corotated"),
+            name=f"fem_{name}"))
+    scene.build(n_envs=2)
+    coupler = scene.sim.coupler
+    coarse = coupler.rigid_fem_snap_coarse
+    for fem, rigid in zip(fems, rigids):
+        scene.add_rigid_fem_snap_constraints(fem, [0], [rigid.links[0]], [10000.], env_idx=0)
+    # Inject accepted rows to isolate coarse activation from contact detection and the force law.
+    native = coupler.rigid_fem_contact
+    native.contact_pairs.batch_idx[0] = 0
+    native.contact_pairs.geom_idx0[0] = fems[1].el_start
+    native.n_contact_pairs[None] = 1
+    self_tet = coupler.fem_self_tet_contact
+    self_tet.contact_pairs.batch_idx[0] = 0
+    self_tet.contact_pairs.geom_idx0[0] = fems[0].el_start
+    self_tet.contact_pairs.geom_idx1[0] = fems[1].el_start
+    self_tet.n_contact_pairs[None] = 1
+    coarse.refresh(scene.sim.cur_substep_local)
+    np.testing.assert_array_equal(coarse.active.to_numpy(), [[True, True], [False, False]])
+
+    scene.clear_rigid_fem_snap_constraints(fems[1])
+    native.n_contact_pairs[None] = 0
+    coarse.refresh(scene.sim.cur_substep_local)
+    assert [row["fem_entity_idx"] for row in scene.get_rigid_fem_snap_constraints()["rows"]] == [fems[0].idx]
+    np.testing.assert_array_equal(coarse.active.to_numpy(), [[True, True], [False, False]])
+    norms = np.linalg.norm(coarse.basis.to_numpy()[0], axis=(1, 3))
+    np.testing.assert_allclose(norms, 1., atol=1e-12)
+
+    # With all snaps gone, both sides must still activate regardless of pair ordering.
+    scene.clear_rigid_fem_snap_constraints()
+    self_tet.contact_pairs.geom_idx0[0] = fems[1].el_start
+    self_tet.contact_pairs.geom_idx1[0] = fems[0].el_start
+    coarse.refresh(scene.sim.cur_substep_local)
+    np.testing.assert_array_equal(coarse.active.to_numpy(), [[True, True], [False, False]])
+    self_tet.n_contact_pairs[None] = 0
+    coarse.refresh(scene.sim.cur_substep_local)
+    assert not coarse.active.to_numpy().any()
+    assert not coarse.basis.to_numpy().any()
+
+
 def test_two_way_snap_momentum_torque_quadratic_and_clear(snap_runtime, tmp_path):
     outer = np.asarray([[-.025, -.020, .10], [.025, -.020, .10], [0., .025, .10], [0., 0., .14]])
     vertices = np.vstack((outer, outer.mean(axis=0)))
@@ -214,4 +277,54 @@ def test_two_way_snap_momentum_torque_quadratic_and_clear(snap_runtime, tmp_path
     np.testing.assert_allclose(_host(rigid.get_links_vel(ref="link_com")), free_velocity, atol=1e-12)
     scene.add_rigid_fem_snap_constraints(fem, [0], [link], [10000.])
     scene.reset()
+    assert scene.get_rigid_fem_snap_constraints()["rows"] == []
+
+
+def test_selective_clear_preserves_other_fem_capture_and_response(snap_runtime, tmp_path):
+    outer = np.asarray([[-.025, -.020, .10], [.025, -.020, .10], [0., .025, .10], [0., 0., .14]])
+    vertices = np.vstack((outer, outer.mean(axis=0)))
+    tets = np.asarray([[0, 1, 2, 4], [0, 1, 4, 3], [0, 4, 2, 3], [4, 1, 2, 3]])
+    path = tmp_path / "two_fem.mesh"
+    igl.writeMESH(str(path), vertices, tets, np.empty((0, 3), dtype=np.int64))
+    scene = gs.Scene(
+        sim_options=gs.options.SimOptions(dt=.001, substeps=1, gravity=(0., 0., 0.)),
+        rigid_options=gs.options.RigidOptions(enable_collision=False),
+        fem_options=gs.options.FEMOptions(use_implicit_solver=True, enable_floor=False),
+        coupler_options=gs.options.SAPCouplerOptions(
+            fem_floor_contact_type="none", rigid_floor_contact_type="none", rigid_rigid_contact_type="none",
+            enable_fem_self_tet_contact=False, enable_rigid_fem_contact=False,
+            max_rigid_fem_snap_constraints=4, enable_rigid_fem_snap_coarse_preconditioner=True,
+            pcg_threshold=1e-16, sap_convergence_atol=1e-14, sap_convergence_rtol=1e-10),
+        show_viewer=False,
+    )
+    rigids, fems = [], []
+    for name, x in (("A", 0.), ("B", .2)):
+        rigids.append(scene.add_entity(
+            morph=gs.morphs.Box(pos=(x, 0., .09), size=(.04, .04, .04)),
+            material=gs.materials.Rigid(enable_coup_collision=False), name=f"rigid_{name}"))
+        fems.append(scene.add_entity(
+            morph=gs.morphs.TetMesh(file=str(path), pos=(x, 0., 0.)),
+            material=gs.materials.FEM.Elastic(E=2e5, nu=.35, rho=950., model="linear_corotated"),
+            name=f"fem_{name}"))
+    scene.build(n_envs=1)
+    # B first makes A move to a different active row when B is removed.
+    for index in (1, 0):
+        scene.add_rigid_fem_snap_constraints(fems[index], [0], [rigids[index].links[0]], [10000.])
+    fields = ("fem_entity_idx", "vertex_idx_local", "vertex_idx_global", "rigid_link_idx",
+              "local_anchor_m", "capture_vertex_position_m", "stiffness_npm", "damping_time_s")
+    before = scene.get_rigid_fem_snap_constraints()["rows"][1]
+    scene.clear_rigid_fem_snap_constraints(fems[1])
+    reading = scene.get_rigid_fem_snap_constraints()
+    assert len(reading["rows"]) == 1
+    assert reading["completed_physical_substep_index"] is None
+    after = reading["rows"][0]
+    assert after["row_id"] == 0
+    assert {key: before[key] for key in fields} == {key: after[key] for key in fields}
+    rigids[0].set_pos(np.asarray([[.002, 0., .09]]))
+    scene.step(update_visualizer=False, refresh_visualizer=False)
+    impulse = scene.get_rigid_fem_snap_constraints()["rows"][0]["impulse_world_ns"]
+    assert np.linalg.norm(impulse) > 1e-8
+    assert np.linalg.norm(_host(fems[0].get_state(track_grad=False).vel)) > 1e-8
+    assert np.linalg.norm(_host(rigids[0].get_vel())) > 1e-8
+    scene.clear_rigid_fem_snap_constraints()
     assert scene.get_rigid_fem_snap_constraints()["rows"] == []

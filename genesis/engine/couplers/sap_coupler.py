@@ -531,6 +531,8 @@ class SAPCoupler(RBC):
             self.rigid_fem_snap.clear()
         self._rigid_fem_contact_completed = None
         self._last_completed_solver_health = None
+        if self._enable_fem_self_tet_contact:
+            self.fem_self_tet_contact.completed_substep = None
         self._last_contact_overflow = False
         self._legacy_sap_health_fields = None
         self._post_final_sap_health_fields = None
@@ -1346,6 +1348,11 @@ class SAPCoupler(RBC):
                 int(self.sim.cur_substep_global),
                 float(self.sim._substep_dt),
             )
+        if self._enable_fem_self_tet_contact:
+            self.fem_self_tet_contact.finalize_public_state()
+            self.fem_self_tet_contact.completed_substep = (
+                int(self.sim.cur_step_global), int(self.sim.cur_substep_global), float(self.sim._substep_dt),
+            )
         if self.rigid_fem_snap is not None:
             self.rigid_fem_snap.finalize_public_state()
             self.rigid_fem_snap.completed_substep = (
@@ -1367,9 +1374,14 @@ class SAPCoupler(RBC):
         return self.rigid_fem_snap.add(fem_entity, verts_idx_local, rigid_links, stiffness_npm,
                                       damping_time_s, env_idx)
 
-    def clear_rigid_fem_snap_constraints(self):
+    def clear_rigid_fem_snap_constraints(self, fem_entity=None):
         if self.rigid_fem_snap is not None:
-            self.rigid_fem_snap.clear()
+            self.rigid_fem_snap.clear(fem_entity)
+
+    def get_fem_fem_contacts(self):
+        if not self._enable_fem_self_tet_contact:
+            raise gs.RigidFEMContactUnavailableError("FEM self-tet contact is disabled")
+        return self.fem_self_tet_contact.readback()
 
     def get_rigid_fem_snap_constraints(self):
         if self.rigid_fem_snap is None:
@@ -6519,9 +6531,11 @@ class RigidFEMSnapCoarsePreconditioner:
         self.fem = coupler.fem_solver
         self.snap = coupler.rigid_fem_snap
         self.native = coupler.rigid_fem_contact if coupler._enable_rigid_fem_contact else None
+        self.self_tet = coupler.fem_self_tet_contact if coupler._enable_fem_self_tet_contact else None
         self.floor = (coupler.fem_floor_tet_contact
                       if coupler._fem_floor_contact_type == FEMFloorContactType.TET else None)
         self._has_native = self.native is not None
+        self._has_self_tet = self.self_tet is not None
         self._has_floor = self.floor is not None
         self._B = coupler._B
         self.n_vertices = self.fem.n_vertices
@@ -6581,6 +6595,14 @@ class RigidFEMSnapCoarsePreconditioner:
                 vertices = self.fem.elements_i[pair.geom_idx0].el2v
                 for corner in qd.static(range(4)):
                     self.active[pair.batch_idx, self.preferred_group[vertices[corner]]] = True
+        if qd.static(self._has_self_tet):
+            for row in range(self.self_tet.n_contact_pairs[None]):
+                pair = self.self_tet.contact_pairs[row]
+                vertices0 = self.fem.elements_i[pair.geom_idx0].el2v
+                vertices1 = self.fem.elements_i[pair.geom_idx1].el2v
+                for corner in qd.static(range(4)):
+                    self.active[pair.batch_idx, self.preferred_group[vertices0[corner]]] = True
+                    self.active[pair.batch_idx, self.preferred_group[vertices1[corner]]] = True
         if qd.static(self._has_floor):
             for row in range(self.floor.n_contact_pairs[None]):
                 pair = self.floor.contact_pairs[row]
@@ -6727,12 +6749,25 @@ class RigidFEMVertexSnapHandler(RigidFEMContactHandler):
         self.n_contact_pairs[None] = len(self.bindings)
         return np.arange(start, len(self.bindings), dtype=np.int64)
 
-    def clear(self):
-        self.n_contact_pairs[None] = 0
-        self.bindings.clear()
+    def clear(self, fem_entity=None):
+        if fem_entity is None:
+            self.bindings.clear()
+        else:
+            if not any(fem_entity is entity for entity in self.fem_solver.entities):
+                gs.raise_exception("Snap FEM entity belongs to another scene")
+            retained = [row for row in self.bindings if row["fem_entity_idx"] != fem_entity.idx]
+            # Increasing source indices permit in-place forward compaction without recapture.
+            for destination, row in enumerate(retained):
+                self._copy_binding_row(destination, row["row_id"])
+            self.bindings = [dict(row, row_id=i) for i, row in enumerate(retained)]
+        self.n_contact_pairs[None] = len(self.bindings)
         self.completed_substep = None
         if self.coupler.rigid_fem_snap_coarse is not None:
             self.coupler.rigid_fem_snap_coarse.active.fill(False)
+
+    @qd.kernel
+    def _copy_binding_row(self, destination: qd.i32, source: qd.i32):
+        self.contact_pairs[destination] = self.contact_pairs[source]
 
     def readback(self):
         count = len(self.bindings)
@@ -7063,6 +7098,7 @@ class FEMSelfTetContactHandler(FEMContactHandler):
             barycentric0=gs.qd_vec4,  # barycentric coordinates of the contact point in tet 0
             barycentric1=gs.qd_vec4,  # barycentric coordinates of the contact point in tet 1
             contact_pos=gs.qd_vec3,  # contact position
+            public_gamma=gs.qd_vec3,
             sap_info=self.sap_contact_info_type,  # contact info
         )
         # Development control episodes can fold the soft body deeply enough
@@ -7071,6 +7107,47 @@ class FEMSelfTetContactHandler(FEMContactHandler):
         # physically finite episode at the old one-pair-per-element cap.
         self.max_contact_pairs = self.fem_solver.n_surface_elements * self.fem_solver._B * 8
         self.contact_pairs = self.contact_pair_type.field(shape=(self.max_contact_pairs,))
+        self.completed_substep = None
+
+    @qd.kernel
+    def finalize_public_state(self):
+        for i in range(self.n_contact_pairs[None]):
+            self.compute_contact_gamma_G(self.contact_pairs.sap_info, i, self.compute_contact_velocity(i))
+            self.contact_pairs[i].public_gamma = self.contact_pairs[i].sap_info.gamma
+
+    def readback(self):
+        if self.completed_substep is None:
+            raise gs.RigidFEMContactUnavailableError("No completed FEM--FEM contact substep")
+        count = int(self.n_contact_pairs[None])
+        fields = {name: getattr(self.contact_pairs, name).to_numpy()[:count].copy()
+                  for name in ("batch_idx", "geom_idx0", "geom_idx1", "contact_pos", "normal",
+                               "tangent0", "tangent1", "public_gamma")}
+        gaps = self.contact_pairs.sap_info.phi0.to_numpy()[:count].copy()
+        rows = []
+        for i in range(count):
+            row = {"env_idx": int(fields["batch_idx"][i])}
+            for side in (0, 1):
+                element = int(fields[f"geom_idx{side}"][i])
+                entity = next(e for e in self.fem_solver.entities
+                              if e.el_start <= element < e.el_start + e.n_elements)
+                row.update({f"fem_entity_idx{side}": int(entity.idx),
+                            f"fem_entity_name{side}": str(entity.name),
+                            f"element_idx_global{side}": element,
+                            f"element_idx_local{side}": element - entity.el_start})
+            gamma = fields["public_gamma"][i]
+            row.update(contact_point_m=fields["contact_pos"][i].tolist(),
+                       normal_world=fields["normal"][i].tolist(), signed_gap_m=float(gaps[i]),
+                       gap_definition="hydroelastic_effective_phi0",
+                       normal_impulse_ns=float(gamma[2]),
+                       tangential_impulse_world_ns=(gamma[0] * fields["tangent0"][i]
+                                                   + gamma[1] * fields["tangent1"][i]).tolist())
+            rows.append(row)
+        rows.sort(key=lambda row: (row["env_idx"], row["fem_entity_idx0"], row["fem_entity_idx1"],
+                                   row["element_idx_local0"], row["element_idx_local1"],
+                                   *row["contact_point_m"]))
+        scene_step, substep, dt = self.completed_substep
+        return {"rows": rows, "completed_scene_step_index": scene_step,
+                "completed_physical_substep_index": substep, "dt_s": dt}
 
     @qd.func
     def compute_candidates(self, f: qd.i32):
@@ -7269,6 +7346,7 @@ class FEMSelfTetContactHandler(FEMContactHandler):
                 self.contact_pairs[i_p].geom_idx1 = i_e1
                 self.contact_pairs[i_p].barycentric0 = barycentric0
                 self.contact_pairs[i_p].barycentric1 = barycentric1
+                self.contact_pairs[i_p].contact_pos = centroid
 
                 deformable_g = self.coupler._hydroelastic_stiffness
                 deformable_k = total_area * deformable_g
