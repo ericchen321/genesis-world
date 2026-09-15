@@ -146,7 +146,7 @@ def _add_overlay_nodes(scene: pyrender.Scene, overlays: list[dict[str, Any]]) ->
                 "+Z": np.array([0.0, 0.0, 1.0], dtype=np.float32),
                 "-Z": np.array([0.0, 0.0, -1.0], dtype=np.float32),
             }[motion_axis]
-            length = max(float(np.max(box[3:] - box[:3])) * 0.75, 0.01)
+            length = max(float(np.max(box[3:] - box[:3])) * 0.30, 0.01)
             arrow = mu.create_arrow(length=length, radius=0.004)
             arrow_render_mesh = pyrender.Mesh.from_trimesh(
                 arrow,

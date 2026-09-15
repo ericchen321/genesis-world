@@ -675,7 +675,7 @@ class VisualTelemetry:
                     "-Z": (0.0, 0.0, -1.0),
                 }
                 center = bounds.mean(axis=0)
-                length = max(float(np.max(bounds[1] - bounds[0])) * 0.75, 0.01)
+                length = max(float(np.max(bounds[1] - bounds[0])) * 0.30, 0.01)
                 axis_handle = session.scene.draw_debug_arrow(
                     center,
                     np.asarray(axis_vectors[motion_axis], dtype=np.float32) * length,
