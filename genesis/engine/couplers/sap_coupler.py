@@ -346,6 +346,7 @@ class SAPCoupler(RBC):
         self._max_rigid_fem_snap_constraints = options.max_rigid_fem_snap_constraints
         self.rigid_fem_snap = None
         self._enable_rigid_fem_snap_coarse_preconditioner = options.enable_rigid_fem_snap_coarse_preconditioner
+        self._enable_rigid_fem_snap_coarse_all_materials = options.enable_rigid_fem_snap_coarse_all_materials
         self.rigid_fem_snap_coarse = None
         self._enable_rigid_fem_contact_patch_preconditioner = (
             options.enable_rigid_fem_contact_patch_preconditioner
@@ -6537,6 +6538,7 @@ class RigidFEMSnapCoarsePreconditioner:
         self._has_native = self.native is not None
         self._has_self_tet = self.self_tet is not None
         self._has_floor = self.floor is not None
+        self._activate_all_materials = coupler._enable_rigid_fem_snap_coarse_all_materials
         self._B = coupler._B
         self.n_vertices = self.fem.n_vertices
         mu, lam = self.fem.elements_i.mu.to_numpy(), self.fem.elements_i.lam.to_numpy()
@@ -6586,29 +6588,33 @@ class RigidFEMSnapCoarsePreconditioner:
         self.centroid.fill(0.0)
         self.norm_squared.fill(0.0)
         self.basis.fill(0.0)
-        for row in range(self.snap.n_contact_pairs[None]):
-            pair = self.snap.contact_pairs[row]
-            self.active[pair.batch_idx, self.preferred_group[pair.vertex_idx]] = True
-        if qd.static(self._has_native):
-            for row in range(self.native.n_contact_pairs[None]):
-                pair = self.native.contact_pairs[row]
-                vertices = self.fem.elements_i[pair.geom_idx0].el2v
-                for corner in qd.static(range(4)):
-                    self.active[pair.batch_idx, self.preferred_group[vertices[corner]]] = True
-        if qd.static(self._has_self_tet):
-            for row in range(self.self_tet.n_contact_pairs[None]):
-                pair = self.self_tet.contact_pairs[row]
-                vertices0 = self.fem.elements_i[pair.geom_idx0].el2v
-                vertices1 = self.fem.elements_i[pair.geom_idx1].el2v
-                for corner in qd.static(range(4)):
-                    self.active[pair.batch_idx, self.preferred_group[vertices0[corner]]] = True
-                    self.active[pair.batch_idx, self.preferred_group[vertices1[corner]]] = True
-        if qd.static(self._has_floor):
-            for row in range(self.floor.n_contact_pairs[None]):
-                pair = self.floor.contact_pairs[row]
-                vertices = self.fem.elements_i[pair.geom_idx].el2v
-                for corner in qd.static(range(4)):
-                    self.active[pair.batch_idx, self.preferred_group[vertices[corner]]] = True
+        if qd.static(self._activate_all_materials):
+            for batch, group in qd.ndrange(self._B, self.n_groups):
+                self.active[batch, group] = self.coupler.batch_active[batch]
+        else:
+            for row in range(self.snap.n_contact_pairs[None]):
+                pair = self.snap.contact_pairs[row]
+                self.active[pair.batch_idx, self.preferred_group[pair.vertex_idx]] = True
+            if qd.static(self._has_native):
+                for row in range(self.native.n_contact_pairs[None]):
+                    pair = self.native.contact_pairs[row]
+                    vertices = self.fem.elements_i[pair.geom_idx0].el2v
+                    for corner in qd.static(range(4)):
+                        self.active[pair.batch_idx, self.preferred_group[vertices[corner]]] = True
+            if qd.static(self._has_self_tet):
+                for row in range(self.self_tet.n_contact_pairs[None]):
+                    pair = self.self_tet.contact_pairs[row]
+                    vertices0 = self.fem.elements_i[pair.geom_idx0].el2v
+                    vertices1 = self.fem.elements_i[pair.geom_idx1].el2v
+                    for corner in qd.static(range(4)):
+                        self.active[pair.batch_idx, self.preferred_group[vertices0[corner]]] = True
+                        self.active[pair.batch_idx, self.preferred_group[vertices1[corner]]] = True
+            if qd.static(self._has_floor):
+                for row in range(self.floor.n_contact_pairs[None]):
+                    pair = self.floor.contact_pairs[row]
+                    vertices = self.fem.elements_i[pair.geom_idx].el2v
+                    for corner in qd.static(range(4)):
+                        self.active[pair.batch_idx, self.preferred_group[vertices[corner]]] = True
         for batch, group, vertex in qd.ndrange(self._B, self.n_groups, self.n_vertices):
             if self.active[batch, group] and self.support[group, vertex]:
                 self.centroid[batch, group] += self.fem.elements_v[i_step, vertex, batch].pos / self.count[group]

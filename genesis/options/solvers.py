@@ -162,6 +162,10 @@ class SAPCouplerOptions(BaseCouplerOptions):
         Vert would be preferable when the mesh is very coarse, such as a single cube or a tetrahedron.
     enable_rigid_fem_contact : bool, optional
         Whether to enable coupling between rigid and FEM solvers. Defaults to True.
+    enable_rigid_fem_snap_coarse_all_materials : bool, optional
+        Whether the rigid--FEM snap coarse preconditioner activates every FEM
+        material group whenever SAP runs. Defaults to False, which retains
+        contact-based material-group activation.
     enable_rigid_fem_contact_patch_preconditioner : bool, optional
         Whether SAP PCG augments its ordinary FEM/rigid block preconditioner
         with rank-aware six-mode rigid--FEM contact-patch coarse corrections.
@@ -213,6 +217,7 @@ class SAPCouplerOptions(BaseCouplerOptions):
     # Zero leaves finite bilateral vertex/link snap coupling disabled and unallocated.
     max_rigid_fem_snap_constraints: NonNegativeInt = 0
     enable_rigid_fem_snap_coarse_preconditioner: StrictBool = False
+    enable_rigid_fem_snap_coarse_all_materials: StrictBool = False
     enable_rigid_fem_contact_patch_preconditioner: StrictBool = False
     enable_rigid_fem_contact_tet_schwarz_preconditioner: StrictBool = False
     rigid_rigid_contact_type: Literal["tet", "vert", "none"] = "tet"
@@ -886,6 +891,12 @@ class FEMOptions(Options):
         Whether the implicit solver augments the per-vertex 3x3 block-Jacobi
         preconditioner with six rigid modes per volumetric FEM entity.
         Defaults to False. Only used when `use_implicit_solver` is True.
+    enable_material_coarse_preconditioner : bool, optional
+        Whether the implicit solver additionally augments the per-vertex
+        block-Jacobi preconditioner with six current-position motion modes per
+        material region. Material regions are grouped per entity by their
+        Lamé parameters. Defaults to False. Only used when
+        `use_implicit_solver` is True.
     true_residual_probe_global_substep : int, optional
         Diagnostic-only global physical substep at which the implicit PCG
         solver records true residuals after 0, 50, 100, 250, and 500 updates.
@@ -927,6 +938,7 @@ class FEMOptions(Options):
     damping_alpha: NonNegativeFloat = 0.5
     damping_beta: NonNegativeFloat = 5e-4
     enable_rigid_mode_deflation: StrictBool = False
+    enable_material_coarse_preconditioner: StrictBool = False
     true_residual_probe_global_substep: NonNegativeInt | None = None
     enable_vertex_constraints: StrictBool = False
     enable_qualification_safety_extrema: StrictBool = False
