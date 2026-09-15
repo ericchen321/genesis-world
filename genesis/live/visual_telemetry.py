@@ -16,7 +16,16 @@ import genesis as gs
 from .overlay_state import anchor_overlay_records, controller_overlay_records
 from .triptych import HAG4R_LABELS, PANEL_ORDER, png_record, stitch_triptych
 
-PANEL_SIZE = (256, 256)
+PANEL_SIZE = (768, 768)
+TRIPTYCH_FOV_DEGREES = 35.0
+TRIPTYCH_TARGET_FILL_FRACTION = 0.75
+PART_SHADED_METALLIC = 0.0
+PART_SHADED_ROUGHNESS = 0.65
+PART_SHADED_BACKGROUND_RGB = (0.18, 0.18, 0.18)
+PART_SHADED_AMBIENT_RGB = (0.3, 0.3, 0.3)
+PART_SHADED_LIGHT_DIRECTION = (-1.0, -1.0, -1.0)
+PART_SHADED_LIGHT_COLOR = (1.0, 1.0, 1.0)
+PART_SHADED_LIGHT_INTENSITY = 3.0
 FIXED_RGB_VIEW_SIZE = (512, 512)
 FIXED_RGB_VIEW_ORDER = ("full", "context")
 FIXED_RGB_FOV_DEGREES = 40.0
@@ -77,39 +86,65 @@ def _triptych_world_bounds(session, boxes: list[np.ndarray] | None = None) -> tu
 
     bbox_min = np.min(np.stack(mins), axis=0)
     bbox_max = np.max(np.stack(maxs), axis=0)
-    pad = np.maximum(0.05, 0.08 * np.maximum(bbox_max - bbox_min, 1e-6))
-    return bbox_min - pad, bbox_max + pad
+    return bbox_min, bbox_max
+
+
+def _bounds_corners(bbox_min: np.ndarray, bbox_max: np.ndarray) -> np.ndarray:
+    return np.asarray(
+        [
+            [x, y, z]
+            for x in (bbox_min[0], bbox_max[0])
+            for y in (bbox_min[1], bbox_max[1])
+            for z in (bbox_min[2], bbox_max[2])
+        ],
+        dtype=np.float32,
+    )
+
+
+def _triptych_view_basis(label: str) -> tuple[np.ndarray, np.ndarray]:
+    if label == "top":
+        return np.array([0.0, -1.0, 0.0], dtype=np.float32), np.array([0.0, 0.0, -1.0], dtype=np.float32)
+    if label == "northeast":
+        return _normalize(np.array([-1.0, -1.0, -0.75], dtype=np.float32), "view direction"), np.array(
+            [0.0, 0.0, 1.0], dtype=np.float32
+        )
+    if label == "southwest":
+        return _normalize(np.array([1.0, 1.0, -0.75], dtype=np.float32), "view direction"), np.array(
+            [0.0, 0.0, 1.0], dtype=np.float32
+        )
+    raise ValueError(f"Unsupported RGB triptych panel label: {label}")
 
 
 def _triptych_camera_pose(
-    label: str, bbox_min: np.ndarray, bbox_max: np.ndarray
-) -> dict[str, tuple[float, float, float]]:
-    if label not in PANEL_ORDER:
-        raise ValueError(f"Unsupported RGB triptych panel label: {label}")
-
+    label: str,
+    bbox_min: np.ndarray,
+    bbox_max: np.ndarray,
+    *,
+    fov_degrees: float = TRIPTYCH_FOV_DEGREES,
+    target_fill_fraction: float = TRIPTYCH_TARGET_FILL_FRACTION,
+) -> dict[str, Any]:
     center = ((bbox_min + bbox_max) * 0.5).astype(np.float32)
-    max_extent = float(np.max(bbox_max - bbox_min))
-    d = max(0.35, 2.5 * max_extent)
-    if label == "top":
-        # Keep the historical label for artifact compatibility, but use this panel
-        # as a +Y profile view so thin parts resting near the floor remain visible.
-        position = center + np.array([0.0, d, 0.0], dtype=np.float32)
-        nominal_up = np.array([0.0, 0.0, -1.0], dtype=np.float32)
-    elif label == "northeast":
-        position = center + np.array([d, d, 0.75 * d], dtype=np.float32)
-        nominal_up = np.array([0.0, 0.0, 1.0], dtype=np.float32)
-    else:
-        position = center + np.array([-d, -d, 0.75 * d], dtype=np.float32)
-        nominal_up = np.array([0.0, 0.0, 1.0], dtype=np.float32)
-
-    lookat = center
-    view_dir = _normalize(lookat - position, "view direction")
+    view_dir, nominal_up = _triptych_view_basis(label)
     right = _normalize(np.cross(view_dir, nominal_up), "right")
     up = _normalize(np.cross(right, view_dir), "up")
+    relative_corners = _bounds_corners(bbox_min, bbox_max) - center
+    tangent = math.tan(math.radians(fov_degrees) * 0.5) * target_fill_fraction
+    along_view = relative_corners @ view_dir
+    horizontal = np.abs(relative_corners @ right)
+    vertical = np.abs(relative_corners @ up)
+    distance = float(np.max(np.maximum(horizontal, vertical) / tangent - along_view))
+    extent = float(np.max(bbox_max - bbox_min))
+    distance = max(distance, max(extent, 1.0e-4))
+    position = center - view_dir * distance
+    radius = float(np.max(np.linalg.norm(relative_corners, axis=1)))
+    near = max(1.0e-5, distance - radius * 1.25)
+    far = distance + radius * 1.25
     return {
         "pos": tuple(float(value) for value in position),
-        "lookat": tuple(float(value) for value in lookat),
+        "lookat": tuple(float(value) for value in center),
         "up": tuple(float(value) for value in up),
+        "near": float(near),
+        "far": float(far),
     }
 
 
@@ -213,14 +248,16 @@ def _normalize_camera_rgb(rgb: Any, *, label: str, camera: Any) -> np.ndarray:
     return np.ascontiguousarray(array)
 
 
-def _render_camera_rgb(camera: Any, *, label: str, force_render: bool) -> np.ndarray:
+def _render_camera_rgb(
+    camera: Any, *, label: str, force_render: bool, render_pass: str = "rgb"
+) -> np.ndarray:
     rgb, _depth, _seg, _normal = camera.render(
         rgb=True,
         depth=False,
         segmentation=False,
         normal=False,
         force_render=force_render,
-        render_pass="rgb",
+        render_pass=render_pass,
     )
     if rgb is None:
         raise ValueError(f"Genesis debug camera {label!r} did not return RGB data")
@@ -307,7 +344,15 @@ def _render_camera_normal(camera: Any, *, label: str, force_render: bool) -> np.
     return np.ascontiguousarray(image)
 
 
-def _render_camera_part_segmentation(camera: Any, *, label: str, force_render: bool, context: Any) -> np.ndarray:
+def _render_camera_part_segmentation(
+    camera: Any,
+    *,
+    label: str,
+    force_render: bool,
+    context: Any,
+    render_pass: str = "part_segmentation",
+    return_indices: bool = False,
+) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
     _rgb, _depth, segmentation, _normal = camera.render(
         rgb=False,
         depth=False,
@@ -315,7 +360,7 @@ def _render_camera_part_segmentation(camera: Any, *, label: str, force_render: b
         colorize_seg=False,
         normal=False,
         force_render=force_render,
-        render_pass="part_segmentation",
+        render_pass=render_pass,
     )
     if segmentation is None:
         raise ValueError(f"Genesis debug camera {label!r} did not return segmentation data")
@@ -340,7 +385,10 @@ def _render_camera_part_segmentation(camera: Any, *, label: str, force_render: b
     if not np.all(known):
         unknown = sorted(int(value) for value in np.unique(indices[~known]))
         raise ValueError(f"Part segmentation render returned unmapped indices: {unknown}")
-    return np.ascontiguousarray(image)
+    image = np.ascontiguousarray(image)
+    if return_indices:
+        return image, indices
+    return image
 
 
 def _json_vec3(value: Any) -> list[float]:
@@ -353,17 +401,24 @@ def _json_vec3(value: Any) -> list[float]:
 
 
 def _camera_metadata(camera: Any, label: str, pose: dict[str, tuple[float, float, float]]) -> dict[str, Any]:
+    position = _json_vec3(camera.pos)
+    target = _json_vec3(camera.lookat)
+    up = _json_vec3(camera.up)
     return {
         "label": label,
         "model": camera.model,
         "debug": bool(camera.debug),
         "res": [int(camera.res[0]), int(camera.res[1])],
+        "resolution": [int(camera.res[0]), int(camera.res[1])],
         "fov": float(camera.fov),
+        "fov_degrees": float(camera.fov),
         "near": float(camera.near),
         "far": float(camera.far),
-        "pos": _json_vec3(camera.pos),
-        "lookat": _json_vec3(camera.lookat),
-        "up": _json_vec3(camera.up),
+        "pos": position,
+        "position": position,
+        "lookat": target,
+        "target": target,
+        "up": up,
         "pose": {
             "pos": [float(value) for value in pose["pos"]],
             "lookat": [float(value) for value in pose["lookat"]],
@@ -439,15 +494,85 @@ def fixed_rgb_request_hash(value: Any) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def canonical_part_shaded_request(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict) or value.get("mode") != "part_shaded_triptych":
+        raise ValueError("part shaded rendering requires mode=part_shaded_triptych")
+    expected = {
+        "resolution": list(PANEL_SIZE),
+        "fov_deg": TRIPTYCH_FOV_DEGREES,
+        "target_fill_fraction": TRIPTYCH_TARGET_FILL_FRACTION,
+        "surface": {"metallic": PART_SHADED_METALLIC, "roughness": PART_SHADED_ROUGHNESS},
+        "lighting": {
+            "background_rgb": list(PART_SHADED_BACKGROUND_RGB),
+            "ambient_rgb": list(PART_SHADED_AMBIENT_RGB),
+            "directional": {
+                "direction": list(PART_SHADED_LIGHT_DIRECTION),
+                "color": list(PART_SHADED_LIGHT_COLOR),
+                "intensity": PART_SHADED_LIGHT_INTENSITY,
+            },
+        },
+        "shadows": True,
+        "part_id_pass": True,
+    }
+    request = dict(value)
+    for key, default in expected.items():
+        request.setdefault(key, default)
+        if request[key] != default:
+            raise ValueError(f"part_shaded_triptych requires {key}={default!r}")
+    roi = dict(request.get("roi", {}))
+    roi.setdefault("enabled", request.get("target_box") is not None)
+    roi["enabled"] = bool(roi["enabled"] and request.get("target_box") is not None)
+    roi.setdefault("resolution", list(PANEL_SIZE))
+    roi.setdefault("target_fill_fraction", TRIPTYCH_TARGET_FILL_FRACTION)
+    if roi["resolution"] != list(PANEL_SIZE):
+        raise ValueError(f"part_shaded_triptych ROI resolution must be {list(PANEL_SIZE)}")
+    if float(roi["target_fill_fraction"]) != TRIPTYCH_TARGET_FILL_FRACTION:
+        raise ValueError(
+            f"part_shaded_triptych ROI target_fill_fraction must be {TRIPTYCH_TARGET_FILL_FRACTION}"
+        )
+    request["roi"] = roi
+    if roi["enabled"]:
+        request["target_box"] = _validate_overlay_box(request["target_box"]).astype(float).tolist()
+    capture_id = str(request.get("capture_id", "")).strip()
+    if capture_id and not all(character.isalnum() or character in "_-" for character in capture_id):
+        raise ValueError("diagnostic_visual.capture_id must contain only letters, digits, underscores, or hyphens")
+    request["capture_id"] = capture_id or None
+    request["action_phase"] = str(request.get("action_phase", "periodic"))
+    if request.get("target_part_id") is not None:
+        request["target_part_id"] = int(request["target_part_id"])
+    return request
+
+
+def part_shaded_vis_options() -> gs.options.VisOptions:
+    return gs.options.VisOptions(
+        background_color=PART_SHADED_BACKGROUND_RGB,
+        ambient_light=PART_SHADED_AMBIENT_RGB,
+        shadow=True,
+        lights=(
+            gs.options.vis.DirectionalLight(
+                dir=PART_SHADED_LIGHT_DIRECTION,
+                color=PART_SHADED_LIGHT_COLOR,
+                intensity=PART_SHADED_LIGHT_INTENSITY,
+            ),
+        ),
+    )
+
+
 class VisualTelemetry:
     def __init__(self, output_dir: str | Path):
         self.output_dir = Path(output_dir)
         self.triptych_cameras: dict[str, Any] = {}
+        self.triptych_camera_poses: dict[str, dict[str, Any]] = {}
+        self.triptych_bounds: tuple[np.ndarray, np.ndarray] | None = None
+        self.roi_camera: Any | None = None
         self.fixed_rgb_cameras: dict[str, Any] = {}
         self._triptych_debug_marker_handles: list[Any] = []
 
     def reset_triptych_cameras(self) -> None:
         self.triptych_cameras.clear()
+        self.triptych_camera_poses.clear()
+        self.triptych_bounds = None
+        self.roi_camera = None
         self._triptych_debug_marker_handles.clear()
 
     def reset_fixed_rgb_cameras(self) -> None:
@@ -477,6 +602,7 @@ class VisualTelemetry:
         if session.scene is None:
             raise ValueError("Cannot register RGB triptych cameras before the Genesis scene exists")
         bbox_min, bbox_max = _triptych_world_bounds(session)
+        self.triptych_bounds = (bbox_min.copy(), bbox_max.copy())
         for label in PANEL_ORDER:
             pose = _triptych_camera_pose(label, bbox_min, bbox_max)
             camera = session.scene.add_camera(
@@ -485,12 +611,29 @@ class VisualTelemetry:
                 pos=pose["pos"],
                 lookat=pose["lookat"],
                 up=pose["up"],
+                fov=TRIPTYCH_FOV_DEGREES,
+                near=pose["near"],
+                far=pose["far"],
                 GUI=False,
                 debug=True,
             )
             self.triptych_cameras[label] = camera
+            self.triptych_camera_poses[label] = pose
         if tuple(self.triptych_cameras) != PANEL_ORDER:
             raise ValueError("RGB triptych camera registration did not produce the expected panel order")
+        roi_pose = self.triptych_camera_poses[PANEL_ORDER[0]]
+        self.roi_camera = session.scene.add_camera(
+            model="pinhole",
+            res=PANEL_SIZE,
+            pos=roi_pose["pos"],
+            lookat=roi_pose["lookat"],
+            up=roi_pose["up"],
+            fov=TRIPTYCH_FOV_DEGREES,
+            near=roi_pose["near"],
+            far=roi_pose["far"],
+            GUI=False,
+            debug=True,
+        )
 
     def triptych_camera(self, label: str):
         if label not in self.triptych_cameras:
@@ -519,6 +662,7 @@ class VisualTelemetry:
                 wireframe=True,
                 wireframe_radius=DEBUG_BOX_WIREFRAME_RADIUS,
             )
+            session.scene.visualizer._context.mark_part_shaded_overlay(handle)
             self._triptych_debug_marker_handles.append(handle)
             motion_axis = record.get("motion_axis")
             if record.get("kind") == "live_box_controller" and motion_axis in {"+X", "-X", "+Y", "-Y", "+Z", "-Z"}:
@@ -538,6 +682,7 @@ class VisualTelemetry:
                     radius=DEBUG_BOX_WIREFRAME_RADIUS,
                     color=CONTROLLER_DEBUG_AXIS_COLOR,
                 )
+                session.scene.visualizer._context.mark_part_shaded_overlay(axis_handle)
                 self._triptych_debug_marker_handles.append(axis_handle)
             marker_records.append(
                 {
@@ -560,28 +705,38 @@ class VisualTelemetry:
         return marker_records
 
     @torch.no_grad()
-    def capture_triptych(self, session, *, mode: str, frame_index: int | None = None) -> dict[str, Any]:
+    def capture_triptych(
+        self,
+        session,
+        *,
+        mode: str,
+        frame_index: int | None = None,
+        visual: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         if mode not in {
             "rgb_triptych",
             "depth_triptych",
             "normal_triptych",
             "part_segmentation_triptych",
+            "part_shaded_triptych",
         }:
             raise ValueError(f"Unsupported diagnostic triptych mode: {mode}")
+        request = canonical_part_shaded_request(visual or {"mode": mode}) if mode == "part_shaded_triptych" else {}
         if frame_index is None:
             frame_index = int(session.current_step)
-        anchor_records = anchor_overlay_records(session.anchor_records)
-        controller_records = controller_overlay_records(session.controllers)
-        overlays = _render_overlay_records(anchor_records + controller_records)
-        boxes = _boxes_from_overlays(overlays)
-        bbox_min, bbox_max = _triptych_world_bounds(session, boxes)
-
-        marker_records = []
-        panel_records = []
-        panel_paths = []
+        capture_id = request.get("capture_id")
+        stem = f"frame_{frame_index:06d}" + (f"__{capture_id}" if capture_id else "")
+        overlays = _render_overlay_records(
+            anchor_overlay_records(session.anchor_records) + controller_overlay_records(session.controllers)
+        )
+        if self.triptych_bounds is None:
+            raise ValueError("RGB triptych cameras have no frozen episode bounds")
+        bbox_min, bbox_max = self.triptych_bounds
         context = session.scene.visualizer._context
-        if mode == "part_segmentation_triptych":
-            palette = next(iter(session.entities.values()))._part_segmentation_config["context_palette"]
+        part_mode = mode in {"part_segmentation_triptych", "part_shaded_triptych"}
+        if part_mode:
+            contracts = [entity._part_segmentation_config for entity in session.entities.values()]
+            palette = contracts[0]["context_palette"]
             context.replace_part_segmentation_context_boxes(
                 [
                     {
@@ -593,20 +748,63 @@ class VisualTelemetry:
                     for index, record in enumerate(overlays)
                 ]
             )
+        else:
+            contracts = []
+
+        marker_records = []
+        panel_records = []
+        panel_paths = []
         panel_render_seconds = []
         png_encode_write_seconds = 0.0
         capture_started = time.perf_counter()
+        prefix = {
+            "rgb_triptych": "rgb",
+            "depth_triptych": "depth",
+            "normal_triptych": "normal",
+            "part_segmentation_triptych": "part_segmentation",
+            "part_shaded_triptych": "part_shaded",
+        }[mode]
+
+        def write_panel(image, *, label, hag4r_label, directory, pose, camera, renderer_mode):
+            nonlocal png_encode_write_seconds
+            path = self.output_dir / directory / label / f"{stem}.png"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            png_started = time.perf_counter()
+            Image.fromarray(image, mode="RGB").save(path)
+            png_encode_write_seconds += time.perf_counter() - png_started
+            record = png_record(
+                path,
+                label=label,
+                hag4r_label=hag4r_label,
+                frame_index=frame_index,
+                simulation_step=session.current_step,
+            )
+            record.update(
+                {
+                    "capture_id": capture_id,
+                    "action_phase": request.get("action_phase", "periodic"),
+                    "simulation_time_s": float(session.current_step * session.scene.dt),
+                    "render_backend": GENESIS_NATIVE_DEBUG_CAMERA_RENDERER,
+                    "renderer": {
+                        "backend": GENESIS_NATIVE_DEBUG_CAMERA_RENDERER,
+                        "mode": renderer_mode,
+                        "debug_camera": True,
+                        "native_camera_registered": True,
+                    },
+                    "camera": _camera_metadata(camera, label, pose),
+                }
+            )
+            return path, record
+
         cuda_memory_available = bool(torch.cuda.is_available() and gs.backend == gs.cuda)
         if cuda_memory_available:
             torch.cuda.reset_peak_memory_stats()
         try:
-            if mode == "rgb_triptych":
+            if mode in {"rgb_triptych", "part_shaded_triptych"}:
                 marker_records = self._draw_triptych_debug_markers(session, overlays)
             for panel_index, label in enumerate(PANEL_ORDER):
                 camera = self.triptych_camera(label)
-                if not bool(camera.debug):
-                    raise ValueError(f"Diagnostic triptych camera {label!r} is not a debug camera")
-                pose = _triptych_camera_pose(label, bbox_min, bbox_max)
+                pose = self.triptych_camera_poses[label]
                 camera.set_pose(pos=pose["pos"], lookat=pose["lookat"], up=pose["up"])
                 render_started = time.perf_counter()
                 if mode == "rgb_triptych":
@@ -615,49 +813,138 @@ class VisualTelemetry:
                     image = _render_camera_depth(camera, label=label, force_render=panel_index == 0)
                 elif mode == "normal_triptych":
                     image = _render_camera_normal(camera, label=label, force_render=panel_index == 0)
-                else:
+                elif mode == "part_segmentation_triptych":
                     image = _render_camera_part_segmentation(
+                        camera, label=label, force_render=panel_index == 0, context=context
+                    )
+                else:
+                    image = _render_camera_rgb(
                         camera,
                         label=label,
                         force_render=panel_index == 0,
-                        context=context,
+                        render_pass="part_shaded",
                     )
                 panel_render_seconds.append(time.perf_counter() - render_started)
-
-                prefix = {
-                    "rgb_triptych": "rgb",
-                    "depth_triptych": "depth",
-                    "normal_triptych": "normal",
-                    "part_segmentation_triptych": "part_segmentation",
-                }[mode]
-                path = self.output_dir / f"png_{prefix}_panels" / label / f"frame_{frame_index:06d}.png"
-                path.parent.mkdir(parents=True, exist_ok=True)
-                png_started = time.perf_counter()
-                Image.fromarray(image, mode="RGB").save(path)
-                png_encode_write_seconds += time.perf_counter() - png_started
-                panel_paths.append(path)
-                panel_record = png_record(
-                    path,
+                path, record = write_panel(
+                    image,
                     label=label,
                     hag4r_label=HAG4R_LABELS[label],
+                    directory=f"png_{prefix}_panels",
+                    pose=pose,
+                    camera=camera,
+                    renderer_mode=mode,
+                )
+                panel_paths.append(path)
+                panel_records.append(record)
+
+            update_stats = dict(context.last_render_update_stats)
+            actual_upload_stats = dict(context.jit.last_buffer_upload_stats)
+
+            part_id_views = []
+            part_id_panel_paths = {}
+            part_id_stitched = None
+            target_visible_pixels = {}
+            if mode == "part_shaded_triptych" and request["part_id_pass"]:
+                target_part_id = request.get("target_part_id")
+                target_segmentation_indices = sorted(
+                    {
+                        int(context.seg_color_map.key_map[("hag4r_part", entity_uid, part_id)])
+                        for _env_index, entity_uid, part_id in context.part_segmentation_nodes
+                        if part_id == target_part_id
+                    }
+                )
+                id_paths = []
+                for label in PANEL_ORDER:
+                    camera = self.triptych_camera(label)
+                    pose = self.triptych_camera_poses[label]
+                    image, indices = _render_camera_part_segmentation(
+                        camera,
+                        label=label,
+                        force_render=False,
+                        context=context,
+                        render_pass="part_segmentation_current",
+                        return_indices=True,
+                    )
+                    target_visible_pixels[label] = int(
+                        np.count_nonzero(np.isin(indices, target_segmentation_indices))
+                    )
+                    path, record = write_panel(
+                        image,
+                        label=label,
+                        hag4r_label=HAG4R_LABELS[label],
+                        directory="png_part_id_panels",
+                        pose=pose,
+                        camera=camera,
+                        renderer_mode="part_segmentation_triptych",
+                    )
+                    record["target_part_visible_pixel_count"] = target_visible_pixels[label]
+                    id_paths.append(path)
+                    part_id_views.append(record)
+                    part_id_panel_paths[label] = str(path)
+                id_stitched_path = self.output_dir / "png_part_id_triptych" / f"{stem}.png"
+                stitch_triptych(id_paths, id_stitched_path)
+                part_id_stitched = png_record(
+                    id_stitched_path,
+                    label="triptych",
+                    hag4r_label="triptych",
                     frame_index=frame_index,
                     simulation_step=session.current_step,
                 )
-                panel_record.update(
+                part_id_stitched["renderer"] = {
+                    "backend": GENESIS_NATIVE_DEBUG_CAMERA_RENDERER,
+                    "mode": "part_segmentation_triptych",
+                }
+
+            roi_view = None
+            roi_path = None
+            roi_camera_id = None
+            best_overview_label = None
+            if mode == "part_shaded_triptych" and request["roi"]["enabled"]:
+                target_box = np.asarray(request["target_box"], dtype=np.float32)
+                target_min, target_max = target_box[:3], target_box[3:]
+                best_overview_label = max(PANEL_ORDER, key=target_visible_pixels.__getitem__)
+                roi_pose = _triptych_camera_pose(best_overview_label, target_min, target_max)
+                roi_camera_id = hashlib.sha256(
+                    json.dumps(
+                        {"source": best_overview_label, "target_box": request["target_box"]},
+                        sort_keys=True,
+                    ).encode("utf-8")
+                ).hexdigest()[:16]
+                self.roi_camera._near = roi_pose["near"]
+                self.roi_camera._far = roi_pose["far"]
+                self.roi_camera.set_pose(pos=roi_pose["pos"], lookat=roi_pose["lookat"], up=roi_pose["up"])
+                render_started = time.perf_counter()
+                roi_image = _render_camera_rgb(
+                    self.roi_camera,
+                    label="roi",
+                    force_render=False,
+                    render_pass="part_shaded",
+                )
+                panel_render_seconds.append(time.perf_counter() - render_started)
+                roi_path_obj, roi_view = write_panel(
+                    roi_image,
+                    label="roi",
+                    hag4r_label="roi",
+                    directory="png_part_shaded_roi",
+                    pose=roi_pose,
+                    camera=self.roi_camera,
+                    renderer_mode=mode,
+                )
+                roi_path = str(roi_path_obj)
+                roi_view.update(
                     {
-                        "render_backend": GENESIS_NATIVE_DEBUG_CAMERA_RENDERER,
-                        "renderer": {
-                            "backend": GENESIS_NATIVE_DEBUG_CAMERA_RENDERER,
-                            "mode": mode,
-                            "debug_camera": True,
-                            "native_camera_registered": True,
-                        },
-                        "camera": _camera_metadata(camera, label, pose),
+                        "roi_camera_id": roi_camera_id,
+                        "source_view": best_overview_label,
+                        "source_overview_label": best_overview_label,
+                        "source_view_target_part_visible_pixel_count": target_visible_pixels[
+                            best_overview_label
+                        ],
+                        "target_box": request["target_box"],
+                        "target_part_id": request.get("target_part_id"),
                     }
                 )
-                panel_records.append(panel_record)
 
-            triptych_path = self.output_dir / f"png_{prefix}_triptych" / f"frame_{frame_index:06d}.png"
+            triptych_path = self.output_dir / f"png_{prefix}_triptych" / f"{stem}.png"
             stitch_started = time.perf_counter()
             stitch_triptych(panel_paths, triptych_path)
             stitch_seconds = time.perf_counter() - stitch_started
@@ -671,100 +958,100 @@ class VisualTelemetry:
             )
             triptych_record.update(
                 {
+                    "capture_id": capture_id,
+                    "action_phase": request.get("action_phase", "periodic"),
                     "render_backend": GENESIS_NATIVE_DEBUG_CAMERA_RENDERER,
                     "renderer": {"backend": GENESIS_NATIVE_DEBUG_CAMERA_RENDERER, "mode": mode},
-                    "source_panel_count": 3,
+                    "source_panel_count": len(PANEL_ORDER),
                 }
             )
 
-            metadata_path = self.output_dir / f"{prefix}_triptych_metadata" / f"frame_{frame_index:06d}.json"
-            part_legend = []
-            context_palette = {}
-            if mode == "part_segmentation_triptych":
-                contracts = [entity._part_segmentation_config for entity in session.entities.values()]
-                part_legend = [part for contract in contracts for part in contract["parts"]]
-                context_palette = dict(contracts[0]["context_palette"])
-            update_stats = dict(context.last_render_update_stats)
-            actual_upload_stats = dict(context.jit.last_buffer_upload_stats)
-            active_part_nodes = len(context.part_segmentation_nodes) if mode == "part_segmentation_triptych" else 0
-            active_context_nodes = (
-                len(context.part_segmentation_context_nodes) if mode == "part_segmentation_triptych" else 0
-            )
             indexed_parts = [
-                {
-                    "env_index": int(key[0]),
-                    "entity_uid": str(key[1]),
-                    "part_id": int(key[2]),
-                    **counts,
-                }
+                {"env_index": int(key[0]), "entity_uid": str(key[1]), "part_id": int(key[2]), **counts}
                 for key, counts in sorted(context.part_segmentation_indexed_counts.items())
             ]
             if cuda_memory_available:
                 torch.cuda.synchronize()
                 peak_gpu_memory_bytes = int(torch.cuda.max_memory_allocated())
                 current_gpu_memory_allocated_bytes = int(torch.cuda.memory_allocated())
-                peak_gpu_memory_reason = None
             else:
                 peak_gpu_memory_bytes = None
                 current_gpu_memory_allocated_bytes = None
-                peak_gpu_memory_reason = (
-                    "genesis_backend_is_not_cuda" if torch.cuda.is_available() else "cuda_unavailable"
-                )
+            metadata_path = self.output_dir / f"{prefix}_triptych_metadata" / f"{stem}.json"
+            frame_metadata = panel_records + [triptych_record] + ([roi_view] if roi_view is not None else [])
             metadata = {
                 "requested": True,
                 "mode": mode,
                 "rendered": True,
+                "capture_id": capture_id,
+                "action_phase": request.get("action_phase", "periodic"),
+                "simulation_time_s": float(session.current_step * session.scene.dt),
+                "target_part_id": request.get("target_part_id"),
                 "render_backend": GENESIS_NATIVE_DEBUG_CAMERA_RENDERER,
                 "renderer": {
                     "backend": GENESIS_NATIVE_DEBUG_CAMERA_RENDERER,
                     "mode": mode,
                     "camera_model": "pinhole",
                     "debug_camera": True,
-                    "panel_camera_models": {record["label"]: record["camera"]["model"] for record in panel_records},
-                    "panel_debug_cameras": {record["label"]: record["camera"]["debug"] for record in panel_records},
                     "panel_size": list(PANEL_SIZE),
+                    "fov_degrees": TRIPTYCH_FOV_DEGREES,
+                    "target_fill_fraction": TRIPTYCH_TARGET_FILL_FRACTION,
+                    "surface": request.get("surface"),
+                    "lighting": request.get("lighting"),
+                    "shadows": request.get("shadows"),
                 },
                 "geometry": {
                     "entity_count": len(session.entities),
                     "bounds": {"min": bbox_min.tolist(), "max": bbox_max.tolist()},
+                    "frozen_episode_bounds": {"min": bbox_min.tolist(), "max": bbox_max.tolist()},
                 },
                 "panel_order": list(PANEL_ORDER),
                 "panel_paths": {record["label"]: record["path"] for record in panel_records},
+                "panels": {record["hag4r_label"]: record for record in panel_records},
                 "views": panel_records,
                 "stitched": triptych_record,
-                "frame_metadata": panel_records + [triptych_record],
+                "roi_view": roi_view,
+                "roi_path": roi_path,
+                "roi_camera_id": roi_camera_id,
+                "best_overview_label": best_overview_label,
+                "part_id_views": part_id_views,
+                "part_id_panel_paths": part_id_panel_paths,
+                "part_id_stitched": part_id_stitched,
+                "frame_metadata": frame_metadata,
                 "overlays": overlays,
                 "debug_markers": marker_records,
-                "part_legend": part_legend,
-                "context_palette": context_palette,
+                "part_legend": [part for contract in contracts for part in contract["parts"]],
+                "context_palette": dict(contracts[0]["context_palette"]) if contracts else {},
                 "indexed_part_nodes": indexed_parts,
                 "performance": {
                     **update_stats,
                     **actual_upload_stats,
                     **context.last_part_segmentation_context_update,
-                    "active_context_node_count": active_context_nodes,
-                    "total_active_draw_update_node_count": active_part_nodes + active_context_nodes,
-                    "rgb_render_count": 0 if mode == "part_segmentation_triptych" else len(PANEL_ORDER),
-                    "rgb_fem_state_fetch_count": int(update_stats.get("rgb_fem_state_fetch_count", 0)),
-                    "rgb_position_upload_bytes": int(update_stats.get("rgb_position_upload_bytes", 0)),
-                    "actual_rgb_inactive_upload_count": int(
-                        actual_upload_stats.get("actual_inactive_buffer_upload_count", 0)
-                    )
-                    if mode == "part_segmentation_triptych"
-                    else 0,
-                    "actual_rgb_inactive_upload_bytes": int(
-                        actual_upload_stats.get("actual_inactive_buffer_upload_bytes", 0)
-                    )
-                    if mode == "part_segmentation_triptych"
-                    else 0,
-                    "segmentation_render_count": len(PANEL_ORDER) if mode == "part_segmentation_triptych" else 0,
+                    "active_context_node_count": len(context.part_segmentation_context_nodes) if part_mode else 0,
+                    "total_active_draw_update_node_count": (
+                        len(context.part_segmentation_nodes) + len(context.part_segmentation_context_nodes)
+                        if part_mode
+                        else 0
+                    ),
+                    "rgb_render_count": (
+                        0
+                        if mode == "part_segmentation_triptych"
+                        else len(PANEL_ORDER) + int(roi_view is not None)
+                    ),
+                    "segmentation_render_count": (
+                        len(PANEL_ORDER) if mode == "part_segmentation_triptych" else len(part_id_views)
+                    ),
                     "panel_raster_seconds": panel_render_seconds,
                     "stitch_seconds": stitch_seconds,
                     "png_encode_write_seconds": png_encode_write_seconds,
                     "peak_gpu_memory_bytes": peak_gpu_memory_bytes,
                     "current_gpu_memory_allocated_bytes": current_gpu_memory_allocated_bytes,
                     "peak_gpu_memory_available": cuda_memory_available,
-                    "peak_gpu_memory_unavailable_reason": peak_gpu_memory_reason,
+                    "peak_gpu_memory_unavailable_reason": (
+                        None
+                        if cuda_memory_available
+                        else "genesis_backend_is_not_cuda" if torch.cuda.is_available() else "cuda_unavailable"
+                    ),
                     "capture_seconds": time.perf_counter() - capture_started,
                 },
                 "capture_time": time.time(),
@@ -776,17 +1063,30 @@ class VisualTelemetry:
         finally:
             self._clear_triptych_debug_markers(session)
 
-    def capture_rgb_triptych(self, session, *, frame_index: int | None = None) -> dict[str, Any]:
-        return self.capture_triptych(session, mode="rgb_triptych", frame_index=frame_index)
+    def capture_rgb_triptych(
+        self, session, *, frame_index: int | None = None, visual: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        return self.capture_triptych(session, mode="rgb_triptych", frame_index=frame_index, visual=visual)
 
-    def capture_depth_triptych(self, session, *, frame_index: int | None = None) -> dict[str, Any]:
-        return self.capture_triptych(session, mode="depth_triptych", frame_index=frame_index)
+    def capture_depth_triptych(
+        self, session, *, frame_index: int | None = None, visual: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        return self.capture_triptych(session, mode="depth_triptych", frame_index=frame_index, visual=visual)
 
-    def capture_normal_triptych(self, session, *, frame_index: int | None = None) -> dict[str, Any]:
-        return self.capture_triptych(session, mode="normal_triptych", frame_index=frame_index)
+    def capture_normal_triptych(
+        self, session, *, frame_index: int | None = None, visual: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        return self.capture_triptych(session, mode="normal_triptych", frame_index=frame_index, visual=visual)
 
-    def capture_part_segmentation_triptych(self, session, *, frame_index: int | None = None) -> dict[str, Any]:
-        return self.capture_triptych(session, mode="part_segmentation_triptych", frame_index=frame_index)
+    def capture_part_segmentation_triptych(
+        self, session, *, frame_index: int | None = None, visual: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        return self.capture_triptych(session, mode="part_segmentation_triptych", frame_index=frame_index, visual=visual)
+
+    def capture_part_shaded_triptych(
+        self, session, *, frame_index: int | None = None, visual: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        return self.capture_triptych(session, mode="part_shaded_triptych", frame_index=frame_index, visual=visual)
 
     @torch.no_grad()
     def capture_fixed_rgb_views(

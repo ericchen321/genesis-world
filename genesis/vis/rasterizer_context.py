@@ -1,3 +1,4 @@
+import math
 import time
 
 import numpy as np
@@ -13,6 +14,34 @@ from genesis.ext.pyrender.jit_render import JITRenderer
 from genesis.utils.misc import tensor_to_array, qd_to_numpy
 
 PART_SEGMENTATION_CONTEXT_EDGE_RADIUS = 0.004
+PART_SHADED_METALLIC = 0.0
+PART_SHADED_ROUGHNESS = 0.65
+PART_SHADED_CREASE_DEGREES = 50.0
+
+
+def _crease_surface_corner_normals(vertices, triangles):
+    face_normals = np.cross(
+        vertices[triangles[:, 1]] - vertices[triangles[:, 0]],
+        vertices[triangles[:, 2]] - vertices[triangles[:, 0]],
+    )
+    lengths = np.linalg.norm(face_normals, axis=1)
+    unit_face_normals = np.zeros_like(face_normals, dtype=np.float32)
+    unit_face_normals[lengths > 0] = face_normals[lengths > 0] / lengths[lengths > 0, None]
+    incident_faces = [[] for _ in range(len(vertices))]
+    for face_index, face in enumerate(triangles):
+        for vertex_index in face:
+            incident_faces[int(vertex_index)].append(face_index)
+    crease_cosine = math.cos(math.radians(PART_SHADED_CREASE_DEGREES))
+    corner_normals = np.empty((len(triangles), 3, 3), dtype=np.float32)
+    for face_index, face in enumerate(triangles):
+        reference = unit_face_normals[face_index]
+        for corner_index, vertex_index in enumerate(face):
+            candidates = np.asarray(incident_faces[int(vertex_index)], dtype=np.int64)
+            smooth_faces = candidates[(unit_face_normals[candidates] @ reference) >= crease_cosine]
+            normal = np.sum(face_normals[smooth_faces], axis=0)
+            normal_length = float(np.linalg.norm(normal))
+            corner_normals[face_index, corner_index] = normal / normal_length if normal_length > 0 else reference
+    return corner_normals
 
 
 def _part_segmentation_wireframe_box_mesh(bounds):
@@ -142,8 +171,11 @@ class RasterizerContext:
         self._per_env_vverts_entity_uids: set = set()
         self.static_nodes = dict()  # used across all frames
         self._fem_surface_vertex_indices = dict()
+        self._fem_surface_triangles = dict()
         self._part_segmentation_vertex_indices = dict()
+        self._part_shaded_corner_indices = dict()
         self.part_segmentation_nodes = dict()
+        self.part_shaded_overlay_nodes = set()
         self.part_segmentation_context_nodes = dict()
         self._part_segmentation_context_vertex_counts = dict()
         self._part_segmentation_context_colors = dict()
@@ -238,8 +270,11 @@ class RasterizerContext:
             node_registry.clear()
         self._per_env_vverts_entity_uids.clear()
         self._fem_surface_vertex_indices.clear()
+        self._fem_surface_triangles.clear()
         self._part_segmentation_vertex_indices.clear()
+        self._part_shaded_corner_indices.clear()
         self.part_segmentation_nodes.clear()
+        self.part_shaded_overlay_nodes.clear()
         self.part_segmentation_context_nodes.clear()
         self._part_segmentation_context_vertex_counts.clear()
         self._part_segmentation_context_colors.clear()
@@ -315,6 +350,9 @@ class RasterizerContext:
 
         self.external_nodes[obj.name] = self.add_node(obj, **kwargs)
 
+    def mark_part_shaded_overlay(self, obj):
+        self.part_shaded_overlay_nodes.add(self.external_nodes[obj.name])
+
     def clear_dynamic_nodes(self, only_outdated: bool = True):
         for t in tuple(self.dynamic_nodes.keys()):
             if not only_outdated or t < self.scene._t:
@@ -324,13 +362,16 @@ class RasterizerContext:
 
     def clear_external_node(self, node):
         if node.name in self.external_nodes:
-            self.remove_node(self.external_nodes[node.name])
+            scene_node = self.external_nodes[node.name]
+            self.part_shaded_overlay_nodes.discard(scene_node)
+            self.remove_node(scene_node)
             del self.external_nodes[node.name]
 
     def clear_external_nodes(self):
         for external_node in self.external_nodes.values():
             self.remove_node(external_node)
         self.external_nodes.clear()
+        self.part_shaded_overlay_nodes.clear()
 
     def set_node_pose(self, node, pose):
         self._scene.set_pose(node, pose)
@@ -987,6 +1028,7 @@ class RasterizerContext:
                         )
                     surf_idx = np.ascontiguousarray(surf_idx)
                     triangles_reindexed = inv.reshape(triangles.shape)
+                    self._fem_surface_triangles[fem_entity.uid] = np.ascontiguousarray(triangles, dtype=np.int64)
                     for idx in self.rendered_envs_idx:
                         entity_vertices = vertices_all[
                             fem_entity.v_start : fem_entity.v_start + fem_entity.n_vertices, idx
@@ -1029,18 +1071,36 @@ class RasterizerContext:
                                 gs.raise_exception(
                                     f"FEM entity {fem_entity.uid} surface labels reference unknown part ids {unknown}."
                                 )
+                            corner_normals = _crease_surface_corner_normals(entity_vertices, triangles)
                             for part_id in sorted(parts):
-                                part_triangles = triangles[labels == part_id]
+                                part_face_indices = np.flatnonzero(labels == part_id)
+                                part_triangles = triangles[part_face_indices]
                                 if part_triangles.shape[0] == 0:
                                     continue
-                                part_vertices, part_inverse = np.unique(part_triangles.flat, return_inverse=True)
-                                part_vertices = np.ascontiguousarray(part_vertices, dtype=np.int64)
-                                part_faces = np.ascontiguousarray(part_inverse.reshape((-1, 3)), dtype=np.int64)
-                                mesh = trimesh.Trimesh(entity_vertices[part_vertices], part_faces, process=False)
+                                part_vertices = np.ascontiguousarray(part_triangles.reshape(-1), dtype=np.int64)
+                                part_faces = np.arange(len(part_vertices), dtype=np.int64).reshape((-1, 3))
+                                part_corner_indices = np.ascontiguousarray(
+                                    (part_face_indices[:, None] * 3 + np.arange(3)[None, :]).reshape(-1),
+                                    dtype=np.int64,
+                                )
+                                mesh = trimesh.Trimesh(
+                                    entity_vertices[part_vertices],
+                                    part_faces,
+                                    vertex_normals=corner_normals.reshape((-1, 3))[part_corner_indices],
+                                    process=False,
+                                )
+                                color = np.asarray(parts[part_id]["part_color_rgb"], dtype=np.float32) / 255.0
+                                material = pyrender.MetallicRoughnessMaterial(
+                                    alphaMode="OPAQUE",
+                                    baseColorFactor=(*color.tolist(), 1.0),
+                                    metallicFactor=PART_SHADED_METALLIC,
+                                    roughnessFactor=PART_SHADED_ROUGHNESS,
+                                )
                                 part_mesh = pyrender.Mesh.from_trimesh(
                                     mesh,
                                     smooth=True,
                                     double_sided=fem_entity.surface.double_sided,
+                                    material=material,
                                 )
                                 primitive = part_mesh.primitives[0]
                                 if primitive.indices is None or primitive.vertex_mapping is not None:
@@ -1055,12 +1115,13 @@ class RasterizerContext:
                                 part_key = (idx, fem_entity.uid, part_id)
                                 self.part_segmentation_nodes[part_key] = part_node
                                 self._part_segmentation_vertex_indices[part_key] = part_vertices
+                                self._part_shaded_corner_indices[part_key] = part_corner_indices
                                 self.segmentation_only_nodes.add(part_node)
                                 self.part_segmentation_indexed_counts[part_key] = {
                                     "vertex_count": int(primitive.positions.shape[0]),
                                     "face_count": int(primitive.indices.shape[0]),
                                     "index_count": int(primitive.indices.size),
-                                    "expanded_vertex_count": 0,
+                                    "expanded_vertex_count": int(primitive.positions.shape[0]),
                                 }
                                 seg_key = ("hag4r_part", fem_entity.uid, part_id)
                                 self.create_node_seg(seg_key, part_node)
@@ -1074,8 +1135,9 @@ class RasterizerContext:
             vertices_all, _, _ = self.sim.fem_solver.get_state_render(self.sim.cur_substep_local)
             vertices_all = vertices_all.to_numpy(dtype=gs.np_float)
 
-            if render_pass == "part_segmentation":
+            if render_pass in {"part_segmentation", "part_shaded"}:
                 uploaded_bytes = 0
+                normal_upload_bytes = 0
                 active_nodes = 0
                 for fem_entity in self.sim.fem_solver.entities:
                     if fem_entity.surface.vis_mode != "visual":
@@ -1088,6 +1150,13 @@ class RasterizerContext:
                         entity_vertices = vertices_all[
                             fem_entity.v_start : fem_entity.v_start + fem_entity.n_vertices, idx
                         ]
+                        corner_normals = (
+                            _crease_surface_corner_normals(
+                                entity_vertices, self._fem_surface_triangles[fem_entity.uid]
+                            ).reshape((-1, 3))
+                            if render_pass == "part_shaded"
+                            else None
+                        )
                         part_ids = sorted(
                             key[2]
                             for key in self.part_segmentation_nodes
@@ -1105,14 +1174,25 @@ class RasterizerContext:
                                 buffer_name="pos",
                             )
                             uploaded_bytes += int(update_data.nbytes)
+                            if corner_normals is not None:
+                                normal_data = corner_normals[self._part_shaded_corner_indices[part_key]]
+                                self.jit.update_buffer(
+                                    self._scene.get_buffer_id(node, "normal"),
+                                    normal_data,
+                                    node=node,
+                                    buffer_name="normal",
+                                )
+                                normal_upload_bytes += int(normal_data.nbytes)
                             active_nodes += 1
                 self.last_part_segmentation_update = {
                     "fem_state_fetch_count": 1,
                     "active_part_node_count": active_nodes,
                     "position_upload_bytes": uploaded_bytes,
-                    "rgb_fem_state_fetch_count": 0,
-                    "rgb_position_upload_bytes": 0,
-                    "rgb_update_node_count": 0,
+                    "normal_upload_bytes": normal_upload_bytes,
+                    "rgb_fem_state_fetch_count": int(render_pass == "part_shaded"),
+                    "rgb_position_upload_bytes": uploaded_bytes if render_pass == "part_shaded" else 0,
+                    "rgb_normal_upload_bytes": normal_upload_bytes,
+                    "rgb_update_node_count": active_nodes if render_pass == "part_shaded" else 0,
                 }
                 self.last_render_update_stats = dict(self.last_part_segmentation_update)
                 return
@@ -1389,6 +1469,9 @@ class RasterizerContext:
         self.clear_external_nodes()
 
     def update(self, force_render: bool = False, render_pass: str = "rgb"):
+        if render_pass == "part_segmentation_current":
+            return
+
         # Early return if already updated previously
         if not force_render and self._t >= self.scene._t and getattr(self, "_last_render_pass", None) == render_pass:
             return
@@ -1400,11 +1483,13 @@ class RasterizerContext:
         self._last_render_pass = render_pass
         self.jit.reset_buffer_upload_stats(render_pass)
 
-        if render_pass == "part_segmentation":
+        if render_pass in {"part_segmentation", "part_shaded"}:
             # The Live diagnostic segmentation pass owns a deliberately tiny visual scene:
             # fixed part/context topology plus current FEM positions. Camera pose is updated
             # by Rasterizer.render_camera; unrelated solver and RGB debug branches stay cold.
             self.update_fem(render_pass=render_pass)
+            if render_pass == "part_shaded":
+                self._scene._bounds = None
             self.last_render_update_stats["scene_update_seconds"] = time.perf_counter() - update_started
             return
 

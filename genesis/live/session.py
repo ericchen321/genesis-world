@@ -33,6 +33,8 @@ from .visual_telemetry import (
     GENESIS_NATIVE_DEBUG_CAMERA_RENDERER,
     VisualTelemetry,
     canonical_fixed_rgb_request,
+    canonical_part_shaded_request,
+    part_shaded_vis_options,
 )
 
 DEFAULT_RENDER_EVERY_STEPS = 10
@@ -473,6 +475,8 @@ class GenesisLiveSession:
             "sim_options": gs.options.SimOptions(**sim_options),
             "fem_options": gs.options.FEMOptions(**fem_options),
         }
+        if any(entity_cfg.get("part_segmentation") is not None for entity_cfg in self._scene_config.get("entities", [])):
+            scene_kwargs["vis_options"] = part_shaded_vis_options()
         if requires_surface_backend:
             scene_kwargs["coupler_options"] = gs.options.IPCCouplerOptions(
                 **self._scene_config.get("coupler_options", {})
@@ -732,6 +736,8 @@ class GenesisLiveSession:
             return self.status()
         if method == "sim.resume":
             return self.resume(params)
+        if method == "visual.capture":
+            return self.capture_visual(params)
         if method == "geometry.context.get":
             entity_name, entity = (
                 self.entity_by_name(str(params["entity"])) if "entity" in params else self.default_entity()
@@ -1134,16 +1140,22 @@ class GenesisLiveSession:
             "normal",
             "normal_triptych",
             "part_segmentation_triptych",
+            "part_shaded_triptych",
             "fixed_rgb_views",
         }:
             raise GenesisLiveError("unsupported_visual_mode", f"unsupported diagnostic visual mode: {mode}")
-        if mode == "part_segmentation_triptych" and any(
+        if mode in {"part_segmentation_triptych", "part_shaded_triptych"} and any(
             getattr(entity, "_part_segmentation_config", None) is None for entity in self.entities.values()
         ):
             raise GenesisLiveError(
                 "invalid_visual_request",
-                "part_segmentation_triptych requires a part_segmentation contract on every diagnostic entity",
+                f"{mode} requires a part_segmentation contract on every diagnostic entity",
             )
+        if mode == "part_shaded_triptych":
+            try:
+                canonical_part_shaded_request(visual)
+            except ValueError as exc:
+                raise GenesisLiveError("invalid_visual_request", str(exc)) from exc
         if mode == "fixed_rgb_views":
             try:
                 canonical_fixed_rgb_request(visual)
@@ -1182,6 +1194,7 @@ class GenesisLiveSession:
             "normal": self.visual_telemetry.capture_normal_triptych,
             "normal_triptych": self.visual_telemetry.capture_normal_triptych,
             "part_segmentation_triptych": self.visual_telemetry.capture_part_segmentation_triptych,
+            "part_shaded_triptych": self.visual_telemetry.capture_part_shaded_triptych,
         }
         if mode == "fixed_rgb_views":
             metadata = self.visual_telemetry.capture_fixed_rgb_views(
@@ -1190,14 +1203,27 @@ class GenesisLiveSession:
                 frame_index=frame_index,
             )
         else:
-            metadata = handlers[mode](self, frame_index=frame_index)
+            metadata = handlers[mode](self, frame_index=frame_index, visual=visual)
         metadata["frame_sequence_index"] = int(frame_sequence_index)
+        metadata["sequence_index"] = int(frame_sequence_index)
         metadata["render_every_steps"] = int(render_every_steps)
         if "frame_index" in metadata:
             self.last_frame_index = int(metadata["frame_index"])
         else:
             self.last_frame_index = int(metadata["stitched"]["frame_index"])
         return metadata
+
+    def capture_visual(self, params: dict[str, Any]) -> dict[str, Any]:
+        visual = params.get("diagnostic_visual")
+        self._validate_visual_request(visual)
+        render_every_steps = self._visual_render_every_steps(visual)
+        metadata = self._capture_visual_request(
+            visual,
+            frame_index=int(self.current_step),
+            frame_sequence_index=0,
+            render_every_steps=int(render_every_steps or DEFAULT_RENDER_EVERY_STEPS),
+        )
+        return {"visual_telemetry": metadata, "status": self.status()}
 
     def visual_overlay_trace(self, params: dict[str, Any]) -> dict[str, Any]:
         from genesis.utils.misc import tensor_to_array
@@ -1299,6 +1325,7 @@ class GenesisLiveSession:
             "normal": "normal triptych",
             "normal_triptych": "normal triptych",
             "part_segmentation_triptych": "part segmentation triptych",
+            "part_shaded_triptych": "part shaded triptych",
             "fixed_rgb_views": "fixed RGB views",
         }[mode]
         if not frames:

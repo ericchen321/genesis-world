@@ -56,6 +56,8 @@ class Rasterizer(RBC):
 
     def update_camera(self, camera):
         self._camera_nodes[camera.uid].camera.yfov = np.deg2rad(camera.fov)
+        self._camera_nodes[camera.uid].camera.znear = camera.near
+        self._camera_nodes[camera.uid].camera.zfar = camera.far
         self._context.set_node_pose(self._camera_nodes[camera.uid], camera.transform)
         self._context.update_camera_frustum(camera)
 
@@ -77,8 +79,12 @@ class Rasterizer(RBC):
         # Force env-separate rendering when the camera has a per-env pose (attached camera in batched scene)
         camera_node = self._camera_nodes[camera.uid]
         env_separate_rigid = self._context.env_separate_rigid or camera_node.matrix.ndim == 3
-        if render_pass == "part_segmentation":
+        if render_pass in {"part_segmentation", "part_segmentation_current"}:
             active_nodes = frozenset(self._context.segmentation_only_nodes)
+        elif render_pass == "part_shaded":
+            active_nodes = frozenset(
+                set(self._context.part_segmentation_nodes.values()) | self._context.part_shaded_overlay_nodes
+            )
         else:
             active_nodes = frozenset(self._context._scene.mesh_nodes - self._context.segmentation_only_nodes)
         excluded_nodes = frozenset(self._context._scene.mesh_nodes - active_nodes)

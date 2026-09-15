@@ -19,6 +19,8 @@ BASE_CAPABILITIES = (
     "visual_overlay_depth_normal_triptych_telemetry",
     "visual_overlay_vertex_trace",
     "part_segmentation_triptych_telemetry",
+    "part_shaded_triptych_telemetry",
+    "diagnostic_visual_capture",
     FIXED_RGB_VIEW_CAPABILITY,
     "frame_metadata",
     "geometry_context",
