@@ -137,6 +137,10 @@ class SAPCouplerOptions(BaseCouplerOptions):
         Absolute tolerance for the original Newton-system residual. Defaults to 1e-12.
     contact_schur_max_refinement_steps : int, optional
         Maximum number of true-residual refinement solves per Newton step. Defaults to 2.
+    contact_schur_compliance_cache_substeps : int, optional
+        Reuse a dense GPU FEM compliance for this many physical substeps. Zero disables caching. Defaults to 0.
+    contact_schur_compliance_cache_max_bytes : int, optional
+        Maximum dense FEM compliance storage before falling back to the current sparse factor. Defaults to 2 GiB.
     n_pcg_iterations : int, optional
         Number of iterations for the Preconditioned Conjugate Gradient solver. Defaults to 100.
     n_linesearch_iterations : int, optional
@@ -224,6 +228,8 @@ class SAPCouplerOptions(BaseCouplerOptions):
     contact_schur_true_residual_rtol: PositiveFloat = 1e-8
     contact_schur_true_residual_atol: NonNegativeFloat = 1e-12
     contact_schur_max_refinement_steps: NonNegativeInt = 2
+    contact_schur_compliance_cache_substeps: NonNegativeInt = 0
+    contact_schur_compliance_cache_max_bytes: PositiveInt = 2 * 1024**3
     n_linesearch_iterations: PositiveInt = 10
     sap_convergence_atol: PositiveFloat = 1e-6
     sap_convergence_rtol: PositiveFloat = 1e-5

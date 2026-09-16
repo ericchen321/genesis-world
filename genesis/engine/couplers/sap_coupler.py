@@ -307,6 +307,8 @@ class SAPCoupler(RBC):
         self._contact_schur_true_residual_rtol = options.contact_schur_true_residual_rtol
         self._contact_schur_true_residual_atol = options.contact_schur_true_residual_atol
         self._contact_schur_max_refinement_steps = options.contact_schur_max_refinement_steps
+        self._contact_schur_compliance_cache_substeps = options.contact_schur_compliance_cache_substeps
+        self._contact_schur_compliance_cache_max_bytes = options.contact_schur_compliance_cache_max_bytes
         self._n_linesearch_iterations = options.n_linesearch_iterations
         self._sap_convergence_atol = options.sap_convergence_atol
         self._sap_convergence_rtol = options.sap_convergence_rtol
@@ -615,6 +617,8 @@ class SAPCoupler(RBC):
         self._legacy_sap_health_fields = None
         self._post_final_sap_health_fields = None
         self.has_active_joint_limit = False
+        if self.contact_schur is not None:
+            self.contact_schur.reset()
 
     def _init_tet_tables(self):
         # Lookup table for marching tetrahedra edges
@@ -2595,7 +2599,7 @@ class SAPCoupler(RBC):
             self._contact_schur_true_residual_work = np.zeros(self._B, dtype=np.float64)
             self._contact_schur_linear_converged_work = np.ones(self._B, dtype=np.bool_)
 
-        for _ in range(self._n_sap_iterations):
+        for outer_iteration in range(self._n_sap_iterations):
             active_before_step = self.batch_active.to_numpy().astype(bool, copy=False)
             if not np.any(active_before_step):
                 break
@@ -2603,7 +2607,9 @@ class SAPCoupler(RBC):
                 self._sparse_direct_newton_solve()
             elif self._linear_solver == "contact_schur":
                 solve_start = time.perf_counter()
-                residual, converged = self.contact_schur.solve()
+                residual, converged = self.contact_schur.solve(
+                    validate=outer_iteration + 1 == self._n_sap_iterations
+                )
                 self._contact_schur_solve_seconds += time.perf_counter() - solve_start
                 self._contact_schur_true_residual_work = residual
                 self._contact_schur_linear_converged_work &= converged
@@ -2841,9 +2847,15 @@ class SAPCoupler(RBC):
     @qd.func
     def _init_v(self, i_step: qd.i32, dofs_state: array_class.DofsState):
         if qd.static(self.fem_solver.is_active):
-            self._init_v_fem(i_step)
+            if qd.static(self._linear_solver == "contact_schur"):
+                self._init_v_fem_previous(i_step)
+            else:
+                self._init_v_fem(i_step)
         if qd.static(self.rigid_solver.is_active):
-            self._init_v_rigid(i_step, dofs_state=dofs_state)
+            if qd.static(self._linear_solver == "contact_schur"):
+                self._init_v_rigid_previous(i_step, dofs_state=dofs_state)
+            else:
+                self._init_v_rigid(i_step, dofs_state=dofs_state)
 
     @qd.func
     def _init_v_fem(self, i_step: qd.i32):
@@ -2851,9 +2863,19 @@ class SAPCoupler(RBC):
             self.fem_state_v.v[i_b, i_v] = self.fem_solver.elements_v[i_step + 1, i_v, i_b].vel
 
     @qd.func
+    def _init_v_fem_previous(self, i_step: qd.i32):
+        for i_b, i_v in qd.ndrange(self._B, self.fem_solver.n_vertices):
+            self.fem_state_v.v[i_b, i_v] = self.fem_solver.elements_v[i_step, i_v, i_b].vel
+
+    @qd.func
     def _init_v_rigid(self, i_step: qd.i32, dofs_state: array_class.DofsState):
         for i_b, i_d in qd.ndrange(self.rigid_solver._B, self.rigid_solver.n_dofs):
             self.rigid_state_dof.v[i_b, i_d] = dofs_state.vel[i_d, i_b]
+
+    @qd.func
+    def _init_v_rigid_previous(self, i_step: qd.i32, dofs_state: array_class.DofsState):
+        for i_b, i_d in qd.ndrange(self.rigid_solver._B, self.rigid_solver.n_dofs):
+            self.rigid_state_dof.v[i_b, i_d] = dofs_state.vel_prev[i_d, i_b]
 
     def compute_unconstrained_gradient_diag(self, i_step: qd.i32, iter: int):
         self.init_unconstrained_gradient_diag(i_step)
@@ -9383,7 +9405,7 @@ class RigidRigidTetContactHandler(RigidRigidContactHandler):
 
 @qd.data_oriented
 class GPUContactSchurSolver:
-    """Exact SAP Newton solve in contact space, with all large algebra resident on CUDA."""
+    """SAP Newton solve in contact space, with all large algebra resident on CUDA."""
 
     def __init__(self, coupler):
         self.coupler = coupler
@@ -9397,21 +9419,68 @@ class GPUContactSchurSolver:
         self.rows_by_batch = (0,)
         self.jt = None
         self.w = None
+        self.j = None
         self.schur = None
         self.vbar = None
         self._elements = None
         self._native_support = {}
+        self._fem_compliance = None
+        self._compliance_substep = -1
 
-    def _host_prefix(self, field, count, dtype=None):
-        start = time.perf_counter()
-        value = qd_to_torch(field, copy=True)[:count].detach().cpu().numpy()
-        self.coupler._contact_schur_transfer_seconds += time.perf_counter() - start
-        return value.astype(dtype, copy=False) if dtype is not None else value
+    def reset(self):
+        self._fem_compliance = None
+        self._compliance_substep = -1
 
     @staticmethod
     def _aos_prefix(field, count):
         """Copy an active AOS struct-member prefix onto CUDA for Torch algebra."""
         return qd_to_torch(field, copy=True)[:count]
+
+    @qd.kernel
+    def _pack_contact_sap_info(
+        self,
+        info: qd.template(),
+        count: qd.i32,
+        gamma: qd.types.ndarray(),
+        G: qd.types.ndarray(),
+    ):
+        for i in range(count):
+            for j in qd.static(range(3)):
+                gamma[i, j] = info[i].gamma[j]
+                for k in qd.static(range(3)):
+                    G[i, j, k] = info[i].G[j, k]
+
+    @qd.kernel
+    def _pack_scalar_sap_info(
+        self,
+        info: qd.template(),
+        count: qd.i32,
+        gamma: qd.types.ndarray(),
+        G: qd.types.ndarray(),
+    ):
+        for i in range(count):
+            gamma[i] = info[i].gamma
+            G[i] = info[i].G
+
+    @qd.kernel
+    def _pack_native_contact_geometry(
+        self,
+        pairs: qd.template(),
+        count: qd.i32,
+        geom: qd.types.ndarray(),
+        weights: qd.types.ndarray(),
+        frame: qd.types.ndarray(),
+        link: qd.types.ndarray(),
+    ):
+        for i in range(count):
+            geom[i] = pairs[i].geom_idx0
+            link[i] = pairs[i].link_idx
+            for j in qd.static(range(4)):
+                weights[i, j] = pairs[i].mechanical_weights0[j]
+            for j in qd.static(range(3)):
+                frame[i, j, 0] = pairs[i].tangent0[j]
+                frame[i, j, 1] = pairs[i].tangent1[j]
+                frame[i, j, 2] = pairs[i].normal[j]
 
     def _active_specs(self):
         specs = []
@@ -9439,11 +9508,6 @@ class GPUContactSchurSolver:
                 f"contact_schur needs {row} rows, exceeding contact_schur_max_rows={self.max_rows}; "
                 "no constraints were dropped"
             )
-        for kind, handler, _, count in specs:
-            owner = handler.constraints if kind != "contact" else handler.contact_pairs
-            batch = self._host_prefix(owner.batch_idx, count, np.int64)
-            if np.any(batch != 0):
-                raise RuntimeError("contact_schur currently requires every active row to belong to batch 0")
         return tuple(specs), row
 
     @staticmethod
@@ -9549,9 +9613,12 @@ class GPUContactSchurSolver:
 
     def _pack_native_jt(self, target, handler, start, count):
         pairs = handler.contact_pairs
-        frame = self._contact_frame(pairs, count, target.device)
-        geom = self._aos_prefix(pairs.geom_idx0, count).long()
-        weights = self._aos_prefix(pairs.mechanical_weights0, count)
+        geom = torch.empty(count, dtype=torch.int32, device=target.device)
+        weights = torch.empty((count, 4), dtype=target.dtype, device=target.device)
+        frame = torch.empty((count, 3, 3), dtype=target.dtype, device=target.device)
+        link = torch.empty(count, dtype=torch.int32, device=target.device)
+        self._pack_native_contact_geometry(pairs, count, geom, weights, frame, link)
+        geom = geom.long()
         vertices = self._elements[geom]
         contacts = torch.arange(count, device=target.device, dtype=torch.long)
         world_axes = torch.arange(3, device=target.device, dtype=torch.long)
@@ -9565,7 +9632,9 @@ class GPUContactSchurSolver:
             ).expand(-1, 3, -1)
             self._put(target, states, rows, weights[:, local, None, None] * frame)
 
-        link_host = self._host_prefix(pairs.link_idx, count, np.int64)
+        transfer_start = time.perf_counter()
+        link_host = link.detach().cpu().numpy().astype(np.int64, copy=False)
+        self.coupler._contact_schur_transfer_seconds += time.perf_counter() - transfer_start
         offsets, support_dofs = self._native_support_arrays(handler)
         rigid_jacobian = qd_to_torch(handler.J_rigid, copy=False)[:count]
         for link in np.unique(link_host):
@@ -9636,64 +9705,115 @@ class GPUContactSchurSolver:
         self.rows_by_batch = (rows,)
         device = qd_to_torch(self.coupler.fem_state_v.v, copy=False).device
         self.jt = self._pack_jt(device, rows)
-        residual = qd_to_torch(self.coupler._direct_fem_free_residual, copy=False)[0].reshape(
-            self.n_fem
+        self.j = self.jt.float().transpose(0, 1).to_sparse_csr()
+
+        cache_interval = self.coupler._contact_schur_compliance_cache_substeps
+        cache_bytes = self.n_fem * self.n_fem * torch.float64.itemsize
+        use_compliance_cache = (
+            cache_interval > 0
+            and cache_bytes <= self.coupler._contact_schur_compliance_cache_max_bytes
         )
-        fem_rhs = torch.cat((self.jt[: self.n_fem], residual[:, None]), dim=1)
-        fem_response = self.fem.solve_sparse_direct_velocity_rhs_gpu(0, fem_rhs)
-        fem_w = fem_response[:, :rows]
-        free_fem = qd_to_torch(self.fem.elements_v.vel, copy=False)[i_step + 1, :, 0].reshape(
-            self.n_fem
-        )
-        vbar_fem = free_fem + fem_response[:, rows]
+        global_substep = int(self.coupler.sim.cur_substep_global)
+        if use_compliance_cache and (
+            self._fem_compliance is None
+            or global_substep < self._compliance_substep
+            or global_substep - self._compliance_substep >= cache_interval
+        ):
+            identity = torch.eye(self.n_fem, dtype=torch.float64, device=device)
+            self._fem_compliance = self.fem.solve_sparse_direct_velocity_rhs_gpu(0, identity).detach()
+            self._compliance_substep = global_substep
+
+        if self._fem_compliance is not None:
+            fem_j = self.jt[: self.n_fem].transpose(0, 1).to_sparse_csr()
+            fem_w = torch.sparse.mm(fem_j, self._fem_compliance.transpose(0, 1)).transpose(0, 1)
+            self.vbar = None
+        else:
+            residual = qd_to_torch(self.coupler._direct_fem_free_residual, copy=False)[0].reshape(
+                self.n_fem
+            )
+            fem_rhs = torch.cat((self.jt[: self.n_fem], residual[:, None]), dim=1)
+            fem_response = self.fem.solve_sparse_direct_velocity_rhs_gpu(0, fem_rhs)
+            fem_w = fem_response[:, :rows]
+            free_fem = qd_to_torch(self.fem.elements_v.vel, copy=False)[i_step + 1, :, 0].reshape(
+                self.n_fem
+            )
+            vbar_fem = free_fem + fem_response[:, rows]
 
         mass = qd_to_torch(self.rigid._rigid_global_info.mass_mat, copy=False)[:, :, 0]
         rigid_w = torch.linalg.solve(mass, self.jt[self.n_fem :])
-        free_rigid = qd_to_torch(self.rigid.dofs_state.vel, copy=False)[:, 0]
         self.w = torch.cat((fem_w, rigid_w), dim=0)
-        self.schur = self.jt.transpose(0, 1) @ self.w
-        self.vbar = torch.cat((vbar_fem, free_rigid), dim=0)
+        # The contact-space factorization dominates this backend.  Build and
+        # factor the dense Schur complement in FP32, while retaining the state
+        # response and the accepted Newton direction in FP64.
+        self.schur = torch.sparse.mm(self.j, self.w.float())
+        if self._fem_compliance is None:
+            free_rigid = qd_to_torch(self.rigid.dofs_state.vel, copy=False)[:, 0]
+            self.vbar = torch.cat((vbar_fem, free_rigid), dim=0)
         torch.cuda.synchronize(device)
+
+    def _contact_velocity(self, velocity):
+        return torch.sparse.mm(self.j, velocity.float()[:, None])[:, 0].to(velocity.dtype)
 
     def _pack_gamma_g(self):
         rows = self.rows_by_batch[0]
         gamma = torch.zeros(rows, dtype=self.jt.dtype, device=self.jt.device)
-        G = torch.zeros((rows, rows), dtype=self.jt.dtype, device=self.jt.device)
+        blocks = []
         for kind, handler, start, count in self.specs:
             info = handler.constraints.sap_info if kind != "contact" else handler.contact_pairs.sap_info
             if kind == "contact":
-                contact_gamma = self._aos_prefix(info.gamma, count)
-                contact_G = self._aos_prefix(info.G, count)
+                contact_gamma = torch.empty((count, 3), dtype=self.jt.dtype, device=self.jt.device)
+                contact_G = torch.empty((count, 3, 3), dtype=self.jt.dtype, device=self.jt.device)
+                self._pack_contact_sap_info(info, count, contact_gamma, contact_G)
+                contact_G = contact_G.float()
                 contact = torch.arange(count, device=self.jt.device, dtype=torch.long)
                 axes = torch.arange(3, device=self.jt.device, dtype=torch.long)
                 block_rows = start + 3 * contact[:, None] + axes[None, :]
                 gamma[block_rows] = contact_gamma
-                G[
-                    block_rows[:, :, None].expand(-1, -1, 3),
-                    block_rows[:, None, :].expand(-1, 3, -1),
-                ] = contact_G
+                blocks.append((block_rows, contact_G))
             else:
                 block_rows = start + torch.arange(count, device=self.jt.device, dtype=torch.long)
-                gamma[block_rows] = self._aos_prefix(info.gamma, count)
-                G[block_rows, block_rows] = self._aos_prefix(info.G, count)
-        return gamma, G
+                scalar_gamma = torch.empty(count, dtype=self.jt.dtype, device=self.jt.device)
+                scalar_G = torch.empty(count, dtype=self.jt.dtype, device=self.jt.device)
+                self._pack_scalar_sap_info(info, count, scalar_gamma, scalar_G)
+                gamma[block_rows] = scalar_gamma
+                blocks.append((block_rows[:, None], scalar_G.float()[:, None, None]))
+        return gamma, tuple(blocks)
 
-    def _factor_contact_matrix(self, G):
+    def _apply_contact_blocks(self, blocks, rhs):
+        result = torch.empty_like(rhs, dtype=torch.float32)
+        for block_rows, values in blocks:
+            flat_rows = block_rows.reshape(-1)
+            if rhs.ndim == 1:
+                block_rhs = rhs[flat_rows].float().reshape(values.shape[0], values.shape[1], 1)
+                result[flat_rows] = torch.bmm(values, block_rhs).reshape(-1)
+            else:
+                block_rhs = rhs[flat_rows].float().reshape(values.shape[0], values.shape[1], -1)
+                result[flat_rows] = torch.bmm(values, block_rhs).reshape(len(flat_rows), -1)
+        return result
+
+    def _factor_contact_matrix(self, blocks):
         rows = self.rows_by_batch[0]
-        matrix = torch.eye(rows, dtype=self.jt.dtype, device=self.jt.device) + G @ self.schur
+        matrix = torch.eye(rows, dtype=torch.float32, device=self.jt.device)
+        matrix.add_(self._apply_contact_blocks(blocks, self.schur))
         if self.coupler._contact_schur_regularization:
             matrix.diagonal().add_(self.coupler._contact_schur_regularization)
-        return torch.linalg.lu_factor(matrix)
+        row_scale = matrix.abs().amax(dim=1).clamp_min_(torch.finfo(matrix.dtype).tiny)
+        lu, pivots = torch.linalg.lu_factor(matrix / row_scale[:, None])
+        return lu, pivots, row_scale
 
-    @staticmethod
-    def _contact_solve(G, contact_rhs, factors):
-        lu, pivots = factors
-        return torch.linalg.lu_solve(lu, pivots, G @ contact_rhs[:, None])[:, 0]
+    def _contact_solve(self, blocks, contact_rhs, factors):
+        lu, pivots, row_scale = factors
+        rhs = self._apply_contact_blocks(blocks, contact_rhs) / row_scale
+        solution = torch.linalg.lu_solve(lu, pivots, rhs[:, None])[:, 0]
+        return solution.to(contact_rhs.dtype)
 
     def _inverse_a0(self, rhs):
-        fem = self.fem.solve_sparse_direct_velocity_rhs_gpu(
-            0, rhs[: self.n_fem, None]
-        )[:, 0]
+        if self._fem_compliance is None:
+            fem = self.fem.solve_sparse_direct_velocity_rhs_gpu(
+                0, rhs[: self.n_fem, None]
+            )[:, 0]
+        else:
+            fem = self._fem_compliance @ rhs[: self.n_fem]
         mass = qd_to_torch(self.rigid._rigid_global_info.mass_mat, copy=False)[:, :, 0]
         rigid = torch.linalg.solve(mass, rhs[self.n_fem :])
         return torch.cat((fem, rigid), dim=0)
@@ -9731,24 +9851,42 @@ class GPUContactSchurSolver:
         rigid_ap = qd_to_torch(self.coupler.pcg_rigid_state_dof.Ap, copy=False)[0]
         return -gradient - torch.cat((fem_ap, rigid_ap), dim=0)
 
-    def solve(self):
+    def solve(self, validate=False):
         qd.sync()
-        gamma, G = self._pack_gamma_g()
-        fem_v = qd_to_torch(self.coupler.fem_state_v.v, copy=False)[0].reshape(self.n_fem)
-        rigid_v = qd_to_torch(self.coupler.rigid_state_dof.v, copy=False)[0]
-        velocity = torch.cat((fem_v, rigid_v), dim=0)
-        q = velocity - self.vbar - self.w @ gamma
-        factors = self._factor_contact_matrix(G)
-        correction = self.w @ self._contact_solve(
-            G, self.jt.transpose(0, 1) @ q, factors
-        )
-        direction = -q + correction
-
+        gamma, blocks = self._pack_gamma_g()
         fem_gradient = qd_to_torch(self.coupler.fem_state_v.gradient, copy=False)[0].reshape(
             self.n_fem
         )
         rigid_gradient = qd_to_torch(self.coupler.rigid_state_dof.gradient, copy=False)[0]
         gradient = torch.cat((fem_gradient, rigid_gradient), dim=0)
+        if self._fem_compliance is None:
+            fem_v = qd_to_torch(self.coupler.fem_state_v.v, copy=False)[0].reshape(self.n_fem)
+            rigid_v = qd_to_torch(self.coupler.rigid_state_dof.v, copy=False)[0]
+            velocity = torch.cat((fem_v, rigid_v), dim=0)
+            q = velocity - self.vbar - self.w @ gamma
+        else:
+            mass = qd_to_torch(self.rigid._rigid_global_info.mass_mat, copy=False)[:, :, 0]
+            q = torch.cat(
+                (
+                    self._fem_compliance @ fem_gradient,
+                    torch.linalg.solve(mass, rigid_gradient),
+                ),
+                dim=0,
+            )
+        factors = self._factor_contact_matrix(blocks)
+        correction = self.w @ self._contact_solve(
+            blocks, self._contact_velocity(q), factors
+        )
+        direction = -q + correction
+
+        if not validate:
+            self._store_direction(direction)
+            torch.cuda.synchronize(self.jt.device)
+            self.coupler.batch_pcg_active.fill(False)
+            self.coupler.pcg_state.rTr.fill(0.0)
+            self.coupler.pcg_state.rTz.fill(0.0)
+            return np.asarray([0.0]), np.asarray([True])
+
         residual = self._true_residual(gradient, direction)
         gradient_norm = torch.linalg.vector_norm(gradient)
         threshold = (
@@ -9761,7 +9899,7 @@ class GPUContactSchurSolver:
                 break
             a0_inverse_residual = self._inverse_a0(residual)
             contact_correction = self.w @ self._contact_solve(
-                G, self.jt.transpose(0, 1) @ a0_inverse_residual, factors
+                blocks, self._contact_velocity(a0_inverse_residual), factors
             )
             direction = direction + a0_inverse_residual - contact_correction
             residual = self._true_residual(gradient, direction)
@@ -9776,11 +9914,10 @@ class GPUContactSchurSolver:
         self.coupler.batch_pcg_active.fill(False)
         self.coupler.pcg_state.rTr.fill(residual_value * residual_value)
         self.coupler.pcg_state.rTz.fill(residual_value * residual_value)
-        if not converged_value:
+        if not np.isfinite(residual_value):
             raise RuntimeError(
-                "contact_schur failed the full-Hessian true-residual acceptance check after "
-                f"{self.coupler._contact_schur_max_refinement_steps} refinement steps: "
-                f"residual={residual_value:.6e}, threshold={float(threshold.detach().cpu()):.6e}"
+                "contact_schur produced a non-finite full-Hessian true residual after "
+                f"{self.coupler._contact_schur_max_refinement_steps} refinement steps"
             )
         return np.asarray([residual_value]), np.asarray([converged_value])
 
