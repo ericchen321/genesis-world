@@ -136,6 +136,12 @@ class ImplicitFEMSubstepHealth:
     rigid_mode_coarse_matrix_finite_by_batch: tuple[bool, ...] | None = None
     rigid_mode_coarse_inverse_finite_by_batch: tuple[bool, ...] | None = None
     true_residual_probe: ImplicitFEMTrueResidualProbe | None = None
+    linear_solver: str = "pcg"
+    sparse_direct_true_residual_norm_by_batch: tuple[float, ...] = ()
+    sparse_direct_assembly_time_s: float = 0.0
+    sparse_direct_factor_time_s: float = 0.0
+    sparse_direct_solve_time_s: float = 0.0
+    sparse_direct_transfer_time_s: float = 0.0
 
     def __post_init__(self) -> None:
         batch_size = len(self.batch_active_by_batch)
@@ -177,6 +183,13 @@ class ImplicitFEMSubstepHealth:
             self.true_residual_probe, ImplicitFEMTrueResidualProbe
         ):
             raise TypeError("true_residual_probe must be ImplicitFEMTrueResidualProbe or None")
+        if self.linear_solver not in ("pcg", "sparse_direct"):
+            raise ValueError("linear_solver must be 'pcg' or 'sparse_direct'")
+        if self.linear_solver == "sparse_direct":
+            if len(self.sparse_direct_true_residual_norm_by_batch) != batch_size:
+                raise ValueError("sparse-direct FEM residuals must have one value per batch")
+        elif self.sparse_direct_true_residual_norm_by_batch:
+            raise ValueError("PCG FEM health cannot carry sparse-direct residuals")
         for name in (
             "batch_active_by_batch",
             "pcg_active_by_batch",
@@ -203,6 +216,15 @@ class ImplicitFEMSubstepHealth:
         _finite_nonnegative(self.pcg_threshold, "pcg_threshold")
         _finite_nonnegative(self.pcg_absolute_residual_squared_floor, "pcg_absolute_residual_squared_floor")
         _finite_nonnegative(self.pcg_rtol, "pcg_rtol")
+        for value in self.sparse_direct_true_residual_norm_by_batch:
+            _finite_nonnegative(value, "sparse_direct_true_residual_norm_by_batch value")
+        for name in (
+            "sparse_direct_assembly_time_s",
+            "sparse_direct_factor_time_s",
+            "sparse_direct_solve_time_s",
+            "sparse_direct_transfer_time_s",
+        ):
+            _finite_nonnegative(getattr(self, name), name)
         if self.pcg_threshold != self.pcg_absolute_residual_squared_floor:
             raise ValueError("pcg_threshold must equal the explicit squared absolute residual floor")
 
@@ -217,6 +239,11 @@ class ImplicitFEMSubstepHealth:
                 *self.pcg_relative_residual_norm_by_batch,
                 *self.pcg_effective_residual_squared_threshold_by_batch,
                 *self.max_newton_update_m_by_batch,
+                *self.sparse_direct_true_residual_norm_by_batch,
+                self.sparse_direct_assembly_time_s,
+                self.sparse_direct_factor_time_s,
+                self.sparse_direct_solve_time_s,
+                self.sparse_direct_transfer_time_s,
             )
         )
 
@@ -485,6 +512,35 @@ class SAPSubstepSolverHealth:
     rigid_fem_contact_tet_schwarz_max_link_rank_by_batch: tuple[int, ...] = ()
     rigid_fem_contact_tet_schwarz_min_factor_pivot_by_batch: tuple[float, ...] = ()
     rigid_fem_contact_tet_schwarz_all_factors_valid_by_batch: tuple[bool, ...] = ()
+    linear_solver: str = "pcg"
+    sparse_direct_sap_iterations_by_batch: tuple[int, ...] = ()
+    sparse_direct_final_original_momentum_norm_by_batch: tuple[float, ...] = ()
+    sparse_direct_converged_by_batch: tuple[bool, ...] = ()
+    sparse_direct_assembly_time_s: float = 0.0
+    sparse_direct_factor_time_s: float = 0.0
+    sparse_direct_solve_time_s: float = 0.0
+    sparse_direct_transfer_time_s: float = 0.0
+    enriched_pcg_sap_iterations_by_batch: tuple[int, ...] = ()
+    enriched_pcg_final_original_momentum_norm_by_batch: tuple[float, ...] = ()
+    enriched_pcg_sap_converged_by_batch: tuple[bool, ...] = ()
+    enriched_pcg_geometry_columns_by_batch: tuple[int, ...] = ()
+    enriched_pcg_response_columns_by_batch: tuple[int, ...] = ()
+    enriched_pcg_retained_columns_by_batch: tuple[int, ...] = ()
+    enriched_pcg_iterations_by_batch: tuple[int, ...] = ()
+    enriched_pcg_true_residual_norm_by_batch: tuple[float, ...] = ()
+    enriched_pcg_linear_converged_by_batch: tuple[bool, ...] = ()
+    enriched_pcg_setup_time_s: float = 0.0
+    enriched_pcg_solve_time_s: float = 0.0
+    enriched_pcg_transfer_time_s: float = 0.0
+    contact_schur_sap_iterations_by_batch: tuple[int, ...] = ()
+    contact_schur_final_original_momentum_norm_by_batch: tuple[float, ...] = ()
+    contact_schur_sap_converged_by_batch: tuple[bool, ...] = ()
+    contact_schur_rows_by_batch: tuple[int, ...] = ()
+    contact_schur_true_residual_norm_by_batch: tuple[float, ...] = ()
+    contact_schur_linear_converged_by_batch: tuple[bool, ...] = ()
+    contact_schur_setup_time_s: float = 0.0
+    contact_schur_solve_time_s: float = 0.0
+    contact_schur_transfer_time_s: float = 0.0
 
     def __post_init__(self) -> None:
         _nonnegative_int(self.global_substep_index, "global_substep_index")
@@ -516,6 +572,57 @@ class SAPSubstepSolverHealth:
         )
         if any(len(getattr(self, name)) != batch_size for name in fields):
             raise ValueError("all per-batch solver fields must have identical length")
+        if self.linear_solver not in ("pcg", "sparse_direct", "enriched_pcg", "contact_schur"):
+            raise ValueError("linear_solver must be 'pcg', 'sparse_direct', 'enriched_pcg', or 'contact_schur'")
+        direct_fields = (
+            "sparse_direct_sap_iterations_by_batch",
+            "sparse_direct_final_original_momentum_norm_by_batch",
+            "sparse_direct_converged_by_batch",
+        )
+        if self.linear_solver == "sparse_direct":
+            if self.contact_solve_executed and any(
+                len(getattr(self, name)) != batch_size for name in direct_fields
+            ):
+                raise ValueError("sparse-direct SAP health must cover every solved batch")
+            if not self.contact_solve_executed and any(getattr(self, name) for name in direct_fields):
+                raise ValueError("unexecuted sparse-direct SAP health must be empty")
+        elif any(getattr(self, name) for name in direct_fields):
+            raise ValueError("non-sparse-direct SAP health cannot carry sparse-direct fields")
+        enriched_fields = (
+            "enriched_pcg_sap_iterations_by_batch",
+            "enriched_pcg_final_original_momentum_norm_by_batch",
+            "enriched_pcg_sap_converged_by_batch",
+            "enriched_pcg_geometry_columns_by_batch",
+            "enriched_pcg_response_columns_by_batch",
+            "enriched_pcg_retained_columns_by_batch",
+            "enriched_pcg_iterations_by_batch",
+            "enriched_pcg_true_residual_norm_by_batch",
+            "enriched_pcg_linear_converged_by_batch",
+        )
+        if self.linear_solver == "enriched_pcg":
+            if self.contact_solve_executed and any(
+                len(getattr(self, name)) != batch_size for name in enriched_fields
+            ):
+                raise ValueError("enriched-PCG SAP health must cover every solved batch")
+            if not self.contact_solve_executed and any(getattr(self, name) for name in enriched_fields):
+                raise ValueError("unexecuted enriched-PCG SAP health must be empty")
+        elif any(getattr(self, name) for name in enriched_fields):
+            raise ValueError("non-enriched-PCG SAP health cannot carry enriched-PCG fields")
+        schur_fields = (
+            "contact_schur_sap_iterations_by_batch",
+            "contact_schur_final_original_momentum_norm_by_batch",
+            "contact_schur_sap_converged_by_batch",
+            "contact_schur_rows_by_batch",
+            "contact_schur_true_residual_norm_by_batch",
+            "contact_schur_linear_converged_by_batch",
+        )
+        if self.linear_solver == "contact_schur":
+            if self.contact_solve_executed and any(len(getattr(self, name)) != batch_size for name in schur_fields):
+                raise ValueError("contact-Schur SAP health must cover every solved batch")
+            if not self.contact_solve_executed and any(getattr(self, name) for name in schur_fields):
+                raise ValueError("unexecuted contact-Schur SAP health must be empty")
+        elif any(getattr(self, name) for name in schur_fields):
+            raise ValueError("non-contact-Schur SAP health cannot carry contact-Schur fields")
         if any(
             type(value) is not bool
             for name in (
@@ -538,6 +645,58 @@ class SAPSubstepSolverHealth:
             for value in getattr(self, name):
                 _float_value(value, name)
         for name in ("sap_convergence_atol", "sap_convergence_rtol", "pcg_threshold"):
+            _finite_nonnegative(getattr(self, name), name)
+        for value in self.sparse_direct_sap_iterations_by_batch:
+            _nonnegative_int(value, "sparse_direct_sap_iterations_by_batch value")
+        for value in self.sparse_direct_final_original_momentum_norm_by_batch:
+            _finite_nonnegative(value, "sparse_direct_final_original_momentum_norm_by_batch value")
+        if any(type(value) is not bool for value in self.sparse_direct_converged_by_batch):
+            raise TypeError("sparse_direct_converged_by_batch must contain bool values")
+        for name in (
+            "sparse_direct_assembly_time_s",
+            "sparse_direct_factor_time_s",
+            "sparse_direct_solve_time_s",
+            "sparse_direct_transfer_time_s",
+        ):
+            _finite_nonnegative(getattr(self, name), name)
+        for name in (
+            "enriched_pcg_sap_iterations_by_batch",
+            "enriched_pcg_geometry_columns_by_batch",
+            "enriched_pcg_response_columns_by_batch",
+            "enriched_pcg_retained_columns_by_batch",
+            "enriched_pcg_iterations_by_batch",
+        ):
+            for value in getattr(self, name):
+                _nonnegative_int(value, f"{name} value")
+        for name in (
+            "enriched_pcg_final_original_momentum_norm_by_batch",
+            "enriched_pcg_true_residual_norm_by_batch",
+        ):
+            for value in getattr(self, name):
+                _finite_nonnegative(value, f"{name} value")
+        if any(type(value) is not bool for value in self.enriched_pcg_sap_converged_by_batch):
+            raise TypeError("enriched_pcg_sap_converged_by_batch must contain bool values")
+        if any(type(value) is not bool for value in self.enriched_pcg_linear_converged_by_batch):
+            raise TypeError("enriched_pcg_linear_converged_by_batch must contain bool values")
+        for name in (
+            "enriched_pcg_setup_time_s",
+            "enriched_pcg_solve_time_s",
+            "enriched_pcg_transfer_time_s",
+        ):
+            _finite_nonnegative(getattr(self, name), name)
+        for name in ("contact_schur_sap_iterations_by_batch", "contact_schur_rows_by_batch"):
+            for value in getattr(self, name):
+                _nonnegative_int(value, f"{name} value")
+        for name in (
+            "contact_schur_final_original_momentum_norm_by_batch",
+            "contact_schur_true_residual_norm_by_batch",
+        ):
+            for value in getattr(self, name):
+                _finite_nonnegative(value, f"{name} value")
+        for name in ("contact_schur_sap_converged_by_batch", "contact_schur_linear_converged_by_batch"):
+            if any(type(value) is not bool for value in getattr(self, name)):
+                raise TypeError(f"{name} must contain bool values")
+        for name in ("contact_schur_setup_time_s", "contact_schur_solve_time_s", "contact_schur_transfer_time_s"):
             _finite_nonnegative(getattr(self, name), name)
         if self.implicit_fem is not None and not isinstance(self.implicit_fem, ImplicitFEMSubstepHealth):
             raise TypeError("implicit_fem must be ImplicitFEMSubstepHealth or None")
@@ -677,6 +836,14 @@ class SAPSubstepSolverHealth:
         """Whether every real SAP iterative mask was inactive after its budget."""
         if not self.contact_solve_executed:
             return True
+        if self.linear_solver == "sparse_direct":
+            return all(self.sparse_direct_converged_by_batch)
+        if self.linear_solver == "enriched_pcg":
+            return all(self.enriched_pcg_sap_converged_by_batch) and all(
+                self.enriched_pcg_linear_converged_by_batch
+            )
+        if self.linear_solver == "contact_schur":
+            return all(self.contact_schur_sap_converged_by_batch) and all(self.contact_schur_linear_converged_by_batch)
         return not any(
             self.sap_active_by_batch
             + self.pcg_active_by_batch
@@ -694,6 +861,21 @@ class SAPSubstepSolverHealth:
             *self.impulse_norm_by_batch,
             *self.pcg_residual_squared_by_batch,
             *self.pcg_preconditioned_residual_by_batch,
+            *self.sparse_direct_final_original_momentum_norm_by_batch,
+            self.sparse_direct_assembly_time_s,
+            self.sparse_direct_factor_time_s,
+            self.sparse_direct_solve_time_s,
+            self.sparse_direct_transfer_time_s,
+            *self.enriched_pcg_final_original_momentum_norm_by_batch,
+            *self.enriched_pcg_true_residual_norm_by_batch,
+            self.enriched_pcg_setup_time_s,
+            self.enriched_pcg_solve_time_s,
+            self.enriched_pcg_transfer_time_s,
+            *self.contact_schur_final_original_momentum_norm_by_batch,
+            *self.contact_schur_true_residual_norm_by_batch,
+            self.contact_schur_setup_time_s,
+            self.contact_schur_solve_time_s,
+            self.contact_schur_transfer_time_s,
         )
         if self.max_rigid_fem_penetration_m is not None:
             values = (*values, self.max_rigid_fem_penetration_m)

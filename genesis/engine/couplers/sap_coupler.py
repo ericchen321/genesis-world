@@ -1,10 +1,13 @@
 from dataclasses import replace
 from typing import TYPE_CHECKING
 import math
+import time
 
 import igl
 import numpy as np
 import quadrants as qd
+import scipy.sparse as sp
+import scipy.sparse.linalg as spla
 import torch
 
 import genesis as gs
@@ -285,8 +288,27 @@ class SAPCoupler(RBC):
         self.options = options
         self.rigid_solver = self.sim.rigid_solver
         self.fem_solver = self.sim.fem_solver
+        self._linear_solver = getattr(options, "linear_solver", "pcg")
+        self._use_original_momentum_objective = self._linear_solver in (
+            "sparse_direct",
+            "enriched_pcg",
+            "contact_schur",
+        )
         self._n_sap_iterations = options.n_sap_iterations
         self._n_pcg_iterations = options.n_pcg_iterations
+        self._enriched_pcg_rtol = options.enriched_pcg_rtol
+        self._enriched_pcg_max_iterations = options.enriched_pcg_max_iterations
+        self._enriched_max_partitions_per_component = options.enriched_max_partitions_per_component
+        self._enriched_target_tets_per_partition = options.enriched_target_tets_per_partition
+        self._enriched_pou_smoothing_steps = options.enriched_pou_smoothing_steps
+        self._enriched_qr_rtol = options.enriched_qr_rtol
+        self._contact_schur_max_rows = options.contact_schur_max_rows
+        self._contact_schur_regularization = options.contact_schur_regularization
+        self._contact_schur_true_residual_rtol = options.contact_schur_true_residual_rtol
+        self._contact_schur_true_residual_atol = options.contact_schur_true_residual_atol
+        self._contact_schur_max_refinement_steps = options.contact_schur_max_refinement_steps
+        self._contact_schur_compliance_cache_substeps = options.contact_schur_compliance_cache_substeps
+        self._contact_schur_compliance_cache_max_bytes = options.contact_schur_compliance_cache_max_bytes
         self._n_linesearch_iterations = options.n_linesearch_iterations
         self._sap_convergence_atol = options.sap_convergence_atol
         self._sap_convergence_rtol = options.sap_convergence_rtol
@@ -312,6 +334,49 @@ class SAPCoupler(RBC):
         self._last_completed_solver_health: SAPSubstepSolverHealth | None = None
         self._legacy_sap_health_fields = None
         self._post_final_sap_health_fields = None
+        self._direct_sap_iterations = 0
+        self._direct_final_original_momentum_norm = 0.0
+        self._direct_converged = False
+        self._direct_sap_iterations_by_batch = ()
+        self._direct_final_original_momentum_norm_by_batch = ()
+        self._direct_converged_by_batch = ()
+        self._direct_assembly_seconds = 0.0
+        self._direct_factor_seconds = 0.0
+        self._direct_solve_seconds = 0.0
+        self._direct_transfer_seconds = 0.0
+        self._direct_assembly_seconds_total = 0.0
+        self._direct_factor_seconds_total = 0.0
+        self._direct_solve_seconds_total = 0.0
+        self._direct_transfer_seconds_total = 0.0
+        self._enriched_sap_iterations_by_batch = ()
+        self._enriched_final_original_momentum_norm_by_batch = ()
+        self._enriched_sap_converged_by_batch = ()
+        self._enriched_geometry_columns_by_batch = ()
+        self._enriched_response_columns_by_batch = ()
+        self._enriched_retained_columns_by_batch = ()
+        self._enriched_iterations_by_batch = ()
+        self._enriched_true_residual_norm_by_batch = ()
+        self._enriched_linear_converged_by_batch = ()
+        self._enriched_setup_seconds = 0.0
+        self._enriched_solve_seconds = 0.0
+        self._enriched_transfer_seconds = 0.0
+        self._enriched_setup_seconds_total = 0.0
+        self._enriched_solve_seconds_total = 0.0
+        self._enriched_transfer_seconds_total = 0.0
+        self._enriched_substep_cache = ()
+        self._enriched_static_cache = None
+        self._contact_schur_sap_iterations_by_batch = ()
+        self._contact_schur_final_original_momentum_norm_by_batch = ()
+        self._contact_schur_sap_converged_by_batch = ()
+        self._contact_schur_rows_by_batch = ()
+        self._contact_schur_true_residual_norm_by_batch = ()
+        self._contact_schur_linear_converged_by_batch = ()
+        self._contact_schur_setup_seconds = 0.0
+        self._contact_schur_solve_seconds = 0.0
+        self._contact_schur_transfer_seconds = 0.0
+        self._contact_schur_setup_seconds_total = 0.0
+        self._contact_schur_solve_seconds_total = 0.0
+        self._contact_schur_transfer_seconds_total = 0.0
         self._last_contact_overflow = False
         self._enable_sap_joint_limits = False
         self.has_active_joint_limit = False
@@ -380,6 +445,14 @@ class SAPCoupler(RBC):
     def build(self) -> None:
         self._B = self.sim._B
         self.contact_handlers = []
+        if self._linear_solver in ("enriched_pcg", "contact_schur") and (
+            not self.fem_solver.is_active or self.fem_solver._linear_solver != "sparse_direct"
+        ):
+            gs.raise_exception(
+                f"SAP {self._linear_solver} requires an active FEM solver with linear_solver='sparse_direct'."
+            )
+        if self._linear_solver == "contact_schur" and self._B != 1:
+            gs.raise_exception("SAP contact_schur currently requires a single simulation environment.")
         self._enable_rigid_fem_contact &= self.rigid_solver.is_active and self.fem_solver.is_active
         if self._enable_rigid_fem_contact_patch_preconditioner and not self._enable_rigid_fem_contact:
             gs.raise_exception(
@@ -526,6 +599,12 @@ class SAPCoupler(RBC):
         if self._enable_rigid_fem_contact_tet_schwarz_preconditioner:
             self._init_rigid_fem_contact_tet_schwarz_preconditioner_fields()
         self._init_linesearch_fields()
+        self.enriched_pcg = None
+        if self._linear_solver == "enriched_pcg":
+            self.enriched_pcg = EnrichedPCGPreconditioner(self)
+        self.contact_schur = None
+        if self._linear_solver == "contact_schur":
+            self.contact_schur = GPUContactSchurSolver(self)
 
     def reset(self, envs_idx=None):
         if self.rigid_fem_snap is not None:
@@ -538,6 +617,8 @@ class SAPCoupler(RBC):
         self._legacy_sap_health_fields = None
         self._post_final_sap_health_fields = None
         self.has_active_joint_limit = False
+        if self.contact_schur is not None:
+            self.contact_schur.reset()
 
     def _init_tet_tables(self):
         # Lookup table for marching tetrahedra edges
@@ -742,6 +823,11 @@ class SAPCoupler(RBC):
         self.fem_state_v = fem_state_v.field(
             shape=(self.sim._B, self.fem_solver.n_vertices), needs_grad=False, layout=qd.Layout.SOA
         )
+        self._direct_fem_free_residual = qd.field(
+            dtype=gs.qd_vec3,
+            shape=(self.sim._B, self.fem_solver.n_vertices),
+            needs_grad=False,
+        )
 
         pcg_fem_state_v = qd.types.struct(
             diag3x3=gs.qd_mat3,  # diagonal 3-by-3 block of the hessian
@@ -801,6 +887,9 @@ class SAPCoupler(RBC):
 
     def _init_pcg_fields(self):
         self.batch_pcg_active = qd.field(dtype=gs.qd_bool, shape=(self.sim._B,), needs_grad=False)
+        self._enriched_pcg_initial_rTr = qd.field(
+            dtype=gs.qd_float, shape=(self.sim._B,), needs_grad=False
+        )
 
         pcg_state = qd.types.struct(
             rTr=gs.qd_float,
@@ -1644,7 +1733,10 @@ class SAPCoupler(RBC):
                 f"implicit FEM final Newton update shape {update.shape} does not match {expected}"
             )
         max_update = tuple(np.linalg.norm(update, axis=2).max(axis=1).astype(np.float64).tolist())
-        rigid_mode_deflation_enabled = bool(fem_solver._enable_rigid_mode_deflation)
+        fem_linear_solver = fem_solver._linear_solver
+        rigid_mode_deflation_enabled = bool(
+            fem_solver._enable_rigid_mode_deflation and fem_linear_solver == "pcg"
+        )
         coarse_matrix_finite = None
         coarse_inverse_finite = None
         if rigid_mode_deflation_enabled:
@@ -1678,6 +1770,24 @@ class SAPCoupler(RBC):
             rigid_mode_coarse_matrix_finite_by_batch=coarse_matrix_finite,
             rigid_mode_coarse_inverse_finite_by_batch=coarse_inverse_finite,
             true_residual_probe=fem_solver.get_true_residual_probe(),
+            linear_solver=fem_linear_solver,
+            sparse_direct_true_residual_norm_by_batch=(
+                tuple(float(value) for value in fem_solver._direct_free_residual_norm)
+                if fem_linear_solver == "sparse_direct"
+                else ()
+            ),
+            sparse_direct_assembly_time_s=(
+                float(fem_solver._direct_assembly_time_s) if fem_linear_solver == "sparse_direct" else 0.0
+            ),
+            sparse_direct_factor_time_s=(
+                float(fem_solver._direct_factor_time_s) if fem_linear_solver == "sparse_direct" else 0.0
+            ),
+            sparse_direct_solve_time_s=(
+                float(fem_solver._direct_solve_time_s) if fem_linear_solver == "sparse_direct" else 0.0
+            ),
+            sparse_direct_transfer_time_s=(
+                float(fem_solver._direct_transfer_time_s) if fem_linear_solver == "sparse_direct" else 0.0
+            ),
         )
 
     def _development_positive_j_feasible_step_health(self):
@@ -1781,7 +1891,11 @@ class SAPCoupler(RBC):
             physical_dt_s=float(self.sim._substep_dt),
             contact_solve_executed=contact_solve_executed,
             sap_iteration_budget=int(self._n_sap_iterations),
-            pcg_iteration_budget=int(self._n_pcg_iterations),
+            pcg_iteration_budget=int(
+                self._enriched_pcg_max_iterations
+                if self._linear_solver == "enriched_pcg"
+                else self._n_pcg_iterations
+            ),
             linesearch_iteration_budget=int(self._n_linesearch_iterations),
             sap_active_by_batch=sap_active,
             pcg_active_by_batch=pcg_active,
@@ -1827,6 +1941,147 @@ class SAPCoupler(RBC):
             rigid_fem_contact_tet_schwarz_max_link_rank_by_batch=schwarz_max_link_rank,
             rigid_fem_contact_tet_schwarz_min_factor_pivot_by_batch=schwarz_min_factor_pivot,
             rigid_fem_contact_tet_schwarz_all_factors_valid_by_batch=schwarz_all_factors_valid,
+            linear_solver=self._linear_solver,
+            sparse_direct_sap_iterations_by_batch=(
+                self._direct_sap_iterations_by_batch
+                if self._linear_solver == "sparse_direct" and contact_solve_executed
+                else ()
+            ),
+            sparse_direct_final_original_momentum_norm_by_batch=(
+                self._direct_final_original_momentum_norm_by_batch
+                if self._linear_solver == "sparse_direct" and contact_solve_executed
+                else ()
+            ),
+            sparse_direct_converged_by_batch=(
+                self._direct_converged_by_batch
+                if self._linear_solver == "sparse_direct" and contact_solve_executed
+                else ()
+            ),
+            sparse_direct_assembly_time_s=(
+                float(self._direct_assembly_seconds)
+                if self._linear_solver == "sparse_direct" and contact_solve_executed
+                else 0.0
+            ),
+            sparse_direct_factor_time_s=(
+                float(self._direct_factor_seconds)
+                if self._linear_solver == "sparse_direct" and contact_solve_executed
+                else 0.0
+            ),
+            sparse_direct_solve_time_s=(
+                float(self._direct_solve_seconds)
+                if self._linear_solver == "sparse_direct" and contact_solve_executed
+                else 0.0
+            ),
+            sparse_direct_transfer_time_s=(
+                float(self._direct_transfer_seconds)
+                if self._linear_solver == "sparse_direct" and contact_solve_executed
+                else 0.0
+            ),
+            enriched_pcg_sap_iterations_by_batch=(
+                self._enriched_sap_iterations_by_batch
+                if self._linear_solver == "enriched_pcg" and contact_solve_executed
+                else ()
+            ),
+            enriched_pcg_final_original_momentum_norm_by_batch=(
+                self._enriched_final_original_momentum_norm_by_batch
+                if self._linear_solver == "enriched_pcg" and contact_solve_executed
+                else ()
+            ),
+            enriched_pcg_sap_converged_by_batch=(
+                self._enriched_sap_converged_by_batch
+                if self._linear_solver == "enriched_pcg" and contact_solve_executed
+                else ()
+            ),
+            enriched_pcg_geometry_columns_by_batch=(
+                self._enriched_geometry_columns_by_batch
+                if self._linear_solver == "enriched_pcg" and contact_solve_executed
+                else ()
+            ),
+            enriched_pcg_response_columns_by_batch=(
+                self._enriched_response_columns_by_batch
+                if self._linear_solver == "enriched_pcg" and contact_solve_executed
+                else ()
+            ),
+            enriched_pcg_retained_columns_by_batch=(
+                self._enriched_retained_columns_by_batch
+                if self._linear_solver == "enriched_pcg" and contact_solve_executed
+                else ()
+            ),
+            enriched_pcg_iterations_by_batch=(
+                self._enriched_iterations_by_batch
+                if self._linear_solver == "enriched_pcg" and contact_solve_executed
+                else ()
+            ),
+            enriched_pcg_true_residual_norm_by_batch=(
+                self._enriched_true_residual_norm_by_batch
+                if self._linear_solver == "enriched_pcg" and contact_solve_executed
+                else ()
+            ),
+            enriched_pcg_linear_converged_by_batch=(
+                self._enriched_linear_converged_by_batch
+                if self._linear_solver == "enriched_pcg" and contact_solve_executed
+                else ()
+            ),
+            enriched_pcg_setup_time_s=(
+                float(self._enriched_setup_seconds)
+                if self._linear_solver == "enriched_pcg" and contact_solve_executed
+                else 0.0
+            ),
+            enriched_pcg_solve_time_s=(
+                float(self._enriched_solve_seconds)
+                if self._linear_solver == "enriched_pcg" and contact_solve_executed
+                else 0.0
+            ),
+            enriched_pcg_transfer_time_s=(
+                float(self._enriched_transfer_seconds)
+                if self._linear_solver == "enriched_pcg" and contact_solve_executed
+                else 0.0
+            ),
+            contact_schur_sap_iterations_by_batch=(
+                self._contact_schur_sap_iterations_by_batch
+                if self._linear_solver == "contact_schur" and contact_solve_executed
+                else ()
+            ),
+            contact_schur_final_original_momentum_norm_by_batch=(
+                self._contact_schur_final_original_momentum_norm_by_batch
+                if self._linear_solver == "contact_schur" and contact_solve_executed
+                else ()
+            ),
+            contact_schur_sap_converged_by_batch=(
+                self._contact_schur_sap_converged_by_batch
+                if self._linear_solver == "contact_schur" and contact_solve_executed
+                else ()
+            ),
+            contact_schur_rows_by_batch=(
+                self._contact_schur_rows_by_batch
+                if self._linear_solver == "contact_schur" and contact_solve_executed
+                else ()
+            ),
+            contact_schur_true_residual_norm_by_batch=(
+                self._contact_schur_true_residual_norm_by_batch
+                if self._linear_solver == "contact_schur" and contact_solve_executed
+                else ()
+            ),
+            contact_schur_linear_converged_by_batch=(
+                self._contact_schur_linear_converged_by_batch
+                if self._linear_solver == "contact_schur" and contact_solve_executed
+                else ()
+            ),
+            contact_schur_setup_time_s=(
+                float(self._contact_schur_setup_seconds)
+                if self._linear_solver == "contact_schur" and contact_solve_executed
+                else 0.0
+            ),
+            contact_schur_solve_time_s=(
+                float(self._contact_schur_solve_seconds)
+                if self._linear_solver == "contact_schur" and contact_solve_executed
+                else 0.0
+            ),
+            contact_schur_transfer_time_s=(
+                float(self._contact_schur_transfer_seconds)
+                if self._linear_solver == "contact_schur" and contact_solve_executed
+                else 0.0
+            ),
         )
 
     def finalize_completed_solver_health(self, *, fem_safety_extrema: FEMSubstepSafetyExtrema | None) -> None:
@@ -2276,6 +2531,9 @@ class SAPCoupler(RBC):
     def sap_solve(self, i_step):
         self._legacy_sap_health_fields = None
         self._post_final_sap_health_fields = None
+        if self._use_original_momentum_objective:
+            self._sparse_direct_sap_solve(i_step)
+            return
         if self._enable_rigid_fem_contact_patch_preconditioner:
             self._reset_rigid_fem_contact_patch_health()
         if self._enable_rigid_fem_contact_tet_schwarz_preconditioner:
@@ -2309,6 +2567,148 @@ class SAPCoupler(RBC):
             self._legacy_sap_health_fields = self._snapshot_sap_health_fields()
             self._recompute_qualification_post_final_sap_health(i_step, positive_marker=1)
             self._post_final_sap_health_fields = self._snapshot_sap_health_fields()
+
+    def _sparse_direct_sap_solve(self, i_step):
+        self._direct_sap_iterations = 0
+        self._direct_final_original_momentum_norm = 0.0
+        self._direct_converged = False
+        self._direct_assembly_seconds = 0.0
+        self._direct_factor_seconds = 0.0
+        self._direct_solve_seconds = 0.0
+        self._direct_transfer_seconds = 0.0
+        self._enriched_setup_seconds = 0.0
+        self._enriched_solve_seconds = 0.0
+        self._enriched_transfer_seconds = 0.0
+        self._contact_schur_setup_seconds = 0.0
+        self._contact_schur_solve_seconds = 0.0
+        self._contact_schur_transfer_seconds = 0.0
+        iterations_by_batch = np.zeros(self._B, dtype=np.int64)
+        self._prepare_sparse_direct_fem_momentum()
+        self._init_sap_solve(i_step, dofs_state=self.rigid_solver.dofs_state)
+
+        self.compute_unconstrained_gradient_diag(i_step, 0)
+        self.compute_constraint_contact_gradient_hessian_diag_prec()
+        self.check_sap_convergence(rigid_global_info=self.rigid_solver._rigid_global_info)
+        if self._linear_solver == "enriched_pcg":
+            self._prepare_enriched_substep_system(i_step)
+        elif self._linear_solver == "contact_schur":
+            setup_start = time.perf_counter()
+            self.contact_schur.refresh(i_step)
+            self._contact_schur_setup_seconds += time.perf_counter() - setup_start
+            self._contact_schur_rows_by_batch = self.contact_schur.rows_by_batch
+            self._contact_schur_true_residual_work = np.zeros(self._B, dtype=np.float64)
+            self._contact_schur_linear_converged_work = np.ones(self._B, dtype=np.bool_)
+
+        for outer_iteration in range(self._n_sap_iterations):
+            active_before_step = self.batch_active.to_numpy().astype(bool, copy=False)
+            if not np.any(active_before_step):
+                break
+            if self._linear_solver == "sparse_direct":
+                self._sparse_direct_newton_solve()
+            elif self._linear_solver == "contact_schur":
+                solve_start = time.perf_counter()
+                residual, converged = self.contact_schur.solve(
+                    validate=outer_iteration + 1 == self._n_sap_iterations
+                )
+                self._contact_schur_solve_seconds += time.perf_counter() - solve_start
+                self._contact_schur_true_residual_work = residual
+                self._contact_schur_linear_converged_work &= converged
+            else:
+                self._enriched_pcg_newton_solve()
+                self._accumulate_pcg_budget_exhaustion()
+            self.exact_linesearch(i_step)
+            self._accumulate_linesearch_budget_exhaustion()
+            self._direct_sap_iterations += 1
+            iterations_by_batch[active_before_step] += 1
+
+            # Recompute the original momentum defect at the accepted velocity.
+            self.compute_unconstrained_gradient_diag(i_step, 1)
+            self.compute_constraint_contact_gradient_hessian_diag_prec()
+            self.check_sap_convergence(rigid_global_info=self.rigid_solver._rigid_global_info)
+
+        active = self.batch_active.to_numpy().astype(bool, copy=False)
+        final_norm = np.asarray(self.sap_state.gradient_norm.to_numpy(), dtype=np.float64)
+        if self._linear_solver == "sparse_direct":
+            self._direct_sap_iterations_by_batch = tuple(int(value) for value in iterations_by_batch)
+            self._direct_final_original_momentum_norm_by_batch = tuple(float(value) for value in final_norm)
+            self._direct_converged_by_batch = tuple(bool(value) for value in ~active)
+            self._direct_final_original_momentum_norm = float(np.max(final_norm, initial=0.0))
+            self._direct_converged = not bool(np.any(active))
+            self._direct_assembly_seconds_total += self._direct_assembly_seconds
+            self._direct_factor_seconds_total += self._direct_factor_seconds
+            self._direct_solve_seconds_total += self._direct_solve_seconds
+            self._direct_transfer_seconds_total += self._direct_transfer_seconds
+        elif self._linear_solver == "enriched_pcg":
+            self._enriched_sap_iterations_by_batch = tuple(int(value) for value in iterations_by_batch)
+            self._enriched_final_original_momentum_norm_by_batch = tuple(float(value) for value in final_norm)
+            self._enriched_sap_converged_by_batch = tuple(bool(value) for value in ~active)
+            self._enriched_iterations_by_batch = tuple(int(value) for value in self._enriched_iterations_work)
+            self._enriched_true_residual_norm_by_batch = tuple(
+                float(value) for value in self._enriched_true_residual_work
+            )
+            self._enriched_linear_converged_by_batch = tuple(
+                bool(value) for value in self._enriched_linear_converged_work
+            )
+            self._enriched_setup_seconds_total += self._enriched_setup_seconds
+            self._enriched_solve_seconds_total += self._enriched_solve_seconds
+            self._enriched_transfer_seconds_total += self._enriched_transfer_seconds
+        else:
+            self._contact_schur_sap_iterations_by_batch = tuple(int(value) for value in iterations_by_batch)
+            self._contact_schur_final_original_momentum_norm_by_batch = tuple(
+                float(value) for value in final_norm
+            )
+            self._contact_schur_sap_converged_by_batch = tuple(bool(value) for value in ~active)
+            self._contact_schur_true_residual_norm_by_batch = tuple(
+                float(value) for value in self._contact_schur_true_residual_work
+            )
+            self._contact_schur_linear_converged_by_batch = tuple(
+                bool(value) for value in self._contact_schur_linear_converged_work
+            )
+            self._contact_schur_setup_seconds_total += self._contact_schur_setup_seconds
+            self._contact_schur_solve_seconds_total += self._contact_schur_solve_seconds
+            self._contact_schur_transfer_seconds_total += self._contact_schur_transfer_seconds
+
+        if self._enable_qualification_post_final_sap_health:
+            self._legacy_sap_health_fields = self._snapshot_sap_health_fields()
+            self._post_final_sap_health_fields = self._legacy_sap_health_fields
+
+    def _prepare_enriched_substep_system(self, i_step):
+        setup_start = time.perf_counter()
+        transfer_before = self._enriched_transfer_seconds
+        self.enriched_pcg.refresh(i_step)
+        transfer_elapsed = self._enriched_transfer_seconds - transfer_before
+        self._enriched_setup_seconds += max(0.0, time.perf_counter() - setup_start - transfer_elapsed)
+        self.batch_pcg_active.fill(False)
+        self.pcg_state.rTr.fill(0.0)
+        self.pcg_state.rTz.fill(0.0)
+        self._enriched_geometry_columns_by_batch = self.enriched_pcg.geometry_columns_by_batch
+        self._enriched_response_columns_by_batch = self.enriched_pcg.response_columns_by_batch
+        self._enriched_retained_columns_by_batch = self.enriched_pcg.retained_columns_by_batch
+        self._enriched_iterations_work = np.zeros(self._B, dtype=np.int64)
+        self._enriched_true_residual_work = np.zeros(self._B, dtype=np.float64)
+        self._enriched_linear_converged_work = np.ones(self._B, dtype=np.bool_)
+
+    def _enriched_pcg_newton_solve(self):
+        setup_start = time.perf_counter()
+        transfer_before = self._enriched_transfer_seconds
+        self.enriched_pcg.prepare_hessian()
+        transfer_elapsed = self._enriched_transfer_seconds - transfer_before
+        self._enriched_setup_seconds += max(0.0, time.perf_counter() - setup_start - transfer_elapsed)
+        solve_start = time.perf_counter()
+        transfer_before = self._enriched_transfer_seconds
+        iterations, residual, converged = self.enriched_pcg.solve()
+        transfer_elapsed = self._enriched_transfer_seconds - transfer_before
+        self._enriched_solve_seconds += max(0.0, time.perf_counter() - solve_start - transfer_elapsed)
+        self._enriched_iterations_work += iterations
+        self._enriched_true_residual_work = residual
+        self._enriched_linear_converged_work &= converged
+        self._enriched_iterations_by_batch = tuple(int(value) for value in self._enriched_iterations_work)
+        self._enriched_true_residual_norm_by_batch = tuple(
+            float(value) for value in self._enriched_true_residual_work
+        )
+        self._enriched_linear_converged_by_batch = tuple(
+            bool(value) for value in self._enriched_linear_converged_work
+        )
 
     def _snapshot_sap_health_fields(self):
         """Read the existing SAP diagnostic fields without mutating solver state."""
@@ -2397,10 +2797,19 @@ class SAPCoupler(RBC):
         for i_b in range(self._B):
             if not self.batch_active[i_b]:
                 continue
-            norm_thr = self._sap_convergence_atol + self._sap_convergence_rtol * qd.max(
-                self.sap_state[i_b].momentum_norm, self.sap_state[i_b].impulse_norm
-            )
-            self.batch_active[i_b] = self.sap_state[i_b].gradient_norm >= norm_thr
+            if qd.static(self._use_original_momentum_objective):
+                self.sap_state[i_b].gradient_norm = qd.sqrt(self.sap_state[i_b].gradient_norm)
+                self.sap_state[i_b].momentum_norm = qd.sqrt(self.sap_state[i_b].momentum_norm)
+                self.sap_state[i_b].impulse_norm = qd.sqrt(self.sap_state[i_b].impulse_norm)
+                norm_thr = self._sap_convergence_atol + self._sap_convergence_rtol * qd.max(
+                    self.sap_state[i_b].momentum_norm, self.sap_state[i_b].impulse_norm
+                )
+                self.batch_active[i_b] = self.sap_state[i_b].gradient_norm > norm_thr
+            else:
+                norm_thr = self._sap_convergence_atol + self._sap_convergence_rtol * qd.max(
+                    self.sap_state[i_b].momentum_norm, self.sap_state[i_b].impulse_norm
+                )
+                self.batch_active[i_b] = self.sap_state[i_b].gradient_norm >= norm_thr
 
     @qd.kernel
     def compute_regularization(
@@ -2438,9 +2847,15 @@ class SAPCoupler(RBC):
     @qd.func
     def _init_v(self, i_step: qd.i32, dofs_state: array_class.DofsState):
         if qd.static(self.fem_solver.is_active):
-            self._init_v_fem(i_step)
+            if qd.static(self._linear_solver == "contact_schur"):
+                self._init_v_fem_previous(i_step)
+            else:
+                self._init_v_fem(i_step)
         if qd.static(self.rigid_solver.is_active):
-            self._init_v_rigid(i_step, dofs_state=dofs_state)
+            if qd.static(self._linear_solver == "contact_schur"):
+                self._init_v_rigid_previous(i_step, dofs_state=dofs_state)
+            else:
+                self._init_v_rigid(i_step, dofs_state=dofs_state)
 
     @qd.func
     def _init_v_fem(self, i_step: qd.i32):
@@ -2448,14 +2863,25 @@ class SAPCoupler(RBC):
             self.fem_state_v.v[i_b, i_v] = self.fem_solver.elements_v[i_step + 1, i_v, i_b].vel
 
     @qd.func
+    def _init_v_fem_previous(self, i_step: qd.i32):
+        for i_b, i_v in qd.ndrange(self._B, self.fem_solver.n_vertices):
+            self.fem_state_v.v[i_b, i_v] = self.fem_solver.elements_v[i_step, i_v, i_b].vel
+
+    @qd.func
     def _init_v_rigid(self, i_step: qd.i32, dofs_state: array_class.DofsState):
         for i_b, i_d in qd.ndrange(self.rigid_solver._B, self.rigid_solver.n_dofs):
             self.rigid_state_dof.v[i_b, i_d] = dofs_state.vel[i_d, i_b]
 
+    @qd.func
+    def _init_v_rigid_previous(self, i_step: qd.i32, dofs_state: array_class.DofsState):
+        for i_b, i_d in qd.ndrange(self.rigid_solver._B, self.rigid_solver.n_dofs):
+            self.rigid_state_dof.v[i_b, i_d] = dofs_state.vel_prev[i_d, i_b]
+
     def compute_unconstrained_gradient_diag(self, i_step: qd.i32, iter: int):
         self.init_unconstrained_gradient_diag(i_step)
-        # No need to do this for iter=0 because v=v* and A(v-v*) = 0
-        if iter > 0:
+        # With an inexact free velocity c, the original free momentum is
+        # A_f(v-c)-r_f.  This is -r_f at iteration zero.
+        if iter > 0 or self._use_original_momentum_objective:
             self.compute_unconstrained_gradient()
 
     def init_unconstrained_gradient_diag(self, i_step: qd.i32):
@@ -2490,6 +2916,10 @@ class SAPCoupler(RBC):
     @qd.kernel
     def compute_fem_unconstrained_gradient(self):
         self.compute_fem_matrix_vector_product(self.fem_state_v.v_diff, self.fem_state_v.gradient, self.batch_active)
+        if qd.static(self._use_original_momentum_objective):
+            for i_b, i_v in qd.ndrange(self.fem_solver._B, self.fem_solver.n_vertices):
+                if self.batch_active[i_b]:
+                    self.fem_state_v.gradient[i_b, i_v] -= self._direct_fem_free_residual[i_b, i_v]
 
     @qd.kernel
     def compute_rigid_unconstrained_gradient(self, rigid_global_info: array_class.RigidGlobalInfo):
@@ -4921,7 +5351,11 @@ class SAPCoupler(RBC):
         for i_b in qd.ndrange(self._B):
             if not self.batch_pcg_active[i_b]:
                 continue
-            self.batch_pcg_active[i_b] = self.pcg_state[i_b].rTr > self._pcg_threshold
+            if qd.static(self._linear_solver == "enriched_pcg"):
+                threshold = self._enriched_pcg_initial_rTr[i_b] * self._enriched_pcg_rtol**2
+                self.batch_pcg_active[i_b] = self.pcg_state[i_b].rTr > threshold
+            else:
+                self.batch_pcg_active[i_b] = self.pcg_state[i_b].rTr > self._pcg_threshold
 
     def one_pcg_iter(self):
         self._kernel_one_pcg_iter(
@@ -5095,7 +5529,11 @@ class SAPCoupler(RBC):
         for i_b in qd.ndrange(self._B):
             if not self.batch_pcg_active[i_b]:
                 continue
-            self.batch_pcg_active[i_b] = self.pcg_state[i_b].rTr_new > self._pcg_threshold
+            if qd.static(self._linear_solver == "enriched_pcg"):
+                threshold = self._enriched_pcg_initial_rTr[i_b] * self._enriched_pcg_rtol**2
+                self.batch_pcg_active[i_b] = self.pcg_state[i_b].rTr_new > threshold
+            else:
+                self.batch_pcg_active[i_b] = self.pcg_state[i_b].rTr_new > self._pcg_threshold
         # update beta, rTr, rTz
         for i_b in qd.ndrange(self._B):
             if not self.batch_pcg_active[i_b]:
@@ -5162,6 +5600,280 @@ class SAPCoupler(RBC):
             self.rigid_fem_snap_coarse.apply()
             self._finish_rigid_fem_contact_patch_pcg_iter()
 
+    def _direct_numpy(self, field):
+        start = time.perf_counter()
+        value = field.to_numpy()
+        self._direct_transfer_seconds += time.perf_counter() - start
+        return value
+
+    def _prepare_sparse_direct_fem_momentum(self):
+        systems = [self.fem_solver.get_sparse_direct_velocity_system(i_b) for i_b in range(self._B)]
+        residual = np.stack([system[3] for system in systems], axis=0).reshape(
+            self._B, self.fem_solver.n_vertices, 3
+        )
+        start = time.perf_counter()
+        self._direct_fem_free_residual.from_numpy(np.asarray(residual, dtype=gs.np_float))
+        elapsed = time.perf_counter() - start
+        if self._linear_solver == "enriched_pcg":
+            self._enriched_transfer_seconds += elapsed
+        else:
+            self._direct_transfer_seconds += elapsed
+        self._direct_fem_velocity_systems = systems
+
+    @staticmethod
+    def _append_direct_hessian_block(rows, cols, values, indices, jacobian, G):
+        if not indices:
+            return
+        indices = np.asarray(indices, dtype=np.int64)
+        local = np.asarray(jacobian, dtype=np.float64).T @ np.asarray(G, dtype=np.float64) @ np.asarray(
+            jacobian, dtype=np.float64
+        )
+        local_rows, local_cols = np.nonzero(local)
+        rows.extend(indices[local_rows].tolist())
+        cols.extend(indices[local_cols].tolist())
+        values.extend(local[local_rows, local_cols].tolist())
+
+    @staticmethod
+    def _direct_contact_columns(world_columns, world_to_contact):
+        indices = sorted(world_columns)
+        jacobian = np.column_stack([world_to_contact @ world_columns[index] for index in indices])
+        return indices, jacobian
+
+    @staticmethod
+    def _direct_accumulate_world_column(world_columns, index, value):
+        if index in world_columns:
+            world_columns[index] += value
+        else:
+            world_columns[index] = np.asarray(value, dtype=np.float64).copy()
+
+    def _append_direct_scalar_constraints(self, handler, i_b, rigid_offset, rows, cols, values):
+        count = int(handler.n_constraints[None])
+        if count == 0:
+            return
+        batch_idx = self._direct_numpy(handler.constraints.batch_idx)[:count]
+        G = self._direct_numpy(handler.constraints.sap_info.G)[:count]
+        if isinstance(handler, RigidJointLimitConstraintHandler):
+            dof_idx = self._direct_numpy(handler.constraints.dof_idx)[:count]
+            jac = self._direct_numpy(handler.constraints.jac)[:count]
+            for i_c in range(count):
+                if int(batch_idx[i_c]) != i_b:
+                    continue
+                self._append_direct_hessian_block(
+                    rows,
+                    cols,
+                    values,
+                    [rigid_offset + int(dof_idx[i_c])],
+                    np.asarray([[jac[i_c]]], dtype=np.float64),
+                    np.asarray([[G[i_c]]], dtype=np.float64),
+                )
+            return
+
+        Jt = self._direct_numpy(handler.Jt)[:count]
+        for i_c in range(count):
+            if int(batch_idx[i_c]) != i_b:
+                continue
+            nonzero = np.flatnonzero(Jt[i_c])
+            self._append_direct_hessian_block(
+                rows,
+                cols,
+                values,
+                (rigid_offset + nonzero).tolist(),
+                Jt[i_c, nonzero][None, :],
+                np.asarray([[G[i_c]]], dtype=np.float64),
+            )
+
+    def _append_direct_contact_handler(self, handler, i_b, rigid_offset, elements, rows, cols, values):
+        count = int(handler.n_contact_pairs[None])
+        if count == 0:
+            return
+        pairs = handler.contact_pairs
+        batch_idx = self._direct_numpy(pairs.batch_idx)[:count]
+        G = self._direct_numpy(pairs.sap_info.G)[:count]
+
+        if isinstance(handler, FEMFloorTetContactHandler):
+            geom_idx = self._direct_numpy(pairs.geom_idx)[:count]
+            barycentric = self._direct_numpy(pairs.barycentric)[:count]
+            for i_p in range(count):
+                if int(batch_idx[i_p]) != i_b:
+                    continue
+                world_columns = {}
+                for local, vertex in enumerate(elements[int(geom_idx[i_p])]):
+                    for axis in range(3):
+                        value = np.zeros(3)
+                        value[axis] = barycentric[i_p, local]
+                        self._direct_accumulate_world_column(world_columns, 3 * int(vertex) + axis, value)
+                indices, jacobian = self._direct_contact_columns(world_columns, np.eye(3))
+                self._append_direct_hessian_block(rows, cols, values, indices, jacobian, G[i_p])
+            return
+
+        if isinstance(handler, FEMFloorVertContactHandler):
+            vertex_idx = self._direct_numpy(pairs.geom_idx)[:count]
+            for i_p in range(count):
+                if int(batch_idx[i_p]) != i_b:
+                    continue
+                indices = [3 * int(vertex_idx[i_p]) + axis for axis in range(3)]
+                self._append_direct_hessian_block(rows, cols, values, indices, np.eye(3), G[i_p])
+            return
+
+        if isinstance(handler, FEMSelfTetContactHandler):
+            geom_idx0 = self._direct_numpy(pairs.geom_idx0)[:count]
+            geom_idx1 = self._direct_numpy(pairs.geom_idx1)[:count]
+            barycentric0 = self._direct_numpy(pairs.barycentric0)[:count]
+            barycentric1 = self._direct_numpy(pairs.barycentric1)[:count]
+            tangent0 = self._direct_numpy(pairs.tangent0)[:count]
+            tangent1 = self._direct_numpy(pairs.tangent1)[:count]
+            normal = self._direct_numpy(pairs.normal)[:count]
+            for i_p in range(count):
+                if int(batch_idx[i_p]) != i_b:
+                    continue
+                world_columns = {}
+                for sign, geom_idx, barycentric in (
+                    (1.0, geom_idx0[i_p], barycentric0[i_p]),
+                    (-1.0, geom_idx1[i_p], barycentric1[i_p]),
+                ):
+                    for local, vertex in enumerate(elements[int(geom_idx)]):
+                        for axis in range(3):
+                            value = np.zeros(3)
+                            value[axis] = sign * barycentric[local]
+                            self._direct_accumulate_world_column(world_columns, 3 * int(vertex) + axis, value)
+                world_to_contact = np.column_stack((tangent0[i_p], tangent1[i_p], normal[i_p])).T
+                indices, jacobian = self._direct_contact_columns(world_columns, world_to_contact)
+                self._append_direct_hessian_block(rows, cols, values, indices, jacobian, G[i_p])
+            return
+
+        if isinstance(handler, RigidFEMVertexSnapHandler):
+            vertex_idx = self._direct_numpy(pairs.vertex_idx)[:count]
+            rigid_J = self._direct_numpy(handler.Jt)[:count]
+            for i_p in range(count):
+                if int(batch_idx[i_p]) != i_b:
+                    continue
+                world_columns = {}
+                vertex = int(vertex_idx[i_p])
+                for axis in range(3):
+                    value = np.zeros(3)
+                    value[axis] = 1.0
+                    self._direct_accumulate_world_column(world_columns, 3 * vertex + axis, value)
+                for dof in np.flatnonzero(np.linalg.norm(rigid_J[i_p], axis=1)):
+                    self._direct_accumulate_world_column(
+                        world_columns, rigid_offset + int(dof), -rigid_J[i_p, dof]
+                    )
+                indices, jacobian = self._direct_contact_columns(world_columns, np.eye(3))
+                self._append_direct_hessian_block(rows, cols, values, indices, jacobian, G[i_p])
+            return
+
+        if isinstance(handler, RigidFemTriTetContactHandler):
+            geom_idx = self._direct_numpy(pairs.geom_idx0)[:count]
+            weights = self._direct_numpy(pairs.mechanical_weights0)[:count]
+            link_idx = self._direct_numpy(pairs.link_idx)[:count]
+            tangent0 = self._direct_numpy(pairs.tangent0)[:count]
+            tangent1 = self._direct_numpy(pairs.tangent1)[:count]
+            normal = self._direct_numpy(pairs.normal)[:count]
+            rigid_J = self._direct_numpy(handler.J_rigid)[:count]
+            support_offsets = self._direct_numpy(handler.link_support_offsets)
+            support_dofs = self._direct_numpy(handler.link_support_dofs)
+            for i_p in range(count):
+                if int(batch_idx[i_p]) != i_b:
+                    continue
+                world_columns = {}
+                for local, vertex in enumerate(elements[int(geom_idx[i_p])]):
+                    for axis in range(3):
+                        value = np.zeros(3)
+                        value[axis] = weights[i_p, local]
+                        self._direct_accumulate_world_column(world_columns, 3 * int(vertex) + axis, value)
+                link = int(link_idx[i_p])
+                start, end = int(support_offsets[link]), int(support_offsets[link + 1])
+                for slot, support_index in enumerate(range(start, end)):
+                    dof = int(support_dofs[support_index])
+                    self._direct_accumulate_world_column(
+                        world_columns, rigid_offset + dof, -rigid_J[i_p, slot]
+                    )
+                world_to_contact = np.column_stack((tangent0[i_p], tangent1[i_p], normal[i_p])).T
+                indices, jacobian = self._direct_contact_columns(world_columns, world_to_contact)
+                self._append_direct_hessian_block(rows, cols, values, indices, jacobian, G[i_p])
+            return
+
+        if isinstance(handler, RigidContactHandler):
+            rigid_J = self._direct_numpy(handler.Jt)[:count]
+            has_contact_frame = isinstance(handler, RigidRigidContactHandler)
+            if has_contact_frame:
+                tangent0 = self._direct_numpy(pairs.tangent0)[:count]
+                tangent1 = self._direct_numpy(pairs.tangent1)[:count]
+                normal = self._direct_numpy(pairs.normal)[:count]
+            for i_p in range(count):
+                if int(batch_idx[i_p]) != i_b:
+                    continue
+                world_to_contact = (
+                    np.column_stack((tangent0[i_p], tangent1[i_p], normal[i_p])).T
+                    if has_contact_frame
+                    else np.eye(3)
+                )
+                nonzero = np.flatnonzero(np.linalg.norm(rigid_J[i_p], axis=1))
+                indices = (rigid_offset + nonzero).tolist()
+                jacobian = world_to_contact @ rigid_J[i_p, nonzero].T
+                self._append_direct_hessian_block(rows, cols, values, indices, jacobian, G[i_p])
+
+    def _sparse_direct_newton_solve(self):
+        active = self._direct_numpy(self.batch_active).astype(bool, copy=False)
+        fem_gradient = self._direct_numpy(self.fem_state_v.gradient)
+        rigid_gradient = self._direct_numpy(self.rigid_state_dof.gradient)
+        rigid_mass = self._direct_numpy(self.rigid_solver._rigid_global_info.mass_mat)
+        elements = self._direct_numpy(self.fem_solver.elements_i.el2v)
+        transfer_before_assembly = self._direct_transfer_seconds
+
+        fem_direction = np.zeros_like(fem_gradient)
+        rigid_direction = np.zeros_like(rigid_gradient)
+        assembly_wall = 0.0
+        factor_wall = 0.0
+        solve_wall = 0.0
+        rigid_offset = 3 * self.fem_solver.n_vertices
+
+        for i_b in np.flatnonzero(active):
+            assembly_start = time.perf_counter()
+            A_f = self._direct_fem_velocity_systems[int(i_b)][0]
+            M_r = sp.csc_matrix(rigid_mass[:, :, int(i_b)])
+            H = sp.block_diag((A_f, M_r), format="csc")
+            rows, cols, values = [], [], []
+            if self.rigid_solver.n_equalities > 0:
+                self._append_direct_scalar_constraints(
+                    self.equality_constraint_handler, int(i_b), rigid_offset, rows, cols, values
+                )
+            if self._enable_sap_joint_limits:
+                self._append_direct_scalar_constraints(
+                    self.joint_limit_constraint_handler, int(i_b), rigid_offset, rows, cols, values
+                )
+            for handler in self.contact_handlers:
+                self._append_direct_contact_handler(
+                    handler, int(i_b), rigid_offset, elements, rows, cols, values
+                )
+            if values:
+                H += sp.coo_matrix((values, (rows, cols)), shape=H.shape).tocsc()
+            H.sum_duplicates()
+            H.sort_indices()
+            assembly_wall += time.perf_counter() - assembly_start
+
+            factor_start = time.perf_counter()
+            factor = spla.splu(H)
+            factor_wall += time.perf_counter() - factor_start
+
+            rhs = -np.concatenate((fem_gradient[int(i_b)].reshape(-1), rigid_gradient[int(i_b)]))
+            solve_start = time.perf_counter()
+            direction = factor.solve(rhs)
+            solve_wall += time.perf_counter() - solve_start
+            fem_direction[int(i_b)] = direction[:rigid_offset].reshape(self.fem_solver.n_vertices, 3)
+            rigid_direction[int(i_b)] = direction[rigid_offset:]
+
+        transfer_during_assembly = self._direct_transfer_seconds - transfer_before_assembly
+        self._direct_assembly_seconds += max(0.0, assembly_wall - transfer_during_assembly)
+        self._direct_factor_seconds += factor_wall
+        self._direct_solve_seconds += solve_wall
+        transfer_start = time.perf_counter()
+        self.pcg_fem_state_v.x.from_numpy(np.asarray(fem_direction, dtype=gs.np_float))
+        self.pcg_rigid_state_dof.x.from_numpy(np.asarray(rigid_direction, dtype=gs.np_float))
+        self._direct_transfer_seconds += time.perf_counter() - transfer_start
+        self.batch_pcg_active.fill(False)
+        self.pcg_state.rTr.fill(0.0)
+        self.pcg_state.rTz.fill(0.0)
+
     @qd.func
     def compute_total_energy(
         self,
@@ -5204,6 +5916,10 @@ class SAPCoupler(RBC):
                 * dt2
                 * damping_alpha_factor
             )
+            if qd.static(self._use_original_momentum_objective):
+                energy[i_b] -= self._direct_fem_free_residual[i_b, i_v].dot(
+                    self.fem_state_v.v_diff[i_b, i_v]
+                )
 
         # Elastic
         for i_b, i_e in qd.ndrange(self._B, self.fem_solver.n_elements):
@@ -5337,6 +6053,10 @@ class SAPCoupler(RBC):
             if not self.batch_linesearch_active[i_b]:
                 continue
             self.linesearch_state.dell_dalpha[i_b] += dp[i_b, i_v].dot(v[i_b, i_v] - v_star[i_step + 1, i_v, i_b])
+            if qd.static(self._use_original_momentum_objective):
+                self.linesearch_state.dell_dalpha[i_b] -= self.pcg_fem_state_v[i_b, i_v].x.dot(
+                    self._direct_fem_free_residual[i_b, i_v]
+                )
 
     @qd.func
     def compute_rigid_gradient_alpha(self, dofs_state: array_class.DofsState):
@@ -5358,6 +6078,10 @@ class SAPCoupler(RBC):
             if not self.batch_linesearch_active[i_b]:
                 continue
             energy[i_b] += alpha[i_b] * dp[i_b, i_v].dot(v[i_b, i_v] - v_star[i_step + 1, i_v, i_b])
+            if qd.static(self._use_original_momentum_objective):
+                energy[i_b] -= alpha[i_b] * self.pcg_fem_state_v[i_b, i_v].x.dot(
+                    self._direct_fem_free_residual[i_b, i_v]
+                )
 
     @qd.func
     def compute_rigid_energy_alpha(self, energy: qd.template(), dofs_state: array_class.DofsState):
@@ -5472,44 +6196,48 @@ class SAPCoupler(RBC):
         if qd.static(self.rigid_solver.is_active):
             self.update_initial_rigid_state()
 
-        # When tolerance is small but gradient norm is small, take step 1.0 and end, this is a rare case, directly
-        # copied from drake
-        # Link: https://github.com/RobotLocomotion/drake/blob/3bb00e611983fb894151c547776d5aa85abe9139/multibody/contact_solvers/sap/sap_solver.cc#L625
-        for i_b in range(self._B):
-            if not self.batch_linesearch_active[i_b]:
-                continue
-            err_threshold = (
-                self._sap_convergence_atol + self._sap_convergence_rtol * self.linesearch_state[i_b].prev_energy
-            )
-            if -self.linesearch_state[i_b].m < err_threshold:
-                self.batch_linesearch_active[i_b] = False
-                self.linesearch_state[i_b].step_size = 1.0
+        if qd.static(not self._use_original_momentum_objective):
+            # When tolerance is small but gradient norm is small, take step 1.0 and end, this is a rare case,
+            # directly copied from Drake.
+            for i_b in range(self._B):
+                if not self.batch_linesearch_active[i_b]:
+                    continue
+                err_threshold = (
+                    self._sap_convergence_atol + self._sap_convergence_rtol * self.linesearch_state[i_b].prev_energy
+                )
+                if -self.linesearch_state[i_b].m < err_threshold:
+                    self.batch_linesearch_active[i_b] = False
+                    self.linesearch_state[i_b].step_size = 1.0
 
     @qd.func
     def update_initial_fem_state(self):
-        for i_b, i_v in qd.ndrange(self._B, self.fem_solver.n_vertices):
-            if not self.batch_linesearch_active[i_b]:
-                continue
-            err_threshold = (
-                self._sap_convergence_atol + self._sap_convergence_rtol * self.linesearch_state[i_b].prev_energy
-            )
-            if -self.linesearch_state[i_b].m < err_threshold:
-                self.fem_state_v.v[i_b, i_v] = (
-                    self.linesearch_fem_state_v[i_b, i_v].x_prev + self.pcg_fem_state_v[i_b, i_v].x
+        if qd.static(not self._use_original_momentum_objective):
+            for i_b, i_v in qd.ndrange(self._B, self.fem_solver.n_vertices):
+                if not self.batch_linesearch_active[i_b]:
+                    continue
+                err_threshold = (
+                    self._sap_convergence_atol
+                    + self._sap_convergence_rtol * self.linesearch_state[i_b].prev_energy
                 )
+                if -self.linesearch_state[i_b].m < err_threshold:
+                    self.fem_state_v.v[i_b, i_v] = (
+                        self.linesearch_fem_state_v[i_b, i_v].x_prev + self.pcg_fem_state_v[i_b, i_v].x
+                    )
 
     @qd.func
     def update_initial_rigid_state(self):
-        for i_b, i_d in qd.ndrange(self._B, self.rigid_solver.n_dofs):
-            if not self.batch_linesearch_active[i_b]:
-                continue
-            err_threshold = (
-                self._sap_convergence_atol + self._sap_convergence_rtol * self.linesearch_state[i_b].prev_energy
-            )
-            if -self.linesearch_state[i_b].m < err_threshold:
-                self.rigid_state_dof.v[i_b, i_d] = (
-                    self.linesearch_rigid_state_dof[i_b, i_d].x_prev + self.pcg_rigid_state_dof[i_b, i_d].x
+        if qd.static(not self._use_original_momentum_objective):
+            for i_b, i_d in qd.ndrange(self._B, self.rigid_solver.n_dofs):
+                if not self.batch_linesearch_active[i_b]:
+                    continue
+                err_threshold = (
+                    self._sap_convergence_atol
+                    + self._sap_convergence_rtol * self.linesearch_state[i_b].prev_energy
                 )
+                if -self.linesearch_state[i_b].m < err_threshold:
+                    self.rigid_state_dof.v[i_b, i_d] = (
+                        self.linesearch_rigid_state_dof[i_b, i_d].x_prev + self.pcg_rigid_state_dof[i_b, i_d].x
+                    )
 
     def one_linesearch_iter(self, i_step: qd.i32):
         self.update_velocity_linesearch()
@@ -8673,3 +9401,1382 @@ class RigidRigidTetContactHandler(RigidRigidContactHandler):
         overflow |= self.compute_candidates(f)
         overflow |= self.compute_pairs(f, geoms_info)
         return overflow
+
+
+@qd.data_oriented
+class GPUContactSchurSolver:
+    """SAP Newton solve in contact space, with all large algebra resident on CUDA."""
+
+    def __init__(self, coupler):
+        self.coupler = coupler
+        self.fem = coupler.fem_solver
+        self.rigid = coupler.rigid_solver
+        self.n_vertices = self.fem.n_vertices
+        self.n_dofs = self.rigid.n_dofs
+        self.n_fem = 3 * self.n_vertices
+        self.max_rows = coupler._contact_schur_max_rows
+        self.specs = ()
+        self.rows_by_batch = (0,)
+        self.jt = None
+        self.w = None
+        self.j = None
+        self.schur = None
+        self.vbar = None
+        self._elements = None
+        self._native_support = {}
+        self._fem_compliance = None
+        self._compliance_substep = -1
+
+    def reset(self):
+        self._fem_compliance = None
+        self._compliance_substep = -1
+
+    @staticmethod
+    def _aos_prefix(field, count):
+        """Copy an active AOS struct-member prefix onto CUDA for Torch algebra."""
+        return qd_to_torch(field, copy=True)[:count]
+
+    @qd.kernel
+    def _pack_contact_sap_info(
+        self,
+        info: qd.template(),
+        count: qd.i32,
+        gamma: qd.types.ndarray(),
+        G: qd.types.ndarray(),
+    ):
+        for i in range(count):
+            for j in qd.static(range(3)):
+                gamma[i, j] = info[i].gamma[j]
+                for k in qd.static(range(3)):
+                    G[i, j, k] = info[i].G[j, k]
+
+    @qd.kernel
+    def _pack_scalar_sap_info(
+        self,
+        info: qd.template(),
+        count: qd.i32,
+        gamma: qd.types.ndarray(),
+        G: qd.types.ndarray(),
+    ):
+        for i in range(count):
+            gamma[i] = info[i].gamma
+            G[i] = info[i].G
+
+    @qd.kernel
+    def _pack_native_contact_geometry(
+        self,
+        pairs: qd.template(),
+        count: qd.i32,
+        geom: qd.types.ndarray(),
+        weights: qd.types.ndarray(),
+        frame: qd.types.ndarray(),
+        link: qd.types.ndarray(),
+    ):
+        for i in range(count):
+            geom[i] = pairs[i].geom_idx0
+            link[i] = pairs[i].link_idx
+            for j in qd.static(range(4)):
+                weights[i, j] = pairs[i].mechanical_weights0[j]
+            for j in qd.static(range(3)):
+                frame[i, j, 0] = pairs[i].tangent0[j]
+                frame[i, j, 1] = pairs[i].tangent1[j]
+                frame[i, j, 2] = pairs[i].normal[j]
+
+    def _active_specs(self):
+        specs = []
+        row = 0
+        if self.rigid.n_equalities > 0:
+            handler = self.coupler.equality_constraint_handler
+            count = int(handler.n_constraints[None])
+            if count:
+                specs.append(("equality", handler, row, count))
+                row += count
+        if self.coupler._enable_sap_joint_limits:
+            handler = self.coupler.joint_limit_constraint_handler
+            count = int(handler.n_constraints[None])
+            if count:
+                specs.append(("joint_limit", handler, row, count))
+                row += count
+        for handler in self.coupler.contact_handlers:
+            count = int(handler.n_contact_pairs[None])
+            if not count:
+                continue
+            specs.append(("contact", handler, row, count))
+            row += 3 * count
+        if row > self.max_rows:
+            raise RuntimeError(
+                f"contact_schur needs {row} rows, exceeding contact_schur_max_rows={self.max_rows}; "
+                "no constraints were dropped"
+            )
+        return tuple(specs), row
+
+    @staticmethod
+    def _put(target, states, rows, values):
+        target.index_put_((states.reshape(-1), rows.reshape(-1)), values.reshape(-1), accumulate=True)
+
+    def _contact_frame(self, pairs, count, device):
+        tangent0 = self._aos_prefix(pairs.tangent0, count)
+        tangent1 = self._aos_prefix(pairs.tangent1, count)
+        normal = self._aos_prefix(pairs.normal, count)
+        return torch.stack((tangent0, tangent1, normal), dim=2).to(device=device)
+
+    def _pack_scalar_jt(self, target, handler, start, count):
+        values = qd_to_torch(handler.Jt, copy=False)[:count]
+        contacts = torch.arange(count, device=target.device, dtype=torch.long)
+        dofs = torch.arange(self.n_dofs, device=target.device, dtype=torch.long)
+        states = self.n_fem + dofs[None, :].expand(count, -1)
+        rows = start + contacts[:, None].expand(-1, self.n_dofs)
+        self._put(target, states, rows, values)
+
+    def _pack_floor_tet_jt(self, target, handler, start, count):
+        pairs = handler.contact_pairs
+        geom = self._aos_prefix(pairs.geom_idx, count).long()
+        barycentric = self._aos_prefix(pairs.barycentric, count)
+        vertices = self._elements[geom]
+        contacts = torch.arange(count, device=target.device, dtype=torch.long)
+        axes = torch.arange(3, device=target.device, dtype=torch.long)
+        constrained = None
+        if self.fem._enable_vertex_constraints:
+            constrained = qd_to_torch(self.fem.vertex_constraints.is_constrained, copy=False)[:, 0]
+        for local in range(4):
+            states = 3 * vertices[:, local, None] + axes[None, :]
+            rows = start + 3 * contacts[:, None] + axes[None, :]
+            values = barycentric[:, local, None].expand(-1, 3)
+            if constrained is not None:
+                values = values * (~constrained[vertices[:, local]])[:, None]
+            self._put(target, states, rows, values)
+
+    def _pack_floor_vert_jt(self, target, handler, start, count):
+        vertex = self._aos_prefix(handler.contact_pairs.geom_idx, count).long()
+        contacts = torch.arange(count, device=target.device, dtype=torch.long)
+        axes = torch.arange(3, device=target.device, dtype=torch.long)
+        states = 3 * vertex[:, None] + axes[None, :]
+        rows = start + 3 * contacts[:, None] + axes[None, :]
+        values = torch.ones((count, 3), dtype=target.dtype, device=target.device)
+        if self.fem._enable_vertex_constraints:
+            constrained = qd_to_torch(self.fem.vertex_constraints.is_constrained, copy=False)[:, 0]
+            values = values * (~constrained[vertex])[:, None]
+        self._put(target, states, rows, values)
+
+    def _pack_self_tet_jt(self, target, handler, start, count):
+        pairs = handler.contact_pairs
+        frame = self._contact_frame(pairs, count, target.device)
+        contacts = torch.arange(count, device=target.device, dtype=torch.long)
+        world_axes = torch.arange(3, device=target.device, dtype=torch.long)
+        contact_axes = torch.arange(3, device=target.device, dtype=torch.long)
+        constrained = None
+        if self.fem._enable_vertex_constraints:
+            constrained = qd_to_torch(self.fem.vertex_constraints.is_constrained, copy=False)[:, 0]
+        for geom_name, bary_name, sign in (
+            ("geom_idx0", "barycentric0", 1.0),
+            ("geom_idx1", "barycentric1", -1.0),
+        ):
+            geom = self._aos_prefix(getattr(pairs, geom_name), count).long()
+            barycentric = self._aos_prefix(getattr(pairs, bary_name), count)
+            vertices = self._elements[geom]
+            for local in range(4):
+                states = (
+                    3 * vertices[:, local, None, None] + world_axes[None, :, None]
+                ).expand(-1, -1, 3)
+                rows = (
+                    start + 3 * contacts[:, None, None] + contact_axes[None, None, :]
+                ).expand(-1, 3, -1)
+                values = sign * barycentric[:, local, None, None] * frame
+                if constrained is not None:
+                    values = values * (~constrained[vertices[:, local]])[:, None, None]
+                self._put(target, states, rows, values)
+
+    def _pack_snap_jt(self, target, handler, start, count):
+        pairs = handler.contact_pairs
+        vertex = self._aos_prefix(pairs.vertex_idx, count).long()
+        contacts = torch.arange(count, device=target.device, dtype=torch.long)
+        axes = torch.arange(3, device=target.device, dtype=torch.long)
+        states = 3 * vertex[:, None] + axes[None, :]
+        rows = start + 3 * contacts[:, None] + axes[None, :]
+        self._put(target, states, rows, torch.ones_like(states, dtype=target.dtype))
+
+        jacobian = -qd_to_torch(handler.Jt, copy=False)[:count]
+        dofs = torch.arange(self.n_dofs, device=target.device, dtype=torch.long)
+        states = (self.n_fem + dofs[None, :, None]).expand(count, -1, 3)
+        rows = (start + 3 * contacts[:, None, None] + axes[None, None, :]).expand(
+            -1, self.n_dofs, -1
+        )
+        self._put(target, states, rows, jacobian)
+
+    def _native_support_arrays(self, handler):
+        key = id(handler)
+        if key not in self._native_support:
+            offsets = np.asarray(handler.link_support_offsets.to_numpy(), dtype=np.int64)
+            dofs = np.asarray(handler.link_support_dofs.to_numpy(), dtype=np.int64)
+            self._native_support[key] = (offsets, dofs)
+        return self._native_support[key]
+
+    def _pack_native_jt(self, target, handler, start, count):
+        pairs = handler.contact_pairs
+        geom = torch.empty(count, dtype=torch.int32, device=target.device)
+        weights = torch.empty((count, 4), dtype=target.dtype, device=target.device)
+        frame = torch.empty((count, 3, 3), dtype=target.dtype, device=target.device)
+        link = torch.empty(count, dtype=torch.int32, device=target.device)
+        self._pack_native_contact_geometry(pairs, count, geom, weights, frame, link)
+        geom = geom.long()
+        vertices = self._elements[geom]
+        contacts = torch.arange(count, device=target.device, dtype=torch.long)
+        world_axes = torch.arange(3, device=target.device, dtype=torch.long)
+        contact_axes = torch.arange(3, device=target.device, dtype=torch.long)
+        for local in range(4):
+            states = (
+                3 * vertices[:, local, None, None] + world_axes[None, :, None]
+            ).expand(-1, -1, 3)
+            rows = (
+                start + 3 * contacts[:, None, None] + contact_axes[None, None, :]
+            ).expand(-1, 3, -1)
+            self._put(target, states, rows, weights[:, local, None, None] * frame)
+
+        transfer_start = time.perf_counter()
+        link_host = link.detach().cpu().numpy().astype(np.int64, copy=False)
+        self.coupler._contact_schur_transfer_seconds += time.perf_counter() - transfer_start
+        offsets, support_dofs = self._native_support_arrays(handler)
+        rigid_jacobian = qd_to_torch(handler.J_rigid, copy=False)[:count]
+        for link in np.unique(link_host):
+            host_rows = np.flatnonzero(link_host == link)
+            selected = torch.as_tensor(host_rows, dtype=torch.long, device=target.device)
+            start_support, end_support = int(offsets[link]), int(offsets[link + 1])
+            dofs = torch.as_tensor(
+                support_dofs[start_support:end_support], dtype=torch.long, device=target.device
+            )
+            values = -torch.einsum(
+                "nkw,nwc->nkc",
+                rigid_jacobian[selected, : end_support - start_support],
+                frame[selected],
+            )
+            states = (self.n_fem + dofs[None, :, None]).expand(len(host_rows), -1, 3)
+            rows = (
+                start + 3 * selected[:, None, None] + contact_axes[None, None, :]
+            ).expand(-1, len(dofs), -1)
+            self._put(target, states, rows, values)
+
+    def _pack_rigid_contact_jt(self, target, handler, start, count):
+        pairs = handler.contact_pairs
+        jacobian = qd_to_torch(handler.Jt, copy=False)[:count]
+        if isinstance(handler, RigidRigidContactHandler):
+            jacobian = torch.einsum(
+                "ndw,nwc->ndc", jacobian, self._contact_frame(pairs, count, target.device)
+            )
+        contacts = torch.arange(count, device=target.device, dtype=torch.long)
+        axes = torch.arange(3, device=target.device, dtype=torch.long)
+        dofs = torch.arange(self.n_dofs, device=target.device, dtype=torch.long)
+        states = (self.n_fem + dofs[None, :, None]).expand(count, -1, 3)
+        rows = (start + 3 * contacts[:, None, None] + axes[None, None, :]).expand(
+            -1, self.n_dofs, -1
+        )
+        self._put(target, states, rows, jacobian)
+
+    def _pack_contact_jt(self, target, handler, start, count):
+        if isinstance(handler, FEMFloorTetContactHandler):
+            self._pack_floor_tet_jt(target, handler, start, count)
+        elif isinstance(handler, FEMFloorVertContactHandler):
+            self._pack_floor_vert_jt(target, handler, start, count)
+        elif isinstance(handler, FEMSelfTetContactHandler):
+            self._pack_self_tet_jt(target, handler, start, count)
+        elif isinstance(handler, RigidFEMVertexSnapHandler):
+            self._pack_snap_jt(target, handler, start, count)
+        elif isinstance(handler, RigidFemTriTetContactHandler):
+            self._pack_native_jt(target, handler, start, count)
+        elif isinstance(handler, RigidContactHandler):
+            self._pack_rigid_contact_jt(target, handler, start, count)
+        else:
+            raise RuntimeError(f"contact_schur does not recognize contact handler {type(handler).__name__}")
+
+    def _pack_jt(self, device, rows):
+        target = torch.zeros(
+            (self.n_fem + self.n_dofs, rows), dtype=torch.float64, device=device
+        )
+        self._elements = qd_to_torch(self.fem.elements_i.el2v, copy=False).long()
+        for kind, handler, start, count in self.specs:
+            if kind == "contact":
+                self._pack_contact_jt(target, handler, start, count)
+            else:
+                self._pack_scalar_jt(target, handler, start, count)
+        return target
+
+    def refresh(self, i_step):
+        qd.sync()
+        self.specs, rows = self._active_specs()
+        self.rows_by_batch = (rows,)
+        device = qd_to_torch(self.coupler.fem_state_v.v, copy=False).device
+        self.jt = self._pack_jt(device, rows)
+        self.j = self.jt.float().transpose(0, 1).to_sparse_csr()
+
+        cache_interval = self.coupler._contact_schur_compliance_cache_substeps
+        cache_bytes = self.n_fem * self.n_fem * torch.float64.itemsize
+        use_compliance_cache = (
+            cache_interval > 0
+            and cache_bytes <= self.coupler._contact_schur_compliance_cache_max_bytes
+        )
+        global_substep = int(self.coupler.sim.cur_substep_global)
+        if use_compliance_cache and (
+            self._fem_compliance is None
+            or global_substep < self._compliance_substep
+            or global_substep - self._compliance_substep >= cache_interval
+        ):
+            identity = torch.eye(self.n_fem, dtype=torch.float64, device=device)
+            self._fem_compliance = self.fem.solve_sparse_direct_velocity_rhs_gpu(0, identity).detach()
+            self._compliance_substep = global_substep
+
+        if self._fem_compliance is not None:
+            fem_j = self.jt[: self.n_fem].transpose(0, 1).to_sparse_csr()
+            fem_w = torch.sparse.mm(fem_j, self._fem_compliance.transpose(0, 1)).transpose(0, 1)
+            self.vbar = None
+        else:
+            residual = qd_to_torch(self.coupler._direct_fem_free_residual, copy=False)[0].reshape(
+                self.n_fem
+            )
+            fem_rhs = torch.cat((self.jt[: self.n_fem], residual[:, None]), dim=1)
+            fem_response = self.fem.solve_sparse_direct_velocity_rhs_gpu(0, fem_rhs)
+            fem_w = fem_response[:, :rows]
+            free_fem = qd_to_torch(self.fem.elements_v.vel, copy=False)[i_step + 1, :, 0].reshape(
+                self.n_fem
+            )
+            vbar_fem = free_fem + fem_response[:, rows]
+
+        mass = qd_to_torch(self.rigid._rigid_global_info.mass_mat, copy=False)[:, :, 0]
+        rigid_w = torch.linalg.solve(mass, self.jt[self.n_fem :])
+        self.w = torch.cat((fem_w, rigid_w), dim=0)
+        # The contact-space factorization dominates this backend.  Build and
+        # factor the dense Schur complement in FP32, while retaining the state
+        # response and the accepted Newton direction in FP64.
+        self.schur = torch.sparse.mm(self.j, self.w.float())
+        if self._fem_compliance is None:
+            free_rigid = qd_to_torch(self.rigid.dofs_state.vel, copy=False)[:, 0]
+            self.vbar = torch.cat((vbar_fem, free_rigid), dim=0)
+        torch.cuda.synchronize(device)
+
+    def _contact_velocity(self, velocity):
+        return torch.sparse.mm(self.j, velocity.float()[:, None])[:, 0].to(velocity.dtype)
+
+    def _pack_gamma_g(self):
+        rows = self.rows_by_batch[0]
+        gamma = torch.zeros(rows, dtype=self.jt.dtype, device=self.jt.device)
+        blocks = []
+        for kind, handler, start, count in self.specs:
+            info = handler.constraints.sap_info if kind != "contact" else handler.contact_pairs.sap_info
+            if kind == "contact":
+                contact_gamma = torch.empty((count, 3), dtype=self.jt.dtype, device=self.jt.device)
+                contact_G = torch.empty((count, 3, 3), dtype=self.jt.dtype, device=self.jt.device)
+                self._pack_contact_sap_info(info, count, contact_gamma, contact_G)
+                contact_G = contact_G.float()
+                contact = torch.arange(count, device=self.jt.device, dtype=torch.long)
+                axes = torch.arange(3, device=self.jt.device, dtype=torch.long)
+                block_rows = start + 3 * contact[:, None] + axes[None, :]
+                gamma[block_rows] = contact_gamma
+                blocks.append((block_rows, contact_G))
+            else:
+                block_rows = start + torch.arange(count, device=self.jt.device, dtype=torch.long)
+                scalar_gamma = torch.empty(count, dtype=self.jt.dtype, device=self.jt.device)
+                scalar_G = torch.empty(count, dtype=self.jt.dtype, device=self.jt.device)
+                self._pack_scalar_sap_info(info, count, scalar_gamma, scalar_G)
+                gamma[block_rows] = scalar_gamma
+                blocks.append((block_rows[:, None], scalar_G.float()[:, None, None]))
+        return gamma, tuple(blocks)
+
+    def _apply_contact_blocks(self, blocks, rhs):
+        result = torch.empty_like(rhs, dtype=torch.float32)
+        for block_rows, values in blocks:
+            flat_rows = block_rows.reshape(-1)
+            if rhs.ndim == 1:
+                block_rhs = rhs[flat_rows].float().reshape(values.shape[0], values.shape[1], 1)
+                result[flat_rows] = torch.bmm(values, block_rhs).reshape(-1)
+            else:
+                block_rhs = rhs[flat_rows].float().reshape(values.shape[0], values.shape[1], -1)
+                result[flat_rows] = torch.bmm(values, block_rhs).reshape(len(flat_rows), -1)
+        return result
+
+    def _factor_contact_matrix(self, blocks):
+        rows = self.rows_by_batch[0]
+        matrix = torch.eye(rows, dtype=torch.float32, device=self.jt.device)
+        matrix.add_(self._apply_contact_blocks(blocks, self.schur))
+        if self.coupler._contact_schur_regularization:
+            matrix.diagonal().add_(self.coupler._contact_schur_regularization)
+        row_scale = matrix.abs().amax(dim=1).clamp_min_(torch.finfo(matrix.dtype).tiny)
+        lu, pivots = torch.linalg.lu_factor(matrix / row_scale[:, None])
+        return lu, pivots, row_scale
+
+    def _contact_solve(self, blocks, contact_rhs, factors):
+        lu, pivots, row_scale = factors
+        rhs = self._apply_contact_blocks(blocks, contact_rhs) / row_scale
+        solution = torch.linalg.lu_solve(lu, pivots, rhs[:, None])[:, 0]
+        return solution.to(contact_rhs.dtype)
+
+    def _inverse_a0(self, rhs):
+        if self._fem_compliance is None:
+            fem = self.fem.solve_sparse_direct_velocity_rhs_gpu(
+                0, rhs[: self.n_fem, None]
+            )[:, 0]
+        else:
+            fem = self._fem_compliance @ rhs[: self.n_fem]
+        mass = qd_to_torch(self.rigid._rigid_global_info.mass_mat, copy=False)[:, :, 0]
+        rigid = torch.linalg.solve(mass, rhs[self.n_fem :])
+        return torch.cat((fem, rigid), dim=0)
+
+    @qd.kernel
+    def _load_direction_for_true_residual(self):
+        for batch in range(self.coupler._B):
+            self.coupler.batch_pcg_active[batch] = self.coupler.batch_active[batch]
+        for batch, vertex in qd.ndrange(self.coupler._B, self.n_vertices):
+            self.coupler.pcg_fem_state_v[batch, vertex].p = self.coupler.pcg_fem_state_v[
+                batch, vertex
+            ].x
+        for batch, dof in qd.ndrange(self.coupler._B, self.n_dofs):
+            self.coupler.pcg_rigid_state_dof[batch, dof].p = self.coupler.pcg_rigid_state_dof[
+                batch, dof
+            ].x
+
+    @qd.kernel
+    def _compute_hessian_product(self, rigid_global_info: array_class.RigidGlobalInfo):
+        self.coupler.compute_pcg_matrix_vector_product(rigid_global_info=rigid_global_info)
+
+    def _store_direction(self, direction):
+        fem_x = qd_to_torch(self.coupler.pcg_fem_state_v.x, copy=False)
+        rigid_x = qd_to_torch(self.coupler.pcg_rigid_state_dof.x, copy=False)
+        fem_x[0].copy_(direction[: self.n_fem].reshape(self.n_vertices, 3))
+        rigid_x[0].copy_(direction[self.n_fem :])
+
+    def _true_residual(self, gradient, direction):
+        self._store_direction(direction)
+        torch.cuda.synchronize(direction.device)
+        self._load_direction_for_true_residual()
+        self._compute_hessian_product(rigid_global_info=self.rigid._rigid_global_info)
+        qd.sync()
+        fem_ap = qd_to_torch(self.coupler.pcg_fem_state_v.Ap, copy=False)[0].reshape(self.n_fem)
+        rigid_ap = qd_to_torch(self.coupler.pcg_rigid_state_dof.Ap, copy=False)[0]
+        return -gradient - torch.cat((fem_ap, rigid_ap), dim=0)
+
+    def solve(self, validate=False):
+        qd.sync()
+        gamma, blocks = self._pack_gamma_g()
+        fem_gradient = qd_to_torch(self.coupler.fem_state_v.gradient, copy=False)[0].reshape(
+            self.n_fem
+        )
+        rigid_gradient = qd_to_torch(self.coupler.rigid_state_dof.gradient, copy=False)[0]
+        gradient = torch.cat((fem_gradient, rigid_gradient), dim=0)
+        if self._fem_compliance is None:
+            fem_v = qd_to_torch(self.coupler.fem_state_v.v, copy=False)[0].reshape(self.n_fem)
+            rigid_v = qd_to_torch(self.coupler.rigid_state_dof.v, copy=False)[0]
+            velocity = torch.cat((fem_v, rigid_v), dim=0)
+            q = velocity - self.vbar - self.w @ gamma
+        else:
+            mass = qd_to_torch(self.rigid._rigid_global_info.mass_mat, copy=False)[:, :, 0]
+            q = torch.cat(
+                (
+                    self._fem_compliance @ fem_gradient,
+                    torch.linalg.solve(mass, rigid_gradient),
+                ),
+                dim=0,
+            )
+        factors = self._factor_contact_matrix(blocks)
+        correction = self.w @ self._contact_solve(
+            blocks, self._contact_velocity(q), factors
+        )
+        direction = -q + correction
+
+        if not validate:
+            self._store_direction(direction)
+            torch.cuda.synchronize(self.jt.device)
+            self.coupler.batch_pcg_active.fill(False)
+            self.coupler.pcg_state.rTr.fill(0.0)
+            self.coupler.pcg_state.rTz.fill(0.0)
+            return np.asarray([0.0]), np.asarray([True])
+
+        residual = self._true_residual(gradient, direction)
+        gradient_norm = torch.linalg.vector_norm(gradient)
+        threshold = (
+            self.coupler._contact_schur_true_residual_atol
+            + self.coupler._contact_schur_true_residual_rtol * gradient_norm
+        )
+        residual_norm = torch.linalg.vector_norm(residual)
+        for _ in range(self.coupler._contact_schur_max_refinement_steps):
+            if bool((residual_norm <= threshold).item()):
+                break
+            a0_inverse_residual = self._inverse_a0(residual)
+            contact_correction = self.w @ self._contact_solve(
+                blocks, self._contact_velocity(a0_inverse_residual), factors
+            )
+            direction = direction + a0_inverse_residual - contact_correction
+            residual = self._true_residual(gradient, direction)
+            residual_norm = torch.linalg.vector_norm(residual)
+        self._store_direction(direction)
+        converged_device = residual_norm <= threshold
+        torch.cuda.synchronize(self.jt.device)
+        transfer_start = time.perf_counter()
+        residual_value = float(residual_norm.detach().cpu())
+        converged_value = bool(converged_device.detach().cpu())
+        self.coupler._contact_schur_transfer_seconds += time.perf_counter() - transfer_start
+        self.coupler.batch_pcg_active.fill(False)
+        self.coupler.pcg_state.rTr.fill(residual_value * residual_value)
+        self.coupler.pcg_state.rTz.fill(residual_value * residual_value)
+        if not np.isfinite(residual_value):
+            raise RuntimeError(
+                "contact_schur produced a non-finite full-Hessian true residual after "
+                f"{self.coupler._contact_schur_max_refinement_steps} refinement steps"
+            )
+        return np.asarray([residual_value]), np.asarray([converged_value])
+
+
+@qd.data_oriented
+class EnrichedPCGPreconditioner:
+    """GPU-resident balanced coarse preconditioner for the accurate SAP Newton system."""
+
+    def __init__(self, coupler):
+        self.coupler = coupler
+        self.fem = coupler.fem_solver
+        self.rigid = coupler.rigid_solver
+        self._B = coupler._B
+        self.n_vertices = self.fem.n_vertices
+        self.n_dofs = self.rigid.n_dofs
+        weights, metadata = self.fem.get_material_connected_partition_of_unity(
+            max_partitions_per_component=coupler._enriched_max_partitions_per_component,
+            target_tets_per_partition=coupler._enriched_target_tets_per_partition,
+            smoothing_steps=coupler._enriched_pou_smoothing_steps,
+        )
+        self.n_partitions = int(weights.shape[0])
+        self.n_components = max(item.component_index for item in metadata) + 1
+        self.n_links = max(1, self.rigid.n_links)
+        enabled_links = tuple(
+            sorted(
+                {
+                    int(link_idx)
+                    for entry in coupler._rigid_fem_whitelist_receipt.entries
+                    if entry.collision_enabled
+                    for link_idx in entry.resolved_link_indices
+                }
+            )
+        ) if coupler._rigid_fem_whitelist_receipt is not None else ()
+        if not enabled_links and (coupler.rigid_fem_snap is not None or coupler._enable_rigid_fem_contact):
+            enabled_links = tuple(range(self.rigid.n_links))
+        self.response_link_indices = enabled_links
+        self.n_response_links = max(1, len(enabled_links))
+        link_slot = np.full((self.n_links,), -1, dtype=gs.np_int)
+        for slot, link_idx in enumerate(enabled_links):
+            link_slot[link_idx] = slot
+        self.link_slot = qd.field(gs.qd_int, shape=(self.n_links,), needs_grad=False)
+        self.link_slot.from_numpy(link_slot)
+        component_weights = np.zeros((self.n_components, self.n_vertices), dtype=np.float64)
+        for partition, item in zip(weights, metadata):
+            component_weights[item.component_index] += partition
+        vertex_component = np.argmax(component_weights, axis=0).astype(gs.np_int, copy=False)
+
+        self.partition_weights = qd.field(
+            gs.qd_float, shape=(self.n_partitions, self.n_vertices), needs_grad=False
+        )
+        self.partition_weights.from_numpy(np.asarray(weights, dtype=gs.np_float))
+        self.vertex_component = qd.field(gs.qd_int, shape=(self.n_vertices,), needs_grad=False)
+        self.vertex_component.from_numpy(vertex_component)
+        pair_index = np.zeros((self.n_components, self.n_components), dtype=gs.np_int)
+        pair = 0
+        for first in range(self.n_components):
+            for second in range(first, self.n_components):
+                pair_index[first, second] = pair_index[second, first] = pair
+                pair += 1
+        self.component_pair_index = qd.field(
+            gs.qd_int, shape=(self.n_components, self.n_components), needs_grad=False
+        )
+        self.component_pair_index.from_numpy(pair_index)
+
+        self.floor_tet = getattr(coupler, "fem_floor_tet_contact", None)
+        self.floor_vert = getattr(coupler, "fem_floor_vert_contact", None)
+        self.self_tet = getattr(coupler, "fem_self_tet_contact", None)
+        self.snap = coupler.rigid_fem_snap
+        self.native = getattr(coupler, "rigid_fem_contact", None)
+        self._has_floor_tet = self.floor_tet is not None
+        self._has_floor_vert = self.floor_vert is not None
+        self._has_self_tet = self.self_tet is not None
+        self._has_snap = self.snap is not None
+        self._has_native = self.native is not None
+
+        offset = 0
+        self._floor_tet_offset = offset
+        offset += self.n_components if self._has_floor_tet else 0
+        self._floor_vert_offset = offset
+        offset += self.n_components if self._has_floor_vert else 0
+        self._self_tet_offset = offset
+        offset += self.n_components * (self.n_components + 1) // 2 if self._has_self_tet else 0
+        self._snap_offset = offset
+        offset += self.n_components * self.n_response_links if self._has_snap else 0
+        self._native_offset = offset
+        offset += self.n_components * self.n_response_links if self._has_native else 0
+        self.n_response_groups = offset
+        self.n_response_columns = 6 * self.n_response_groups
+        self.n_geometry_columns = 6 * self.n_partitions
+        self.n_columns = max(1, self.n_geometry_columns + self.n_response_columns)
+        self._response_storage_columns = max(1, self.n_response_columns)
+
+        self.partition_mass = qd.field(gs.qd_float, shape=(self.n_partitions,), needs_grad=False)
+        masses = np.asarray(self.fem.elements_v_info.mass.to_numpy(), dtype=np.float64)
+        self.partition_mass.from_numpy(np.asarray(weights @ masses, dtype=gs.np_float))
+        self.partition_centroid = qd.field(
+            gs.qd_vec3, shape=(self._B, self.n_partitions), needs_grad=False
+        )
+        self.response_count = qd.field(
+            gs.qd_int, shape=(self._B, max(1, self.n_response_groups)), needs_grad=False
+        )
+        self.response_centroid = qd.field(
+            gs.qd_vec3, shape=(self._B, max(1, self.n_response_groups)), needs_grad=False
+        )
+        self.response_radius = qd.field(
+            gs.qd_float, shape=(self._B, max(1, self.n_response_groups)), needs_grad=False
+        )
+        self.response_active = qd.field(
+            gs.qd_bool, shape=(self._B, max(1, self.n_response_groups)), needs_grad=False
+        )
+        self.response_rhs_fem = qd.field(
+            gs.qd_vec3,
+            shape=(self._B, self.n_vertices, self._response_storage_columns),
+            needs_grad=False,
+        )
+        self.response_rhs_rigid = qd.field(
+            gs.qd_float,
+            shape=(self._B, self.n_dofs, self._response_storage_columns),
+            needs_grad=False,
+        )
+        self.response_solution_fem = qd.field(
+            gs.qd_vec3,
+            shape=(self._B, self.n_vertices, self._response_storage_columns),
+            needs_grad=False,
+        )
+
+        basis_shape_fem = (self._B, self.n_vertices, self.n_columns)
+        basis_shape_rigid = (self._B, self.n_dofs, self.n_columns)
+        self.raw_fem = qd.field(gs.qd_vec3, shape=basis_shape_fem, needs_grad=False)
+        self.raw_rigid = qd.field(gs.qd_float, shape=basis_shape_rigid, needs_grad=False)
+        self.z_fem = qd.field(gs.qd_vec3, shape=basis_shape_fem, needs_grad=False)
+        self.z_rigid = qd.field(gs.qd_float, shape=basis_shape_rigid, needs_grad=False)
+        self.hz_fem = qd.field(gs.qd_vec3, shape=basis_shape_fem, needs_grad=False)
+        self.hz_rigid = qd.field(gs.qd_float, shape=basis_shape_rigid, needs_grad=False)
+        matrix_shape = (self._B, self.n_columns, self.n_columns)
+        self.gram = qd.field(gs.qd_float, shape=matrix_shape, needs_grad=False)
+        self.transform = qd.field(gs.qd_float, shape=matrix_shape, needs_grad=False)
+        self.coarse_matrix = qd.field(gs.qd_float, shape=matrix_shape, needs_grad=False)
+        self.coarse_cholesky = qd.field(gs.qd_float, shape=matrix_shape, needs_grad=False)
+        self.rank = qd.field(gs.qd_int, shape=(self._B,), needs_grad=False)
+
+        self.coarse_rhs = qd.field(
+            gs.qd_float, shape=(self._B, self.n_columns), needs_grad=False
+        )
+        self.coarse_rhs2 = qd.field(
+            gs.qd_float, shape=(self._B, self.n_columns), needs_grad=False
+        )
+        self.coarse_tmp = qd.field(
+            gs.qd_float, shape=(self._B, self.n_columns), needs_grad=False
+        )
+        self.coarse_a = qd.field(gs.qd_float, shape=(self._B, self.n_columns), needs_grad=False)
+        self.coarse_b = qd.field(gs.qd_float, shape=(self._B, self.n_columns), needs_grad=False)
+        self.scratch_t_fem = qd.field(
+            gs.qd_vec3, shape=(self._B, self.n_vertices), needs_grad=False
+        )
+        self.scratch_s_fem = qd.field(
+            gs.qd_vec3, shape=(self._B, self.n_vertices), needs_grad=False
+        )
+        self.scratch_t_rigid = qd.field(
+            gs.qd_float, shape=(self._B, self.n_dofs), needs_grad=False
+        )
+        self.scratch_s_rigid = qd.field(
+            gs.qd_float, shape=(self._B, self.n_dofs), needs_grad=False
+        )
+        self.iterations = qd.field(gs.qd_int, shape=(self._B,), needs_grad=False)
+        self.geometry_columns_by_batch = (0,) * self._B
+        self.response_columns_by_batch = (0,) * self._B
+        self.retained_columns_by_batch = (0,) * self._B
+
+    @qd.func
+    def _tet_component(self, element, weights):
+        corner = 0
+        largest = qd.abs(weights[0])
+        for local in qd.static(range(1, 4)):
+            candidate = qd.abs(weights[local])
+            if candidate > largest:
+                largest = candidate
+                corner = local
+        return self.vertex_component[self.fem.elements_i[element].el2v[corner]]
+
+    @qd.func
+    def _accumulate_group_point(self, batch, group, point):
+        self.response_count[batch, group] += 1
+        self.response_centroid[batch, group] += point
+
+    @qd.kernel
+    def _refresh_response_group_centroids(self):
+        self.response_count.fill(0)
+        self.response_centroid.fill(0.0)
+        if qd.static(self._has_floor_tet):
+            for row in range(self.floor_tet.n_contact_pairs[None]):
+                pair = self.floor_tet.contact_pairs[row]
+                component = self._tet_component(pair.geom_idx, pair.barycentric)
+                self._accumulate_group_point(
+                    pair.batch_idx, self._floor_tet_offset + component, pair.contact_pos
+                )
+        if qd.static(self._has_floor_vert):
+            for row in range(self.floor_vert.n_contact_pairs[None]):
+                pair = self.floor_vert.contact_pairs[row]
+                component = self.vertex_component[pair.geom_idx]
+                self._accumulate_group_point(
+                    pair.batch_idx, self._floor_vert_offset + component, pair.contact_pos
+                )
+        if qd.static(self._has_self_tet):
+            for row in range(self.self_tet.n_contact_pairs[None]):
+                pair = self.self_tet.contact_pairs[row]
+                first = self._tet_component(pair.geom_idx0, pair.barycentric0)
+                second = self._tet_component(pair.geom_idx1, pair.barycentric1)
+                group = self._self_tet_offset + self.component_pair_index[first, second]
+                self._accumulate_group_point(pair.batch_idx, group, pair.contact_pos)
+        if qd.static(self._has_snap):
+            for row in range(self.snap.n_contact_pairs[None]):
+                pair = self.snap.contact_pairs[row]
+                component = self.vertex_component[pair.vertex_idx]
+                group = self._snap_offset + component * self.n_response_links + self.link_slot[pair.link_idx]
+                self._accumulate_group_point(pair.batch_idx, group, pair.contact_pos)
+        if qd.static(self._has_native):
+            for row in range(self.native.n_contact_pairs[None]):
+                pair = self.native.contact_pairs[row]
+                component = self._tet_component(pair.geom_idx0, pair.mechanical_weights0)
+                group = self._native_offset + component * self.n_response_links + self.link_slot[pair.link_idx]
+                self._accumulate_group_point(pair.batch_idx, group, pair.contact_pos)
+        for batch, group in qd.ndrange(self._B, self.n_response_groups):
+            count = self.response_count[batch, group]
+            self.response_active[batch, group] = count > 0
+            if count > 0:
+                self.response_centroid[batch, group] /= count
+
+    @qd.func
+    def _accumulate_group_radius(self, batch, group, point):
+        delta = point - self.response_centroid[batch, group]
+        self.response_radius[batch, group] += delta.norm_sqr()
+
+    @qd.kernel
+    def _refresh_response_group_radii(self):
+        self.response_radius.fill(0.0)
+        if qd.static(self._has_floor_tet):
+            for row in range(self.floor_tet.n_contact_pairs[None]):
+                pair = self.floor_tet.contact_pairs[row]
+                component = self._tet_component(pair.geom_idx, pair.barycentric)
+                self._accumulate_group_radius(
+                    pair.batch_idx, self._floor_tet_offset + component, pair.contact_pos
+                )
+        if qd.static(self._has_floor_vert):
+            for row in range(self.floor_vert.n_contact_pairs[None]):
+                pair = self.floor_vert.contact_pairs[row]
+                component = self.vertex_component[pair.geom_idx]
+                self._accumulate_group_radius(
+                    pair.batch_idx, self._floor_vert_offset + component, pair.contact_pos
+                )
+        if qd.static(self._has_self_tet):
+            for row in range(self.self_tet.n_contact_pairs[None]):
+                pair = self.self_tet.contact_pairs[row]
+                first = self._tet_component(pair.geom_idx0, pair.barycentric0)
+                second = self._tet_component(pair.geom_idx1, pair.barycentric1)
+                group = self._self_tet_offset + self.component_pair_index[first, second]
+                self._accumulate_group_radius(pair.batch_idx, group, pair.contact_pos)
+        if qd.static(self._has_snap):
+            for row in range(self.snap.n_contact_pairs[None]):
+                pair = self.snap.contact_pairs[row]
+                component = self.vertex_component[pair.vertex_idx]
+                group = self._snap_offset + component * self.n_response_links + self.link_slot[pair.link_idx]
+                self._accumulate_group_radius(pair.batch_idx, group, pair.contact_pos)
+        if qd.static(self._has_native):
+            for row in range(self.native.n_contact_pairs[None]):
+                pair = self.native.contact_pairs[row]
+                component = self._tet_component(pair.geom_idx0, pair.mechanical_weights0)
+                group = self._native_offset + component * self.n_response_links + self.link_slot[pair.link_idx]
+                self._accumulate_group_radius(pair.batch_idx, group, pair.contact_pos)
+        for batch, group in qd.ndrange(self._B, self.n_response_groups):
+            count = self.response_count[batch, group]
+            if count > 0:
+                self.response_radius[batch, group] = qd.sqrt(
+                    self.response_radius[batch, group] / count + 1.0e-24
+                )
+
+    @qd.func
+    def _response_world_value(self, batch, group, mode, point):
+        # ``mode`` is specialized by static callers.  Avoid indexing a local
+        # length-three vector with both ``mode`` and ``mode - 3``: Quadrants'
+        # scalarizer still visits the inactive branch and treats its constant
+        # out-of-range index as an invalid alloca offset.
+        axis = qd.Vector([1.0, 0.0, 0.0], dt=gs.qd_float)
+        if mode == 1 or mode == 4:
+            axis = qd.Vector([0.0, 1.0, 0.0], dt=gs.qd_float)
+        elif mode == 2 or mode == 5:
+            axis = qd.Vector([0.0, 0.0, 1.0], dt=gs.qd_float)
+        value = axis
+        if mode >= 3:
+            radius = qd.max(self.response_radius[batch, group], 1.0e-12)
+            value = axis.cross(point - self.response_centroid[batch, group]) / radius
+        return value
+
+    @qd.func
+    def _add_floor_tet_response(self, row, group):
+        pair = self.floor_tet.contact_pairs[row]
+        for mode in qd.static(range(6)):
+            column = 6 * group + mode
+            value = self._response_world_value(pair.batch_idx, group, mode, pair.contact_pos)
+            for local in qd.static(range(4)):
+                vertex = self.fem.elements_i[pair.geom_idx].el2v[local]
+                if qd.static(self.fem._enable_vertex_constraints):
+                    if not self.fem.vertex_constraints.is_constrained[vertex, pair.batch_idx]:
+                        self.response_rhs_fem[pair.batch_idx, vertex, column] += pair.barycentric[local] * value
+                else:
+                    self.response_rhs_fem[pair.batch_idx, vertex, column] += pair.barycentric[local] * value
+
+    @qd.kernel
+    def _build_response_rhs(self):
+        self.response_rhs_fem.fill(0.0)
+        self.response_rhs_rigid.fill(0.0)
+        if qd.static(self._has_floor_tet):
+            for row in range(self.floor_tet.n_contact_pairs[None]):
+                pair = self.floor_tet.contact_pairs[row]
+                component = self._tet_component(pair.geom_idx, pair.barycentric)
+                self._add_floor_tet_response(row, self._floor_tet_offset + component)
+        if qd.static(self._has_floor_vert):
+            for row in range(self.floor_vert.n_contact_pairs[None]):
+                pair = self.floor_vert.contact_pairs[row]
+                group = self._floor_vert_offset + self.vertex_component[pair.geom_idx]
+                for mode in qd.static(range(6)):
+                    column = 6 * group + mode
+                    value = self._response_world_value(pair.batch_idx, group, mode, pair.contact_pos)
+                    if qd.static(self.fem._enable_vertex_constraints):
+                        if not self.fem.vertex_constraints.is_constrained[pair.geom_idx, pair.batch_idx]:
+                            self.response_rhs_fem[pair.batch_idx, pair.geom_idx, column] += value
+                    else:
+                        self.response_rhs_fem[pair.batch_idx, pair.geom_idx, column] += value
+        if qd.static(self._has_self_tet):
+            for row in range(self.self_tet.n_contact_pairs[None]):
+                pair = self.self_tet.contact_pairs[row]
+                first = self._tet_component(pair.geom_idx0, pair.barycentric0)
+                second = self._tet_component(pair.geom_idx1, pair.barycentric1)
+                group = self._self_tet_offset + self.component_pair_index[first, second]
+                for mode in qd.static(range(6)):
+                    column = 6 * group + mode
+                    value = self._response_world_value(pair.batch_idx, group, mode, pair.contact_pos)
+                    for local in qd.static(range(4)):
+                        vertex0 = self.fem.elements_i[pair.geom_idx0].el2v[local]
+                        vertex1 = self.fem.elements_i[pair.geom_idx1].el2v[local]
+                        if qd.static(self.fem._enable_vertex_constraints):
+                            if not self.fem.vertex_constraints.is_constrained[vertex0, pair.batch_idx]:
+                                self.response_rhs_fem[pair.batch_idx, vertex0, column] += pair.barycentric0[local] * value
+                            if not self.fem.vertex_constraints.is_constrained[vertex1, pair.batch_idx]:
+                                self.response_rhs_fem[pair.batch_idx, vertex1, column] -= pair.barycentric1[local] * value
+                        else:
+                            self.response_rhs_fem[pair.batch_idx, vertex0, column] += pair.barycentric0[local] * value
+                            self.response_rhs_fem[pair.batch_idx, vertex1, column] -= pair.barycentric1[local] * value
+        if qd.static(self._has_snap):
+            for row in range(self.snap.n_contact_pairs[None]):
+                pair = self.snap.contact_pairs[row]
+                component = self.vertex_component[pair.vertex_idx]
+                group = self._snap_offset + component * self.n_response_links + self.link_slot[pair.link_idx]
+                for mode in qd.static(range(6)):
+                    column = 6 * group + mode
+                    value = self._response_world_value(pair.batch_idx, group, mode, pair.contact_pos)
+                    self.response_rhs_fem[pair.batch_idx, pair.vertex_idx, column] += value
+                    for dof in range(self.n_dofs):
+                        self.response_rhs_rigid[pair.batch_idx, dof, column] -= self.snap.Jt[row, dof].dot(value)
+        if qd.static(self._has_native):
+            for row in range(self.native.n_contact_pairs[None]):
+                pair = self.native.contact_pairs[row]
+                component = self._tet_component(pair.geom_idx0, pair.mechanical_weights0)
+                group = self._native_offset + component * self.n_response_links + self.link_slot[pair.link_idx]
+                for mode in qd.static(range(6)):
+                    column = 6 * group + mode
+                    value = self._response_world_value(pair.batch_idx, group, mode, pair.contact_pos)
+                    for local in qd.static(range(4)):
+                        vertex = self.fem.elements_i[pair.geom_idx0].el2v[local]
+                        self.response_rhs_fem[pair.batch_idx, vertex, column] += (
+                            pair.mechanical_weights0[local] * value
+                        )
+                    support_start = self.native.link_support_offsets[pair.link_idx]
+                    support_end = self.native.link_support_offsets[pair.link_idx + 1]
+                    for support_index in range(support_start, support_end):
+                        slot = support_index - support_start
+                        dof = self.native.link_support_dofs[support_index]
+                        self.response_rhs_rigid[pair.batch_idx, dof, column] -= (
+                            self.native.J_rigid[row, slot].dot(value)
+                        )
+
+    @qd.kernel
+    def _refresh_geometry_raw_basis(self, i_step: qd.i32):
+        self.raw_fem.fill(0.0)
+        self.raw_rigid.fill(0.0)
+        self.partition_centroid.fill(0.0)
+        for batch, partition, vertex in qd.ndrange(self._B, self.n_partitions, self.n_vertices):
+            weight = self.partition_weights[partition, vertex]
+            self.partition_centroid[batch, partition] += (
+                weight
+                * self.fem.elements_v_info[vertex].mass
+                * self.fem.elements_v[i_step + 1, vertex, batch].pos
+                / self.partition_mass[partition]
+            )
+        for batch, partition, vertex, mode in qd.ndrange(
+            self._B, self.n_partitions, self.n_vertices, 6
+        ):
+            constrained = False
+            if qd.static(self.fem._enable_vertex_constraints):
+                constrained = self.fem.vertex_constraints.is_constrained[vertex, batch]
+            if not constrained:
+                axis = qd.Vector.zero(gs.qd_float, 3)
+                value = qd.Vector.zero(gs.qd_float, 3)
+                weight = self.partition_weights[partition, vertex]
+                if mode < 3:
+                    axis[mode] = 1.0
+                    value = weight * axis
+                else:
+                    axis[mode - 3] = 1.0
+                    value = weight * axis.cross(
+                        self.fem.elements_v[i_step + 1, vertex, batch].pos
+                        - self.partition_centroid[batch, partition]
+                    )
+                self.raw_fem[batch, vertex, 6 * partition + mode] = value
+
+    @qd.kernel
+    def _load_response_rigid_rhs(self, column: qd.i32):
+        group = column // 6
+        for batch in range(self._B):
+            self.coupler.batch_pcg_active[batch] = self.response_active[batch, group]
+        for batch, dof in qd.ndrange(self._B, self.n_dofs):
+            self.coupler.pcg_rigid_state_dof[batch, dof].r = self.response_rhs_rigid[
+                batch, dof, column
+            ]
+
+    @qd.kernel
+    def _store_response_rigid_solution(self, column: qd.i32):
+        raw_column = self.n_geometry_columns + column
+        for batch, dof in qd.ndrange(self._B, self.n_dofs):
+            self.raw_rigid[batch, dof, raw_column] = self.coupler.pcg_rigid_state_dof[
+                batch, dof
+            ].z
+
+    @qd.kernel
+    def _solve_loaded_response_rigid_rhs(
+        self, entities_info: array_class.EntitiesInfo, rigid_global_info: array_class.RigidGlobalInfo
+    ):
+        self.coupler.rigid_solve_pcg(
+            self.coupler.pcg_rigid_state_dof.r,
+            self.coupler.pcg_rigid_state_dof.z,
+            entities_info=entities_info,
+            rigid_global_info=rigid_global_info,
+        )
+
+    @qd.kernel
+    def _merge_response_fem_solution(self):
+        for batch, vertex, column in qd.ndrange(
+            self._B, self.n_vertices, self.n_response_columns
+        ):
+            self.raw_fem[batch, vertex, self.n_geometry_columns + column] = (
+                self.response_solution_fem[batch, vertex, column]
+            )
+
+    @qd.kernel
+    def _compute_gram(self):
+        self.gram.fill(0.0)
+        for batch, row, column, vertex in qd.ndrange(
+            self._B, self.n_columns, self.n_columns, self.n_vertices
+        ):
+            self.gram[batch, row, column] += self.raw_fem[batch, vertex, row].dot(
+                self.raw_fem[batch, vertex, column]
+            )
+        for batch, row, column, dof in qd.ndrange(
+            self._B, self.n_columns, self.n_columns, self.n_dofs
+        ):
+            self.gram[batch, row, column] += (
+                self.raw_rigid[batch, dof, row] * self.raw_rigid[batch, dof, column]
+            )
+
+    @qd.kernel
+    def _form_orthonormal_basis(self):
+        self.z_fem.fill(0.0)
+        self.z_rigid.fill(0.0)
+        for batch, vertex, column, raw_column in qd.ndrange(
+            self._B, self.n_vertices, self.n_columns, self.n_columns
+        ):
+            if column < self.rank[batch]:
+                self.z_fem[batch, vertex, column] += (
+                    self.raw_fem[batch, vertex, raw_column]
+                    * self.transform[batch, raw_column, column]
+                )
+        for batch, dof, column, raw_column in qd.ndrange(
+            self._B, self.n_dofs, self.n_columns, self.n_columns
+        ):
+            if column < self.rank[batch]:
+                self.z_rigid[batch, dof, column] += (
+                    self.raw_rigid[batch, dof, raw_column]
+                    * self.transform[batch, raw_column, column]
+                )
+
+    def refresh(self, i_step):
+        unsupported_snap_links = {
+            int(row["rigid_link_idx"])
+            for row in (self.snap.bindings if self.snap is not None else ())
+            if int(row["rigid_link_idx"]) not in self.response_link_indices
+        }
+        if unsupported_snap_links:
+            raise RuntimeError(
+                "enriched_pcg response basis has no topology slot for active snap links "
+                f"{sorted(unsupported_snap_links)}"
+            )
+        self._refresh_geometry_raw_basis(i_step)
+        active = np.zeros((self._B, max(1, self.n_response_groups)), dtype=np.bool_)
+        if self.n_response_groups:
+            self._refresh_response_group_centroids()
+            self._refresh_response_group_radii()
+            self._build_response_rhs()
+            transfer_start = time.perf_counter()
+            active = np.asarray(self.response_active.to_numpy(), dtype=np.bool_)
+            rhs_device = qd_to_torch(self.response_rhs_fem, copy=False)
+            solution_device = qd_to_torch(self.response_solution_fem, copy=False)
+            solution_device.zero_()
+            self.coupler._enriched_transfer_seconds += time.perf_counter() - transfer_start
+            for batch in range(self._B):
+                columns = np.repeat(active[batch, : self.n_response_groups], 6)
+                active_columns = np.flatnonzero(columns)
+                if active_columns.size:
+                    device_columns = torch.as_tensor(
+                        active_columns, dtype=torch.long, device=rhs_device.device
+                    )
+                    transfer_start = time.perf_counter()
+                    packed_rhs = (
+                        rhs_device[batch, :, device_columns, :]
+                        .permute(0, 2, 1)
+                        .reshape(3 * self.n_vertices, active_columns.size)
+                        .detach()
+                        .cpu()
+                        .numpy()
+                    )
+                    self.coupler._enriched_transfer_seconds += time.perf_counter() - transfer_start
+                    packed_solution = self.fem.solve_sparse_direct_velocity_rhs(batch, packed_rhs)
+                    packed_solution = packed_solution.reshape(
+                        self.n_vertices, 3, active_columns.size
+                    ).transpose(0, 2, 1).copy()
+                    transfer_start = time.perf_counter()
+                    solution_device[batch, :, device_columns, :] = torch.as_tensor(
+                        packed_solution,
+                        dtype=solution_device.dtype,
+                        device=solution_device.device,
+                    )
+                    self.coupler._enriched_transfer_seconds += time.perf_counter() - transfer_start
+            active_response_columns = np.flatnonzero(
+                np.any(np.repeat(active[:, : self.n_response_groups], 6, axis=1), axis=0)
+            )
+            for column in active_response_columns:
+                column = int(column)
+                self._load_response_rigid_rhs(column)
+                self._solve_loaded_response_rigid_rhs(
+                    entities_info=self.rigid.entities_info,
+                    rigid_global_info=self.rigid._rigid_global_info,
+                )
+                self._store_response_rigid_solution(column)
+            self._merge_response_fem_solution()
+
+        self._compute_gram()
+        transfer_start = time.perf_counter()
+        gram = np.asarray(self.gram.to_numpy(), dtype=np.float64)
+        self.coupler._enriched_transfer_seconds += time.perf_counter() - transfer_start
+        transform = np.zeros_like(gram)
+        ranks = np.zeros(self._B, dtype=gs.np_int)
+        for batch in range(self._B):
+            symmetric = 0.5 * (gram[batch] + gram[batch].T)
+            eigenvalues, eigenvectors = np.linalg.eigh(symmetric)
+            maximum = float(np.max(eigenvalues, initial=0.0))
+            cutoff = max(
+                self.coupler._enriched_qr_rtol * maximum,
+                np.finfo(np.float64).eps * max(1.0, maximum),
+            )
+            keep = eigenvalues > cutoff
+            retained = np.flatnonzero(keep)
+            ranks[batch] = retained.size
+            if retained.size:
+                retained = retained[::-1]
+                transform[batch, :, : retained.size] = (
+                    eigenvectors[:, retained] / np.sqrt(eigenvalues[retained])[None, :]
+                )
+        transfer_start = time.perf_counter()
+        self.transform.from_numpy(np.asarray(transform, dtype=gs.np_float))
+        self.rank.from_numpy(ranks)
+        self.coupler._enriched_transfer_seconds += time.perf_counter() - transfer_start
+        self._form_orthonormal_basis()
+        self.geometry_columns_by_batch = (self.n_geometry_columns,) * self._B
+        self.response_columns_by_batch = tuple(
+            int(6 * np.count_nonzero(active[batch, : self.n_response_groups]))
+            for batch in range(self._B)
+        )
+        self.retained_columns_by_batch = tuple(int(value) for value in ranks)
+
+    @qd.kernel
+    def _load_basis_column(self, column: qd.i32):
+        for batch in range(self._B):
+            self.coupler.batch_pcg_active[batch] = (
+                self.coupler.batch_active[batch] and column < self.rank[batch]
+            )
+        for batch, vertex in qd.ndrange(self._B, self.n_vertices):
+            self.coupler.pcg_fem_state_v[batch, vertex].p = self.z_fem[batch, vertex, column]
+        for batch, dof in qd.ndrange(self._B, self.n_dofs):
+            self.coupler.pcg_rigid_state_dof[batch, dof].p = self.z_rigid[batch, dof, column]
+
+    @qd.kernel
+    def _store_hz_column(self, column: qd.i32):
+        for batch, vertex in qd.ndrange(self._B, self.n_vertices):
+            if self.coupler.batch_pcg_active[batch]:
+                self.hz_fem[batch, vertex, column] = self.coupler.pcg_fem_state_v[
+                    batch, vertex
+                ].Ap
+        for batch, dof in qd.ndrange(self._B, self.n_dofs):
+            if self.coupler.batch_pcg_active[batch]:
+                self.hz_rigid[batch, dof, column] = self.coupler.pcg_rigid_state_dof[
+                    batch, dof
+                ].Ap
+
+    @qd.kernel
+    def _compute_hessian_product(self, rigid_global_info: array_class.RigidGlobalInfo):
+        self.coupler.compute_pcg_matrix_vector_product(rigid_global_info=rigid_global_info)
+
+    @qd.kernel
+    def _compute_coarse_matrix(self):
+        self.coarse_matrix.fill(0.0)
+        for batch, row, column, vertex in qd.ndrange(
+            self._B, self.n_columns, self.n_columns, self.n_vertices
+        ):
+            if row < self.rank[batch] and column < self.rank[batch]:
+                self.coarse_matrix[batch, row, column] += self.z_fem[
+                    batch, vertex, row
+                ].dot(self.hz_fem[batch, vertex, column])
+        for batch, row, column, dof in qd.ndrange(
+            self._B, self.n_columns, self.n_columns, self.n_dofs
+        ):
+            if row < self.rank[batch] and column < self.rank[batch]:
+                self.coarse_matrix[batch, row, column] += (
+                    self.z_rigid[batch, dof, row] * self.hz_rigid[batch, dof, column]
+                )
+
+    def prepare_hessian(self):
+        self.hz_fem.fill(0.0)
+        self.hz_rigid.fill(0.0)
+        for column in range(max(self.retained_columns_by_batch, default=0)):
+            self._load_basis_column(column)
+            self._compute_hessian_product(rigid_global_info=self.rigid._rigid_global_info)
+            self._store_hz_column(column)
+        self._compute_coarse_matrix()
+        transfer_start = time.perf_counter()
+        coarse = np.asarray(self.coarse_matrix.to_numpy(), dtype=np.float64)
+        self.coupler._enriched_transfer_seconds += time.perf_counter() - transfer_start
+        factors = np.zeros_like(coarse)
+        for batch, rank in enumerate(self.retained_columns_by_batch):
+            factors[batch] = np.eye(self.n_columns)
+            if rank:
+                matrix = 0.5 * (coarse[batch, :rank, :rank] + coarse[batch, :rank, :rank].T)
+                floor = np.finfo(np.float64).eps * max(1.0, float(np.trace(matrix)) / rank)
+                factors[batch, :rank, :rank] = np.linalg.cholesky(
+                    matrix + floor * np.eye(rank)
+                )
+        transfer_start = time.perf_counter()
+        self.coarse_cholesky.from_numpy(np.asarray(factors, dtype=gs.np_float))
+        self.coupler._enriched_transfer_seconds += time.perf_counter() - transfer_start
+
+    @qd.kernel
+    def _capture_initial_residual(self):
+        self.iterations.fill(0)
+        for batch in range(self._B):
+            self.coupler._enriched_pcg_initial_rTr[batch] = self.coupler.pcg_state[batch].rTr
+
+    @qd.func
+    def _solve_coarse(self, rhs, result):
+        for batch in range(self._B):
+            if not self.coupler.batch_pcg_active[batch]:
+                continue
+            for row in range(self.n_columns):
+                if row < self.rank[batch]:
+                    value = rhs[batch, row]
+                    for column in range(row):
+                        value -= self.coarse_cholesky[batch, row, column] * self.coarse_tmp[
+                            batch, column
+                        ]
+                    self.coarse_tmp[batch, row] = value / self.coarse_cholesky[
+                        batch, row, row
+                    ]
+            for reverse_row in range(self.n_columns):
+                row = self.n_columns - 1 - reverse_row
+                if row < self.rank[batch]:
+                    value = self.coarse_tmp[batch, row]
+                    for column in range(row + 1, self.n_columns):
+                        if column < self.rank[batch]:
+                            value -= self.coarse_cholesky[batch, column, row] * result[
+                                batch, column
+                            ]
+                    result[batch, row] = value / self.coarse_cholesky[batch, row, row]
+
+    @qd.kernel
+    def _balanced_begin(self):
+        self.coarse_rhs.fill(0.0)
+        self.coarse_a.fill(0.0)
+        self.coarse_tmp.fill(0.0)
+        for batch, column, vertex in qd.ndrange(self._B, self.n_columns, self.n_vertices):
+            if self.coupler.batch_pcg_active[batch] and column < self.rank[batch]:
+                self.coarse_rhs[batch, column] += self.z_fem[batch, vertex, column].dot(
+                    self.coupler.pcg_fem_state_v[batch, vertex].r
+                )
+        for batch, column, dof in qd.ndrange(self._B, self.n_columns, self.n_dofs):
+            if self.coupler.batch_pcg_active[batch] and column < self.rank[batch]:
+                self.coarse_rhs[batch, column] += (
+                    self.z_rigid[batch, dof, column]
+                    * self.coupler.pcg_rigid_state_dof[batch, dof].r
+                )
+        self._solve_coarse(self.coarse_rhs, self.coarse_a)
+
+    @qd.kernel
+    def _balanced_form_fine_residual(self):
+        for batch, vertex in qd.ndrange(self._B, self.n_vertices):
+            if self.coupler.batch_pcg_active[batch]:
+                value = self.coupler.pcg_fem_state_v[batch, vertex].r
+                for column in range(self.n_columns):
+                    if column < self.rank[batch]:
+                        value -= self.hz_fem[batch, vertex, column] * self.coarse_a[
+                            batch, column
+                        ]
+                self.scratch_t_fem[batch, vertex] = value
+                self.scratch_s_fem[batch, vertex] = (
+                    self.coupler.pcg_fem_state_v[batch, vertex].prec @ value
+                )
+        for batch, dof in qd.ndrange(self._B, self.n_dofs):
+            if self.coupler.batch_pcg_active[batch]:
+                value = self.coupler.pcg_rigid_state_dof[batch, dof].r
+                for column in range(self.n_columns):
+                    if column < self.rank[batch]:
+                        value -= self.hz_rigid[batch, dof, column] * self.coarse_a[
+                            batch, column
+                        ]
+                self.scratch_t_rigid[batch, dof] = value
+
+    @qd.kernel
+    def _balanced_finish(self):
+        self.coarse_rhs2.fill(0.0)
+        self.coarse_b.fill(0.0)
+        self.coarse_tmp.fill(0.0)
+        for batch, column, vertex in qd.ndrange(self._B, self.n_columns, self.n_vertices):
+            if self.coupler.batch_pcg_active[batch] and column < self.rank[batch]:
+                self.coarse_rhs2[batch, column] += self.hz_fem[
+                    batch, vertex, column
+                ].dot(self.scratch_s_fem[batch, vertex])
+        for batch, column, dof in qd.ndrange(self._B, self.n_columns, self.n_dofs):
+            if self.coupler.batch_pcg_active[batch] and column < self.rank[batch]:
+                self.coarse_rhs2[batch, column] += (
+                    self.hz_rigid[batch, dof, column] * self.scratch_s_rigid[batch, dof]
+                )
+        self._solve_coarse(self.coarse_rhs2, self.coarse_b)
+        for batch, vertex in qd.ndrange(self._B, self.n_vertices):
+            if self.coupler.batch_pcg_active[batch]:
+                value = self.scratch_s_fem[batch, vertex]
+                for column in range(self.n_columns):
+                    if column < self.rank[batch]:
+                        value += self.z_fem[batch, vertex, column] * (
+                            self.coarse_a[batch, column] - self.coarse_b[batch, column]
+                        )
+                self.coupler.pcg_fem_state_v[batch, vertex].z = value
+        for batch, dof in qd.ndrange(self._B, self.n_dofs):
+            if self.coupler.batch_pcg_active[batch]:
+                value = self.scratch_s_rigid[batch, dof]
+                for column in range(self.n_columns):
+                    if column < self.rank[batch]:
+                        value += self.z_rigid[batch, dof, column] * (
+                            self.coarse_a[batch, column] - self.coarse_b[batch, column]
+                        )
+                self.coupler.pcg_rigid_state_dof[batch, dof].z = value
+
+    @qd.kernel
+    def _solve_balanced_rigid_residual(
+        self, entities_info: array_class.EntitiesInfo, rigid_global_info: array_class.RigidGlobalInfo
+    ):
+        self.coupler.rigid_solve_pcg(
+            self.scratch_t_rigid,
+            self.scratch_s_rigid,
+            entities_info=entities_info,
+            rigid_global_info=rigid_global_info,
+        )
+
+    def apply(self):
+        self._balanced_begin()
+        self._balanced_form_fine_residual()
+        self._solve_balanced_rigid_residual(
+            entities_info=self.rigid.entities_info,
+            rigid_global_info=self.rigid._rigid_global_info,
+        )
+        self._balanced_finish()
+
+    @qd.kernel
+    def _increment_iterations(self):
+        for batch in range(self._B):
+            if self.coupler.batch_pcg_active[batch]:
+                self.iterations[batch] += 1
+
+    @qd.kernel
+    def _load_solution_for_true_residual(self):
+        for batch in range(self._B):
+            self.coupler.batch_pcg_active[batch] = self.coupler.batch_active[batch]
+        for batch, vertex in qd.ndrange(self._B, self.n_vertices):
+            self.coupler.pcg_fem_state_v[batch, vertex].p = self.coupler.pcg_fem_state_v[
+                batch, vertex
+            ].x
+        for batch, dof in qd.ndrange(self._B, self.n_dofs):
+            self.coupler.pcg_rigid_state_dof[batch, dof].p = self.coupler.pcg_rigid_state_dof[
+                batch, dof
+            ].x
+
+    @qd.kernel
+    def _finish_true_residual(self):
+        for batch in range(self._B):
+            if self.coupler.batch_active[batch]:
+                self.coupler.pcg_state[batch].rTr = 0.0
+        for batch, vertex in qd.ndrange(self._B, self.n_vertices):
+            if self.coupler.batch_active[batch]:
+                residual = -self.coupler.fem_state_v[batch, vertex].gradient - self.coupler.pcg_fem_state_v[
+                    batch, vertex
+                ].Ap
+                self.coupler.pcg_state[batch].rTr += residual.norm_sqr()
+        for batch, dof in qd.ndrange(self._B, self.n_dofs):
+            if self.coupler.batch_active[batch]:
+                residual = -self.coupler.rigid_state_dof[batch, dof].gradient - self.coupler.pcg_rigid_state_dof[
+                    batch, dof
+                ].Ap
+                self.coupler.pcg_state[batch].rTr += residual * residual
+        for batch in range(self._B):
+            if self.coupler.batch_active[batch]:
+                threshold = self.coupler._enriched_pcg_initial_rTr[batch] * (
+                    self.coupler._enriched_pcg_rtol**2
+                )
+                self.coupler.batch_pcg_active[batch] = self.coupler.pcg_state[batch].rTr > threshold
+                self.coupler.pcg_state[batch].rTz = self.coupler.pcg_state[batch].rTr
+
+    def solve(self):
+        self.coupler._init_rigid_fem_contact_patch_pcg_baseline(
+            entities_info=self.rigid.entities_info,
+            rigid_global_info=self.rigid._rigid_global_info,
+        )
+        self._capture_initial_residual()
+        self.apply()
+        self.coupler._finish_rigid_fem_contact_patch_pcg_initialization()
+        for iteration in range(self.coupler._enriched_pcg_max_iterations):
+            self._increment_iterations()
+            self.coupler._begin_rigid_fem_contact_patch_pcg_iter(
+                entities_info=self.rigid.entities_info,
+                rigid_global_info=self.rigid._rigid_global_info,
+            )
+            self.apply()
+            self.coupler._finish_rigid_fem_contact_patch_pcg_iter()
+            if (iteration + 1) % 8 == 0:
+                transfer_start = time.perf_counter()
+                active = np.asarray(self.coupler.batch_pcg_active.to_numpy(), dtype=np.bool_)
+                self.coupler._enriched_transfer_seconds += time.perf_counter() - transfer_start
+                if not np.any(active):
+                    break
+        self._load_solution_for_true_residual()
+        self._compute_hessian_product(rigid_global_info=self.rigid._rigid_global_info)
+        self._finish_true_residual()
+        transfer_start = time.perf_counter()
+        iterations = np.asarray(self.iterations.to_numpy(), dtype=np.int64)
+        residual = np.sqrt(np.asarray(self.coupler.pcg_state.rTr.to_numpy(), dtype=np.float64))
+        converged = ~np.asarray(self.coupler.batch_pcg_active.to_numpy(), dtype=np.bool_)
+        self.coupler._enriched_transfer_seconds += time.perf_counter() - transfer_start
+        return iterations, residual, converged

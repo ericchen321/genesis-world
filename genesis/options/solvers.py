@@ -124,6 +124,23 @@ class SAPCouplerOptions(BaseCouplerOptions):
     ----------
     n_sap_iterations : int, optional
         Number of iterations for the SAP solver. Defaults to 5.
+    linear_solver : {"pcg", "sparse_direct", "enriched_pcg", "contact_schur"}, optional
+        Linear solver used for each SAP Newton system. Defaults to "pcg".
+    contact_schur_max_rows : int, optional
+        Maximum number of scalar constraint rows in the GPU contact Schur system. Defaults to 1024.
+    contact_schur_regularization : float, optional
+        Relative diagonal stabilization of the Schur factor. Defaults to 0.0.
+        The original unregularized Hessian is used for the true-residual check.
+    contact_schur_true_residual_rtol : float, optional
+        Relative tolerance for the original Newton-system residual. Defaults to 1e-8.
+    contact_schur_true_residual_atol : float, optional
+        Absolute tolerance for the original Newton-system residual. Defaults to 1e-12.
+    contact_schur_max_refinement_steps : int, optional
+        Maximum number of true-residual refinement solves per Newton step. Defaults to 2.
+    contact_schur_compliance_cache_substeps : int, optional
+        Reuse a dense GPU FEM compliance for this many physical substeps. Zero disables caching. Defaults to 0.
+    contact_schur_compliance_cache_max_bytes : int, optional
+        Maximum dense FEM compliance storage before falling back to the current sparse factor. Defaults to 2 GiB.
     n_pcg_iterations : int, optional
         Number of iterations for the Preconditioned Conjugate Gradient solver. Defaults to 100.
     n_linesearch_iterations : int, optional
@@ -198,7 +215,21 @@ class SAPCouplerOptions(BaseCouplerOptions):
     """
 
     n_sap_iterations: PositiveInt = 5
+    linear_solver: Literal["pcg", "sparse_direct", "enriched_pcg", "contact_schur"] = "pcg"
     n_pcg_iterations: PositiveInt = 100
+    enriched_pcg_rtol: PositiveFloat = 1e-8
+    enriched_pcg_max_iterations: PositiveInt = 200
+    enriched_max_partitions_per_component: PositiveInt = 8
+    enriched_target_tets_per_partition: PositiveInt = 128
+    enriched_pou_smoothing_steps: NonNegativeInt = 3
+    enriched_qr_rtol: PositiveFloat = 1e-10
+    contact_schur_max_rows: PositiveInt = 1024
+    contact_schur_regularization: NonNegativeFloat = 0.0
+    contact_schur_true_residual_rtol: PositiveFloat = 1e-8
+    contact_schur_true_residual_atol: NonNegativeFloat = 1e-12
+    contact_schur_max_refinement_steps: NonNegativeInt = 2
+    contact_schur_compliance_cache_substeps: NonNegativeInt = 0
+    contact_schur_compliance_cache_max_bytes: PositiveInt = 2 * 1024**3
     n_linesearch_iterations: PositiveInt = 10
     sap_convergence_atol: PositiveFloat = 1e-6
     sap_convergence_rtol: PositiveFloat = 1e-5
@@ -864,6 +895,8 @@ class FEMOptions(Options):
     use_implicit_solver : bool, optional
         Whether to use the implicit solver. Defaults to False.
         Implicit solver is a more stable solver for FEM. It can be used with a large time step.
+    linear_solver : {"pcg", "sparse_direct"}, optional
+        Linear solver used for the implicit free-FEM Newton system. Defaults to "pcg".
     n_newton_iterations : int, optional
         Maximum number of Newton iterations. Defaults to 1. Only used when `use_implicit_solver` is True.
     n_pcg_iterations : int, optional
@@ -927,6 +960,7 @@ class FEMOptions(Options):
     floor_height: float | None = None
     enable_floor: StrictBool = True
     use_implicit_solver: StrictBool = False
+    linear_solver: Literal["pcg", "sparse_direct"] = "pcg"
     n_newton_iterations: PositiveInt = 1
     n_pcg_iterations: PositiveInt = 500
     n_linesearch_iterations: NonNegativeInt = 0

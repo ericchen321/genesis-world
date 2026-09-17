@@ -1,10 +1,13 @@
 # pylint: disable=no-value-for-parameter
 
+import time
 from typing import TYPE_CHECKING
 
 import numpy as np
 import igl
 import quadrants as qd
+import scipy.sparse as sp
+import scipy.sparse.linalg as spla
 import torch
 
 import genesis as gs
@@ -23,6 +26,10 @@ from genesis.utils.misc import qd_to_torch, tensor_to_array
 from genesis.utils.geom import qd_transform_by_quat, qd_transform_quat_by_quat
 
 from .base_solver import Solver
+from .fem_coarse_space import (
+    build_material_connected_partition_of_unity,
+    build_weighted_rigid_motion_candidates,
+)
 
 if TYPE_CHECKING:
     from genesis.engine.entities import FEMEntity
@@ -201,6 +208,7 @@ class FEMSolver(Solver):
         self._enable_floor = options.enable_floor
         self._damping = options.damping
         self._use_implicit_solver = options.use_implicit_solver
+        self._linear_solver = options.linear_solver
         self._n_newton_iterations = options.n_newton_iterations
         self._newton_dx_threshold = options.newton_dx_threshold
         self._n_pcg_iterations = options.n_pcg_iterations
@@ -225,6 +233,25 @@ class FEMSolver(Solver):
         self._enable_development_direct_replay_min_j_query = (
             options.enable_development_direct_replay_min_j_query
         )
+
+        # CPU sparse-direct state is populated once per implicit physical
+        # substep.  SAP consumes the velocity-unit matrix and momentum data
+        # without reconstructing a second FEM operator.
+        self._direct_velocity_matrices = ()
+        self._direct_velocity_matrix = None
+        self._direct_velocity_factors = ()
+        self._direct_velocity_gpu_factors = {}
+        self._direct_velocity_rhs = None
+        self._direct_free_velocity = None
+        self._direct_free_residual = None
+        self._direct_free_residual_norm = None
+        self._direct_free_positions = None
+        self._direct_geometry_candidates = None
+        self._direct_assembly_time_s = 0.0
+        self._direct_factor_time_s = 0.0
+        self._direct_solve_time_s = 0.0
+        self._direct_transfer_time_s = 0.0
+        self._material_connected_pou_cache = {}
 
         # use scaled volume for better numerical stability, similar to p_vol_scale in mpm
         self._vol_scale = float(1e4)
@@ -747,6 +774,18 @@ class FEMSolver(Solver):
 
         if self.n_vertices_max > 0 and self._enable_vertex_constraints and not self._constraints_initialized:
             self.init_constraints()
+
+        if self.n_elements_max > 0 and self._use_implicit_solver and self._linear_solver == "sparse_direct":
+            tetrahedra = np.asarray(self.elements_i.el2v.to_numpy(), dtype=np.int64)
+            self._direct_tetrahedra = tetrahedra
+            element_dofs = (tetrahedra[:, :, None] * 3 + np.arange(3, dtype=np.int64)).reshape(-1, 12)
+            element_shape = (self.n_elements, 12, 12)
+            self._direct_element_rows = np.broadcast_to(element_dofs[:, :, None], element_shape).ravel()
+            self._direct_element_cols = np.broadcast_to(element_dofs[:, None, :], element_shape).ravel()
+            self._direct_element_mapping = np.empty((self.n_elements, 4, 3), dtype=np.float64)
+            self._direct_element_mapping[:, :3] = np.asarray(self.elements_i.B.to_numpy(), dtype=np.float64)
+            self._direct_element_mapping[:, 3] = -self._direct_element_mapping[:, :3].sum(axis=1)
+            self._direct_element_volume = np.asarray(self.elements_i.V.to_numpy(), dtype=np.float64)
 
         # FIXME: _gravity must be a raw qd.field() — see comment in mpm_solver.py
         if self._gravity is not None:
@@ -1982,13 +2021,270 @@ class FEMSolver(Solver):
         self._select_development_implicit_fem_positive_j_alpha_and_witness(f)
         self._commit_development_implicit_fem_positive_j_position(f)
 
+    def _sparse_direct_solve(self, f: qd.i32):
+        """Solve the current free-FEM Newton system and retain its velocity form for SAP."""
+        transfer_start = time.perf_counter()
+        hessians = np.asarray(self.elements_el_hessian.to_numpy(), dtype=np.float64)
+        force = np.asarray(self.elements_v_energy.force.to_numpy(), dtype=np.float64)
+        mass_over_dt2 = np.asarray(self.elements_v_info.mass_over_dt2.to_numpy(), dtype=np.float64)
+        positions = np.asarray(self.elements_v.pos.to_numpy(), dtype=np.float64)
+        if self._enable_vertex_constraints:
+            is_constrained = np.asarray(self.vertex_constraints.is_constrained.to_numpy(), dtype=np.bool_).T
+            is_soft = np.asarray(self.vertex_constraints.is_soft_constraint.to_numpy(), dtype=np.bool_).T
+            constraint_stiffness = np.asarray(self.vertex_constraints.stiffness.to_numpy(), dtype=np.float64).T
+        else:
+            is_constrained = np.zeros((self._B, self.n_vertices), dtype=np.bool_)
+            is_soft = np.zeros_like(is_constrained)
+            constraint_stiffness = np.zeros((self._B, self.n_vertices), dtype=np.float64)
+        self._direct_transfer_time_s += time.perf_counter() - transfer_start
+
+        h = float(self.substep_dt)
+        damping_alpha_factor = 1.0 + self._damping_alpha * h
+        damping_beta_factor = 1.0 + self._damping_beta / h
+        matrix_size = self.n_vertices * 3
+        diagonal_dofs = np.arange(matrix_size, dtype=np.int64)
+        matrices = []
+        factors = []
+        velocity_rhs = np.empty((self._B, matrix_size), dtype=np.float64)
+        velocity_updates = np.empty_like(velocity_rhs)
+
+        assembly_start = time.perf_counter()
+        for i_b in range(self._B):
+            mapping = self._direct_element_mapping.copy()
+            hard_constrained = is_constrained[i_b] & ~is_soft[i_b]
+            mapping[hard_constrained[self._direct_tetrahedra]] = 0.0
+            element_hessian = np.moveaxis(hessians[i_b], 2, 0)
+            element_matrix = np.einsum(
+                "eki,eijab,elj->ekalb",
+                mapping,
+                element_hessian,
+                mapping,
+                optimize=True,
+            )
+            element_matrix *= self._direct_element_volume[:, None, None, None, None] * damping_beta_factor
+            position_matrix = sp.coo_matrix(
+                (element_matrix.reshape(-1), (self._direct_element_rows, self._direct_element_cols)),
+                shape=(matrix_size, matrix_size),
+            ).tocsc()
+            vertex_diagonal = mass_over_dt2 * damping_alpha_factor
+            vertex_diagonal += np.where(
+                is_constrained[i_b] & is_soft[i_b], constraint_stiffness[i_b], 0.0
+            )
+            position_matrix += sp.csc_matrix(
+                (np.repeat(vertex_diagonal, 3), (diagonal_dofs, diagonal_dofs)),
+                shape=(matrix_size, matrix_size),
+            )
+            velocity_matrix = position_matrix * (h * h)
+            velocity_matrix.sum_duplicates()
+            velocity_matrix.sort_indices()
+
+            base_velocity = (positions[f + 1, :, i_b] - positions[f, :, i_b]).reshape(-1) / h
+            velocity_rhs[i_b] = velocity_matrix @ base_velocity + h * force[i_b].reshape(-1)
+            matrices.append(velocity_matrix)
+        self._direct_assembly_time_s += time.perf_counter() - assembly_start
+
+        factor_start = time.perf_counter()
+        for velocity_matrix in matrices:
+            factors.append(spla.splu(velocity_matrix))
+        self._direct_factor_time_s += time.perf_counter() - factor_start
+
+        solve_start = time.perf_counter()
+        for i_b, factor in enumerate(factors):
+            velocity_updates[i_b] = factor.solve(h * force[i_b].reshape(-1))
+        self._direct_solve_time_s += time.perf_counter() - solve_start
+
+        transfer_start = time.perf_counter()
+        self.pcg_state_v.x.from_numpy((h * velocity_updates).reshape(self._B, self.n_vertices, 3))
+        self._direct_transfer_time_s += time.perf_counter() - transfer_start
+
+        position_residual = force.reshape(self._B, -1) - np.stack(
+            [(matrix @ velocity_updates[i_b]) / h for i_b, matrix in enumerate(matrices)]
+        )
+        initial_rtr = np.einsum("bi,bi->b", force.reshape(self._B, -1), force.reshape(self._B, -1))
+        final_rtr = np.einsum("bi,bi->b", position_residual, position_residual)
+        self.pcg_state.rTr_initial.from_numpy(initial_rtr)
+        self.pcg_state.rTr.from_numpy(final_rtr)
+        self.pcg_state.rTz.from_numpy(final_rtr)
+        self.pcg_state.termination_threshold.from_numpy(
+            np.maximum(self._pcg_threshold, initial_rtr * self._pcg_rtol * self._pcg_rtol)
+        )
+        self.batch_pcg_active.fill(False)
+        self.batch_pcg_iterations.fill(0)
+
+        self._direct_velocity_matrices = tuple(matrices)
+        self._direct_velocity_matrix = matrices[0] if self._B == 1 else None
+        self._direct_velocity_factors = tuple(factors)
+        self._direct_velocity_gpu_factors.clear()
+        self._direct_velocity_rhs = velocity_rhs
+
+    def _finalize_sparse_direct_velocity_system(self, f: qd.i32):
+        transfer_start = time.perf_counter()
+        positions = np.asarray(self.elements_v.pos.to_numpy(), dtype=np.float64)
+        self._direct_transfer_time_s += time.perf_counter() - transfer_start
+        h = float(self.substep_dt)
+        free_velocity = np.transpose(positions[f + 1] - positions[f], (1, 0, 2)).reshape(self._B, -1) / h
+        free_residual = np.stack(
+            [
+                self._direct_velocity_rhs[i_b] - self._direct_velocity_matrices[i_b] @ free_velocity[i_b]
+                for i_b in range(self._B)
+            ]
+        )
+        self._direct_free_velocity = free_velocity
+        self._direct_free_residual = free_residual
+        self._direct_free_residual_norm = np.linalg.norm(free_residual, axis=1)
+        self._direct_free_positions = np.transpose(positions[f + 1], (1, 0, 2)).copy()
+        self._direct_geometry_candidates = [{} for _ in range(self._B)]
+        position_residual_rtr = np.einsum("bi,bi->b", free_residual, free_residual) / (h * h)
+        self.pcg_state.rTr.from_numpy(position_residual_rtr)
+        self.pcg_state.rTz.from_numpy(position_residual_rtr)
+
+    def get_sparse_direct_velocity_system(self, i_b: int):
+        """Return ``(A_f, b_f, c, b_f - A_f c)`` for one completed free solve."""
+        if self._linear_solver != "sparse_direct" or self._direct_velocity_rhs is None:
+            raise RuntimeError("sparse-direct FEM velocity system is not available")
+        return (
+            self._direct_velocity_matrices[i_b],
+            self._direct_velocity_rhs[i_b],
+            self._direct_free_velocity[i_b],
+            self._direct_free_residual[i_b],
+        )
+
+    def solve_sparse_direct_velocity_rhs(self, i_b: int, rhs):
+        """Apply the current free-FEM ``A_f`` LU factor to one or many FP64 right-hand sides."""
+        return np.asarray(self._direct_velocity_factors[i_b].solve(np.asarray(rhs, dtype=np.float64)), dtype=np.float64)
+
+    def solve_sparse_direct_velocity_rhs_gpu(self, i_b: int, rhs) -> torch.Tensor:
+        """Solve current ``A_f`` against CUDA FP64 ``(3 * n_vertices, K)`` RHSs.
+
+        ``rhs`` may be a Torch tensor or a CuPy array. The returned Torch tensor
+        shares the CUDA solution through DLPack; the RHS and solution never
+        pass through host memory. Work runs on the current Torch stream for
+        the RHS device. This interface is for substep response preparation,
+        and does not provide autograd through the sparse solve.
+
+        CuPy uploads the existing SciPy SuperLU factors lazily, including both
+        row and column permutations. These GPU factors are reused within the
+        same physical substep, but CuPy's solve still performs its own sparse
+        triangular analysis on each call.
+        """
+        if self._linear_solver != "sparse_direct" or not self._direct_velocity_factors:
+            raise RuntimeError("GPU sparse-direct FEM solve requires a completed sparse_direct free-FEM solve")
+        if not 0 <= i_b < len(self._direct_velocity_factors):
+            raise IndexError(f"FEM batch index {i_b} is outside the current sparse-direct factors")
+
+        try:
+            import cupy as cp
+            from cupyx.scipy.sparse.linalg import SuperLU
+        except (ImportError, OSError) as exc:
+            raise RuntimeError(
+                "The SAP GPU Schur backend requires CuPy with CUDA support for the FEM response solve. "
+                "Install a CuPy package matching the CUDA runtime (for CUDA 12, cupy-cuda12x) "
+                "in the active Python environment."
+            ) from exc
+
+        if isinstance(rhs, torch.Tensor):
+            if rhs.device.type != "cuda" or rhs.dtype != torch.float64:
+                raise ValueError("GPU sparse-direct FEM RHS must be a CUDA torch.float64 tensor")
+            device_index = rhs.device.index
+            rhs_torch = rhs.detach()
+        elif isinstance(rhs, cp.ndarray):
+            if rhs.dtype != cp.float64:
+                raise ValueError("GPU sparse-direct FEM RHS must be a CuPy float64 array")
+            device_index = rhs.device.id
+            # Import before overriding CuPy's stream so DLPack can order its
+            # producing stream before the current Torch consumer stream.
+            with torch.cuda.device(device_index):
+                rhs_torch = torch.from_dlpack(rhs)
+        else:
+            raise TypeError("GPU sparse-direct FEM RHS must be a CUDA Torch tensor or CuPy array")
+        if rhs_torch.ndim != 2 or rhs_torch.shape[0] != 3 * self.n_vertices:
+            raise ValueError(f"GPU sparse-direct FEM RHS must have shape ({3 * self.n_vertices}, K)")
+
+        with torch.cuda.device(device_index):
+            stream = torch.cuda.current_stream(device_index)
+            if rhs_torch.shape[1] == 0:
+                return torch.empty_like(rhs_torch)
+            with cp.cuda.Device(device_index), cp.cuda.ExternalStream(stream.cuda_stream, device_id=device_index):
+                rhs_device = cp.from_dlpack(rhs_torch)
+                factor = self._direct_velocity_factors[i_b]
+                key = (i_b, device_index)
+                cached = self._direct_velocity_gpu_factors.get(key)
+                if cached is None or cached[0] is not factor:
+                    # SuperLU's wrapper applies perm_r/perm_c around the two
+                    # GPU triangular solves; the unpermuted factors alone do
+                    # not represent A_f^{-1}.
+                    gpu_factor = SuperLU(factor)
+                    ready = torch.cuda.Event()
+                    ready.record(stream)
+                    self._direct_velocity_gpu_factors[key] = (factor, gpu_factor, ready)
+                else:
+                    _, gpu_factor, ready = cached
+                    stream.wait_event(ready)
+                solution = gpu_factor.solve(rhs_device)
+                return torch.from_dlpack(solution)
+
+    def get_material_connected_partition_of_unity(
+        self,
+        *,
+        max_partitions_per_component: int = 8,
+        target_tets_per_partition: int = 128,
+        smoothing_steps: int = 3,
+    ):
+        """Return the fixed generic material-connected PoU for this FEM mesh."""
+        cache_key = (max_partitions_per_component, target_tets_per_partition, smoothing_steps)
+        if cache_key not in self._material_connected_pou_cache:
+            material_keys = np.column_stack(
+                (
+                    np.asarray(self.elements_i.mu.to_numpy(), dtype=np.float64),
+                    np.asarray(self.elements_i.lam.to_numpy(), dtype=np.float64),
+                )
+            )
+            self._material_connected_pou_cache[cache_key] = build_material_connected_partition_of_unity(
+                np.asarray(self.elements_i.el2v.to_numpy(), dtype=np.int64),
+                material_keys,
+                self.n_vertices,
+                max_partitions_per_component=max_partitions_per_component,
+                target_tets_per_partition=target_tets_per_partition,
+                smoothing_steps=smoothing_steps,
+            )
+        return self._material_connected_pou_cache[cache_key]
+
+    def get_sparse_direct_geometry_candidates(
+        self,
+        i_b: int,
+        *,
+        max_partitions_per_component: int = 8,
+        target_tets_per_partition: int = 128,
+        smoothing_steps: int = 3,
+    ):
+        """Return current-position PoU translation/rotation candidates in vertex-major XYZ order."""
+        cache_key = (max_partitions_per_component, target_tets_per_partition, smoothing_steps)
+        if cache_key not in self._direct_geometry_candidates[i_b]:
+            weights, partition_metadata = self.get_material_connected_partition_of_unity(
+                max_partitions_per_component=max_partitions_per_component,
+                target_tets_per_partition=target_tets_per_partition,
+                smoothing_steps=smoothing_steps,
+            )
+            self._direct_geometry_candidates[i_b][cache_key] = build_weighted_rigid_motion_candidates(
+                self._direct_free_positions[i_b],
+                weights,
+                vertex_masses=np.asarray(self.elements_v_info.mass.to_numpy(), dtype=np.float64),
+                partition_metadata=partition_metadata,
+            )
+        return self._direct_geometry_candidates[i_b][cache_key]
+
     def batch_solve(self, f: qd.i32):
         self.batch_active.fill(True)
         self.batch_pcg_budget_exhausted.fill(False)
         self.batch_pcg_breakdown.fill(False)
         self.batch_linesearch_budget_exhausted.fill(False)
 
-        if self._enable_material_coarse_preconditioner:
+        if self._linear_solver == "sparse_direct":
+            self._direct_assembly_time_s = 0.0
+            self._direct_factor_time_s = 0.0
+            self._direct_solve_time_s = 0.0
+            self._direct_transfer_time_s = 0.0
+        elif self._enable_material_coarse_preconditioner:
             self._refresh_material_coarse_basis(f)
 
         for i in range(self._n_newton_iterations):
@@ -2002,14 +2298,17 @@ class FEMSolver(Solver):
 
             # accumulate vertex force and preconditioner
             self.accumulate_vertex_force_preconditioner(f)
-            if self._enable_rigid_mode_deflation:
-                self._prepare_rigid_mode_coarse_operator()
-            if self._enable_material_coarse_preconditioner:
-                self._prepare_material_coarse_operator()
+            if self._linear_solver == "sparse_direct":
+                self._sparse_direct_solve(f)
+            else:
+                if self._enable_rigid_mode_deflation:
+                    self._prepare_rigid_mode_coarse_operator()
+                if self._enable_material_coarse_preconditioner:
+                    self._prepare_material_coarse_operator()
 
-            # solve for the vertex positions
-            self.pcg_solve()
-            self._accumulate_pcg_budget_exhaustion()
+                # solve for the vertex positions
+                self.pcg_solve()
+                self._accumulate_pcg_budget_exhaustion()
 
             # line search
             if self._enable_development_implicit_fem_positive_j_feasible_step:
@@ -2022,6 +2321,9 @@ class FEMSolver(Solver):
             else:
                 self.linesearch(f)
             self._accumulate_linesearch_budget_exhaustion()
+
+        if self._linear_solver == "sparse_direct":
+            self._finalize_sparse_direct_velocity_system(f)
 
     @qd.kernel
     def _accumulate_pcg_budget_exhaustion(self):
