@@ -1,6 +1,7 @@
 from dataclasses import replace
 from typing import TYPE_CHECKING
 import math
+import os
 import time
 
 import igl
@@ -2667,6 +2668,21 @@ class SAPCoupler(RBC):
             self._contact_schur_setup_seconds_total += self._contact_schur_setup_seconds
             self._contact_schur_solve_seconds_total += self._contact_schur_solve_seconds
             self._contact_schur_transfer_seconds_total += self._contact_schur_transfer_seconds
+
+            if (
+                os.environ.get("GENESIS_FEM_CUDSS_TELEMETRY") == "1"
+                and (int(self.sim.cur_substep_global) + 1) % 20 == 0
+            ):
+                print(
+                    "[contact Schur] "
+                    f"substeps={int(self.sim.cur_substep_global) + 1} "
+                    f"setup_s={self._contact_schur_setup_seconds_total:.6f} "
+                    f"solve_s={self._contact_schur_solve_seconds_total:.6f} "
+                    f"transfer_s={self._contact_schur_transfer_seconds_total:.6f} "
+                    f"rows={self._contact_schur_rows_by_batch} "
+                    f"sap_iterations={self._contact_schur_sap_iterations_by_batch}",
+                    flush=True,
+                )
 
         if self._enable_qualification_post_final_sap_health:
             self._legacy_sap_health_fields = self._snapshot_sap_health_fields()
@@ -9425,11 +9441,24 @@ class GPUContactSchurSolver:
         self._elements = None
         self._native_support = {}
         self._fem_compliance = None
+        self._fem_compliance_factor = None
         self._compliance_substep = -1
+        self._full_h_cudss = os.environ.get("GENESIS_CONTACT_FULL_H_CUDSS") == "1"
+        self._full_h_factor = None
+        self._full_h_base = None
+        self._full_h_j = None
 
     def reset(self):
+        if self._fem_compliance_factor is not None:
+            self._fem_compliance_factor.close()
+        if self._full_h_factor is not None:
+            self._full_h_factor.close()
         self._fem_compliance = None
+        self._fem_compliance_factor = None
         self._compliance_substep = -1
+        self._full_h_factor = None
+        self._full_h_base = None
+        self._full_h_j = None
 
     @staticmethod
     def _aos_prefix(field, count):
@@ -9705,6 +9734,37 @@ class GPUContactSchurSolver:
         self.rows_by_batch = (rows,)
         device = qd_to_torch(self.coupler.fem_state_v.v, copy=False).device
         self.jt = self._pack_jt(device, rows)
+
+        if self._full_h_cudss:
+            import cupy as cp
+            import cupyx.scipy.sparse as cpxs
+
+            fem_factor = self.fem._direct_velocity_factors[0]
+            a_lower = cpxs.csr_matrix(
+                (fem_factor._values, fem_factor._col_ind, fem_factor._row_ptr),
+                shape=fem_factor._shape,
+            )
+            a = a_lower + a_lower.T - cpxs.diags(a_lower.diagonal())
+            mass_torch = qd_to_torch(
+                self.rigid._rigid_global_info.mass_mat, copy=False
+            )[:, :, 0]
+            mass = cpxs.csr_matrix(cp.from_dlpack(mass_torch))
+            self._full_h_base = cpxs.bmat([[a, None], [None, mass]], format="csr")
+            j_torch = self.jt.transpose(0, 1).to_sparse_csr()
+            self._full_h_j = cpxs.csr_matrix(
+                (
+                    cp.from_dlpack(j_torch.values()),
+                    cp.from_dlpack(j_torch.col_indices()).astype(cp.int32, copy=False),
+                    cp.from_dlpack(j_torch.crow_indices()).astype(cp.int32, copy=False),
+                ),
+                shape=j_torch.shape,
+            )
+            self.w = None
+            self.schur = None
+            self.vbar = None
+            torch.cuda.synchronize(device)
+            return
+
         self.j = self.jt.float().transpose(0, 1).to_sparse_csr()
 
         cache_interval = self.coupler._contact_schur_compliance_cache_substeps
@@ -9715,15 +9775,28 @@ class GPUContactSchurSolver:
         )
         global_substep = int(self.coupler.sim.cur_substep_global)
         if use_compliance_cache and (
-            self._fem_compliance is None
+            (self._fem_compliance is None and self._fem_compliance_factor is None)
             or global_substep < self._compliance_substep
             or global_substep - self._compliance_substep >= cache_interval
         ):
-            identity = torch.eye(self.n_fem, dtype=torch.float64, device=device)
-            self._fem_compliance = self.fem.solve_sparse_direct_velocity_rhs_gpu(0, identity).detach()
+            if self.fem._sparse_direct_backend == "cudss":
+                from genesis.utils.cudss_sparse import CudssSpdFactor
+
+                if self._fem_compliance_factor is not None:
+                    self._fem_compliance_factor.close()
+                self._fem_compliance_factor = CudssSpdFactor(
+                    self.fem._direct_velocity_matrices[0]
+                )
+                self._fem_compliance = None
+            else:
+                identity = torch.eye(self.n_fem, dtype=torch.float64, device=device)
+                self._fem_compliance = self.fem.solve_sparse_direct_velocity_rhs_gpu(0, identity).detach()
             self._compliance_substep = global_substep
 
-        if self._fem_compliance is not None:
+        if self._fem_compliance_factor is not None:
+            fem_w = self._fem_compliance_factor.solve_gpu(self.jt[: self.n_fem])
+            self.vbar = None
+        elif self._fem_compliance is not None:
             fem_j = self.jt[: self.n_fem].transpose(0, 1).to_sparse_csr()
             fem_w = torch.sparse.mm(fem_j, self._fem_compliance.transpose(0, 1)).transpose(0, 1)
             self.vbar = None
@@ -9746,7 +9819,7 @@ class GPUContactSchurSolver:
         # factor the dense Schur complement in FP32, while retaining the state
         # response and the accepted Newton direction in FP64.
         self.schur = torch.sparse.mm(self.j, self.w.float())
-        if self._fem_compliance is None:
+        if self._fem_compliance is None and self._fem_compliance_factor is None:
             free_rigid = qd_to_torch(self.rigid.dofs_state.vel, copy=False)[:, 0]
             self.vbar = torch.cat((vbar_fem, free_rigid), dim=0)
         torch.cuda.synchronize(device)
@@ -9764,7 +9837,8 @@ class GPUContactSchurSolver:
                 contact_gamma = torch.empty((count, 3), dtype=self.jt.dtype, device=self.jt.device)
                 contact_G = torch.empty((count, 3, 3), dtype=self.jt.dtype, device=self.jt.device)
                 self._pack_contact_sap_info(info, count, contact_gamma, contact_G)
-                contact_G = contact_G.float()
+                if not self._full_h_cudss:
+                    contact_G = contact_G.float()
                 contact = torch.arange(count, device=self.jt.device, dtype=torch.long)
                 axes = torch.arange(3, device=self.jt.device, dtype=torch.long)
                 block_rows = start + 3 * contact[:, None] + axes[None, :]
@@ -9776,7 +9850,9 @@ class GPUContactSchurSolver:
                 scalar_G = torch.empty(count, dtype=self.jt.dtype, device=self.jt.device)
                 self._pack_scalar_sap_info(info, count, scalar_gamma, scalar_G)
                 gamma[block_rows] = scalar_gamma
-                blocks.append((block_rows[:, None], scalar_G.float()[:, None, None]))
+                if not self._full_h_cudss:
+                    scalar_G = scalar_G.float()
+                blocks.append((block_rows[:, None], scalar_G[:, None, None]))
         return gamma, tuple(blocks)
 
     def _apply_contact_blocks(self, blocks, rhs):
@@ -9808,7 +9884,9 @@ class GPUContactSchurSolver:
         return solution.to(contact_rhs.dtype)
 
     def _inverse_a0(self, rhs):
-        if self._fem_compliance is None:
+        if self._fem_compliance_factor is not None:
+            fem = self._fem_compliance_factor.solve_gpu(rhs[: self.n_fem, None])[:, 0]
+        elif self._fem_compliance is None:
             fem = self.fem.solve_sparse_direct_velocity_rhs_gpu(
                 0, rhs[: self.n_fem, None]
             )[:, 0]
@@ -9841,6 +9919,101 @@ class GPUContactSchurSolver:
         fem_x[0].copy_(direction[: self.n_fem].reshape(self.n_vertices, 3))
         rigid_x[0].copy_(direction[self.n_fem :])
 
+    def _solve_full_h_cudss(self, blocks, gradient, *, compute_residual=False):
+        import cupy as cp
+        import cupyx.scipy.sparse as cpxs
+        from genesis.utils.cudss_sparse import CudssDeviceSpdFactor
+
+        profile = os.environ.get("GENESIS_FEM_CUDSS_TELEMETRY") == "1"
+        stream = cp.cuda.get_current_stream()
+        if profile:
+            stream.synchronize()
+            profile_start = time.perf_counter()
+        phase_start = time.perf_counter()
+        base = self._full_h_base
+        if profile:
+            stream.synchronize()
+            base_seconds = time.perf_counter() - phase_start
+            phase_start = time.perf_counter()
+
+        j = self._full_h_j
+        if profile:
+            stream.synchronize()
+            jacobian_seconds = time.perf_counter() - phase_start
+            phase_start = time.perf_counter()
+        g_rows = []
+        g_cols = []
+        g_values = []
+        for block_rows, values in blocks:
+            block_rows_cp = cp.from_dlpack(block_rows).astype(cp.int32, copy=False)
+            values_cp = cp.from_dlpack(values).astype(cp.float64, copy=False)
+            block_size = block_rows_cp.shape[1]
+            g_rows.append(cp.repeat(block_rows_cp, block_size, axis=1).reshape(-1))
+            g_cols.append(cp.tile(block_rows_cp, (1, block_size)).reshape(-1))
+            g_values.append(values_cp.reshape(-1))
+        g = cpxs.coo_matrix(
+            (cp.concatenate(g_values), (cp.concatenate(g_rows), cp.concatenate(g_cols))),
+            shape=(self.rows_by_batch[0], self.rows_by_batch[0]),
+        ).tocsr()
+        if profile:
+            stream.synchronize()
+            g_seconds = time.perf_counter() - phase_start
+            phase_start = time.perf_counter()
+        hessian = (base + j.T @ (g @ j)).tocsr()
+        hessian.sum_duplicates()
+        hessian.sort_indices()
+        if profile:
+            stream.synchronize()
+            hessian_seconds = time.perf_counter() - phase_start
+            phase_start = time.perf_counter()
+        lower = cpxs.tril(hessian, format="csr")
+        if profile:
+            stream.synchronize()
+            lower_seconds = time.perf_counter() - phase_start
+        factor = self._full_h_factor
+        reuse_analysis = False
+        if factor is not None:
+            reuse_analysis = (
+                factor._shape == lower.shape
+                and factor._values.size == lower.data.size
+                and bool(cp.array_equal(factor._row_ptr, lower.indptr).item())
+                and bool(cp.array_equal(factor._col_ind, lower.indices).item())
+            )
+            if not reuse_analysis:
+                factor.close()
+                factor = None
+        if factor is None:
+            factor = CudssDeviceSpdFactor(lower)
+            self._full_h_factor = factor
+            analysis_seconds = factor.analysis_seconds
+            factor_seconds = factor.factor_seconds_total
+        else:
+            factor_seconds_before = factor.factor_seconds_total
+            factor.refactor_lower_values(lower.data.astype(cp.float64, copy=False))
+            analysis_seconds = 0.0
+            factor_seconds = factor.factor_seconds_total - factor_seconds_before
+        solve_seconds_before = factor.solve_seconds_total
+        gradient_cp = cp.from_dlpack(gradient)
+        direction_cp = -factor._solve_cupy(gradient_cp)
+        solve_seconds = factor.solve_seconds_total - solve_seconds_before
+        residual_cp = -gradient_cp - hessian @ direction_cp if compute_residual else None
+        direction = torch.from_dlpack(direction_cp)
+        residual = torch.from_dlpack(residual_cp) if residual_cp is not None else None
+        if profile:
+            stream.synchronize()
+            total_seconds = time.perf_counter() - profile_start
+            print(
+                "[FULL_H_CUDSS] "
+                f"dofs={lower.shape[0]} rows={self.rows_by_batch[0]} "
+                f"j_nnz={j.nnz} h_nnz={hessian.nnz} lower_nnz={lower.nnz} "
+                f"base_s={base_seconds:.6f} jacobian_s={jacobian_seconds:.6f} "
+                f"g_s={g_seconds:.6f} hessian_s={hessian_seconds:.6f} "
+                f"lower_s={lower_seconds:.6f} reuse_analysis={int(reuse_analysis)} "
+                f"analysis_s={analysis_seconds:.6f} factor_s={factor_seconds:.6f} "
+                f"solve_s={solve_seconds:.6f} total_s={total_seconds:.6f}"
+            )
+        return direction, residual
+
     def _true_residual(self, gradient, direction):
         self._store_direction(direction)
         torch.cuda.synchronize(direction.device)
@@ -9859,16 +10032,59 @@ class GPUContactSchurSolver:
         )
         rigid_gradient = qd_to_torch(self.coupler.rigid_state_dof.gradient, copy=False)[0]
         gradient = torch.cat((fem_gradient, rigid_gradient), dim=0)
-        if self._fem_compliance is None:
+        if self._full_h_cudss:
+            direction, residual = self._solve_full_h_cudss(
+                blocks, gradient, compute_residual=validate
+            )
+            if not validate:
+                self._store_direction(direction)
+                torch.cuda.synchronize(self.jt.device)
+                self.coupler.batch_pcg_active.fill(False)
+                self.coupler.pcg_state.rTr.fill(0.0)
+                self.coupler.pcg_state.rTz.fill(0.0)
+                return np.asarray([0.0]), np.asarray([True])
+            if os.environ.get("GENESIS_CONTACT_FULL_H_QD_RESIDUAL_CHECK") == "1":
+                qd_residual = self._true_residual(gradient, direction)
+                assembled_norm = torch.linalg.vector_norm(residual)
+                qd_norm = torch.linalg.vector_norm(qd_residual)
+                difference_norm = torch.linalg.vector_norm(residual - qd_residual)
+                torch.cuda.synchronize(self.jt.device)
+                print(
+                    "[FULL_H_RESIDUAL_CHECK] "
+                    f"assembled={float(assembled_norm.detach().cpu()):.9e} "
+                    f"qd={float(qd_norm.detach().cpu()):.9e} "
+                    f"difference={float(difference_norm.detach().cpu()):.9e}",
+                    flush=True,
+                )
+            residual_norm = torch.linalg.vector_norm(residual)
+            gradient_norm = torch.linalg.vector_norm(gradient)
+            threshold = (
+                self.coupler._contact_schur_true_residual_atol
+                + self.coupler._contact_schur_true_residual_rtol * gradient_norm
+            )
+            self._store_direction(direction)
+            converged_device = residual_norm <= threshold
+            torch.cuda.synchronize(self.jt.device)
+            residual_value = float(residual_norm.detach().cpu())
+            converged_value = bool(converged_device.detach().cpu())
+            self.coupler.batch_pcg_active.fill(False)
+            self.coupler.pcg_state.rTr.fill(residual_value * residual_value)
+            self.coupler.pcg_state.rTz.fill(residual_value * residual_value)
+            return np.asarray([residual_value]), np.asarray([converged_value])
+        if self._fem_compliance is None and self._fem_compliance_factor is None:
             fem_v = qd_to_torch(self.coupler.fem_state_v.v, copy=False)[0].reshape(self.n_fem)
             rigid_v = qd_to_torch(self.coupler.rigid_state_dof.v, copy=False)[0]
             velocity = torch.cat((fem_v, rigid_v), dim=0)
             q = velocity - self.vbar - self.w @ gamma
         else:
             mass = qd_to_torch(self.rigid._rigid_global_info.mass_mat, copy=False)[:, :, 0]
+            if self._fem_compliance_factor is not None:
+                fem_q = self._fem_compliance_factor.solve_gpu(fem_gradient[:, None])[:, 0]
+            else:
+                fem_q = self._fem_compliance @ fem_gradient
             q = torch.cat(
                 (
-                    self._fem_compliance @ fem_gradient,
+                    fem_q,
                     torch.linalg.solve(mass, rigid_gradient),
                 ),
                 dim=0,

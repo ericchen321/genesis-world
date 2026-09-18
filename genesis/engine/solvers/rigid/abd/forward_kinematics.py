@@ -1166,10 +1166,29 @@ def func_update_all_verts(
     static_rigid_sim_config: qd.template(),
 ):
     n_geoms, _B = geoms_state.pos.shape
+    n_verts = verts_info.geom_idx.shape[0]
 
     qd.loop_config(serialize=qd.static(static_rigid_sim_config.para_level < gs.PARA_LEVEL.PARTIAL))
+    for i_v, i_b in qd.ndrange(n_verts, _B):
+        i_g = verts_info.geom_idx[i_v]
+        if not geoms_state.verts_updated[i_g, i_b]:
+            verts_state_idx = verts_info.verts_state_idx[i_v]
+            if verts_info.is_fixed[i_v]:
+                # Fixed vertices share storage across environments, so keep a single writer.
+                if i_b == 0:
+                    fixed_verts_state.pos[verts_state_idx] = gu.qd_transform_by_trans_quat(
+                        verts_info.init_pos[i_v], geoms_state.pos[i_g, i_b], geoms_state.quat[i_g, i_b]
+                    )
+            else:
+                free_verts_state.pos[verts_state_idx, i_b] = gu.qd_transform_by_trans_quat(
+                    verts_info.init_pos[i_v], geoms_state.pos[i_g, i_b], geoms_state.quat[i_g, i_b]
+                )
+
+    # This is a separate ordered range, so no geometry becomes clean before all of its vertices have been written.
+    qd.loop_config(serialize=qd.static(static_rigid_sim_config.para_level < gs.PARA_LEVEL.PARTIAL))
     for i_g, i_b in qd.ndrange(n_geoms, _B):
-        func_update_verts_for_geom(i_g, i_b, geoms_state, geoms_info, verts_info, free_verts_state, fixed_verts_state)
+        if not geoms_state.verts_updated[i_g, i_b]:
+            geoms_state.verts_updated[i_g, i_b] = True
 
 
 @qd.kernel(fastcache=True)

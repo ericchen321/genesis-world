@@ -1,5 +1,6 @@
 # pylint: disable=no-value-for-parameter
 
+import os
 import time
 from typing import TYPE_CHECKING
 
@@ -209,6 +210,17 @@ class FEMSolver(Solver):
         self._damping = options.damping
         self._use_implicit_solver = options.use_implicit_solver
         self._linear_solver = options.linear_solver
+        self._sparse_direct_backend = os.environ.get("GENESIS_FEM_SPARSE_DIRECT_BACKEND", "scipy")
+        if self._sparse_direct_backend not in ("scipy", "cudss"):
+            raise ValueError(
+                "GENESIS_FEM_SPARSE_DIRECT_BACKEND must be either 'scipy' or 'cudss'"
+            )
+        self._cudss_anchor_age = int(os.environ.get("GENESIS_FEM_CUDSS_ANCHOR_AGE", "0"))
+        self._cudss_pcg_max_iterations = int(
+            os.environ.get("GENESIS_FEM_CUDSS_PCG_MAX_ITERATIONS", "6")
+        )
+        self._cudss_pcg_rtol = float(os.environ.get("GENESIS_FEM_CUDSS_PCG_RTOL", "1e-8"))
+        self._cudss_gpu_assembly = os.environ.get("GENESIS_FEM_CUDSS_GPU_ASSEMBLY") == "1"
         self._n_newton_iterations = options.n_newton_iterations
         self._newton_dx_threshold = options.newton_dx_threshold
         self._n_pcg_iterations = options.n_pcg_iterations
@@ -241,6 +253,19 @@ class FEMSolver(Solver):
         self._direct_velocity_matrix = None
         self._direct_velocity_factors = ()
         self._direct_velocity_gpu_factors = {}
+        self._direct_velocity_cudss_factors = []
+        self._direct_velocity_cudss_ages = []
+        self._direct_cudss_factorizations = 0
+        self._direct_cudss_pcg_solves = 0
+        self._direct_cudss_pcg_iterations = 0
+        self._direct_cudss_pcg_fallbacks = 0
+        self._direct_cudss_last_relative_residual = 0.0
+        self._direct_cudss_max_relative_residual = 0.0
+        self._direct_gpu_template = None
+        self._direct_gpu_lower_contribution_mask = None
+        self._direct_gpu_lower_contribution_indices = None
+        self._direct_gpu_diagonal_indices = None
+        self._direct_gpu_static_tensors = None
         self._direct_velocity_rhs = None
         self._direct_free_velocity = None
         self._direct_free_residual = None
@@ -786,6 +811,39 @@ class FEMSolver(Solver):
             self._direct_element_mapping[:, :3] = np.asarray(self.elements_i.B.to_numpy(), dtype=np.float64)
             self._direct_element_mapping[:, 3] = -self._direct_element_mapping[:, :3].sum(axis=1)
             self._direct_element_volume = np.asarray(self.elements_i.V.to_numpy(), dtype=np.float64)
+            if self._sparse_direct_backend == "cudss" and self._cudss_gpu_assembly:
+                matrix_size = self.n_vertices * 3
+                diagonal = np.arange(matrix_size, dtype=np.int64)
+                pattern_rows = np.concatenate((self._direct_element_rows, diagonal))
+                pattern_cols = np.concatenate((self._direct_element_cols, diagonal))
+                pattern = sp.coo_matrix(
+                    (np.ones(pattern_rows.size), (pattern_rows, pattern_cols)),
+                    shape=(matrix_size, matrix_size),
+                ).tocsr()
+                pattern.sum_duplicates()
+                pattern.sort_indices()
+                full_rows = np.repeat(
+                    np.arange(matrix_size, dtype=np.int64), np.diff(pattern.indptr)
+                )
+                lower_source = np.flatnonzero(full_rows >= pattern.indices)
+                lower_keys = matrix_size * full_rows[lower_source] + pattern.indices[lower_source]
+                contribution_mask = self._direct_element_rows >= self._direct_element_cols
+                contribution_keys = (
+                    matrix_size * self._direct_element_rows[contribution_mask]
+                    + self._direct_element_cols[contribution_mask]
+                )
+                contribution_indices = np.searchsorted(lower_keys, contribution_keys)
+                diagonal_indices = np.searchsorted(lower_keys, matrix_size * diagonal + diagonal)
+                pattern.data.fill(0.0)
+                full_diagonal_positions = np.searchsorted(
+                    matrix_size * full_rows + pattern.indices,
+                    matrix_size * diagonal + diagonal,
+                )
+                pattern.data[full_diagonal_positions] = 1.0
+                self._direct_gpu_template = pattern
+                self._direct_gpu_lower_contribution_mask = contribution_mask
+                self._direct_gpu_lower_contribution_indices = contribution_indices
+                self._direct_gpu_diagonal_indices = diagonal_indices
 
         # FIXME: _gravity must be a raw qd.field() — see comment in mpm_solver.py
         if self._gravity is not None:
@@ -2023,6 +2081,9 @@ class FEMSolver(Solver):
 
     def _sparse_direct_solve(self, f: qd.i32):
         """Solve the current free-FEM Newton system and retain its velocity form for SAP."""
+        if self._sparse_direct_backend == "cudss" and self._cudss_gpu_assembly:
+            return self._sparse_direct_solve_cudss_gpu(f)
+
         transfer_start = time.perf_counter()
         hessians = np.asarray(self.elements_el_hessian.to_numpy(), dtype=np.float64)
         force = np.asarray(self.elements_v_energy.force.to_numpy(), dtype=np.float64)
@@ -2084,14 +2145,94 @@ class FEMSolver(Solver):
         self._direct_assembly_time_s += time.perf_counter() - assembly_start
 
         factor_start = time.perf_counter()
-        for velocity_matrix in matrices:
-            factors.append(spla.splu(velocity_matrix))
+        if self._sparse_direct_backend == "cudss":
+            from genesis.utils.cudss_sparse import CudssSpdFactor
+
+            if not self._direct_velocity_cudss_factors:
+                self._direct_velocity_cudss_factors = [
+                    CudssSpdFactor(velocity_matrix) for velocity_matrix in matrices
+                ]
+                self._direct_velocity_cudss_ages = [0 for _ in matrices]
+                self._direct_cudss_factorizations += len(matrices)
+            else:
+                for i_b, (factor, velocity_matrix) in enumerate(
+                    zip(self._direct_velocity_cudss_factors, matrices, strict=True)
+                ):
+                    next_age = self._direct_velocity_cudss_ages[i_b] + 1
+                    refresh = self._cudss_anchor_age <= 0 or next_age >= self._cudss_anchor_age
+                    if refresh:
+                        if factor.matches_pattern(velocity_matrix):
+                            factor.refactor(velocity_matrix)
+                        else:
+                            factor.close()
+                            self._direct_velocity_cudss_factors[i_b] = CudssSpdFactor(
+                                velocity_matrix
+                            )
+                        self._direct_velocity_cudss_ages[i_b] = 0
+                        self._direct_cudss_factorizations += 1
+                    else:
+                        self._direct_velocity_cudss_ages[i_b] = next_age
+            factors.extend(self._direct_velocity_cudss_factors)
+        else:
+            for velocity_matrix in matrices:
+                factors.append(spla.splu(velocity_matrix))
         self._direct_factor_time_s += time.perf_counter() - factor_start
 
         solve_start = time.perf_counter()
         for i_b, factor in enumerate(factors):
-            velocity_updates[i_b] = factor.solve(h * force[i_b].reshape(-1))
+            force_rhs = h * force[i_b].reshape(-1)
+            if self._sparse_direct_backend == "cudss" and self._direct_velocity_cudss_ages[i_b] > 0:
+                update, iterations, relative_residual, converged = factor.solve_pcg(
+                    matrices[i_b],
+                    force_rhs,
+                    max_iterations=self._cudss_pcg_max_iterations,
+                    relative_tolerance=self._cudss_pcg_rtol,
+                )
+                self._direct_cudss_pcg_solves += 1
+                self._direct_cudss_pcg_iterations += iterations
+                self._direct_cudss_last_relative_residual = relative_residual
+                self._direct_cudss_max_relative_residual = max(
+                    self._direct_cudss_max_relative_residual, relative_residual
+                )
+                if not converged:
+                    fallback_start = time.perf_counter()
+                    if factor.matches_pattern(matrices[i_b]):
+                        factor.refactor(matrices[i_b])
+                    else:
+                        factor.close()
+                        factor = CudssSpdFactor(matrices[i_b])
+                        self._direct_velocity_cudss_factors[i_b] = factor
+                        factors[i_b] = factor
+                    self._direct_factor_time_s += time.perf_counter() - fallback_start
+                    self._direct_velocity_cudss_ages[i_b] = 0
+                    self._direct_cudss_factorizations += 1
+                    self._direct_cudss_pcg_fallbacks += 1
+                    update = factor.solve(force_rhs)
+                velocity_updates[i_b] = update
+            else:
+                velocity_updates[i_b] = factor.solve(force_rhs)
         self._direct_solve_time_s += time.perf_counter() - solve_start
+
+        if (
+            self._sparse_direct_backend == "cudss"
+            and os.environ.get("GENESIS_FEM_CUDSS_TELEMETRY") == "1"
+            and (int(self.sim.cur_substep_global) + 1) % 20 == 0
+        ):
+            print(
+                "[cuDSS FEM] "
+                f"substeps={int(self.sim.cur_substep_global) + 1} "
+                f"factors={self._direct_cudss_factorizations} "
+                f"pcg_solves={self._direct_cudss_pcg_solves} "
+                f"pcg_iterations={self._direct_cudss_pcg_iterations} "
+                f"fallbacks={self._direct_cudss_pcg_fallbacks} "
+                f"last_relative_residual={self._direct_cudss_last_relative_residual:.3e} "
+                f"max_relative_residual={self._direct_cudss_max_relative_residual:.3e} "
+                f"assembly_s={self._direct_assembly_time_s:.6f} "
+                f"factor_s={self._direct_factor_time_s:.6f} "
+                f"solve_s={self._direct_solve_time_s:.6f} "
+                f"transfer_s={self._direct_transfer_time_s:.6f}",
+                flush=True,
+            )
 
         transfer_start = time.perf_counter()
         self.pcg_state_v.x.from_numpy((h * velocity_updates).reshape(self._B, self.n_vertices, 3))
@@ -2116,6 +2257,144 @@ class FEMSolver(Solver):
         self._direct_velocity_factors = tuple(factors)
         self._direct_velocity_gpu_factors.clear()
         self._direct_velocity_rhs = velocity_rhs
+
+    def _sparse_direct_solve_cudss_gpu(self, f: qd.i32):
+        """Assemble the exact fixed-graph FEM operator on CUDA and factor it with cuDSS."""
+        from genesis.utils.cudss_sparse import CudssSpdFactor, CudssSpdMatrix
+
+        hessian = qd_to_torch(self.elements_el_hessian, copy=False)
+        force = qd_to_torch(self.elements_v_energy.force, copy=False)
+        mass_over_dt2 = qd_to_torch(self.elements_v_info.mass_over_dt2, copy=False)
+        positions = qd_to_torch(self.elements_v.pos, copy=False)
+        device = hessian.device
+        if self._direct_gpu_static_tensors is None:
+            self._direct_gpu_static_tensors = {
+                "mapping": torch.as_tensor(
+                    self._direct_element_mapping, dtype=torch.float64, device=device
+                ),
+                "tetrahedra": torch.as_tensor(
+                    self._direct_tetrahedra, dtype=torch.long, device=device
+                ),
+                "volume": torch.as_tensor(
+                    self._direct_element_volume, dtype=torch.float64, device=device
+                ),
+                "contribution_mask": torch.as_tensor(
+                    self._direct_gpu_lower_contribution_mask, dtype=torch.bool, device=device
+                ),
+                "contribution_indices": torch.as_tensor(
+                    self._direct_gpu_lower_contribution_indices, dtype=torch.long, device=device
+                ),
+                "diagonal_indices": torch.as_tensor(
+                    self._direct_gpu_diagonal_indices, dtype=torch.long, device=device
+                ),
+            }
+        static = self._direct_gpu_static_tensors
+        if self._enable_vertex_constraints:
+            is_constrained = qd_to_torch(
+                self.vertex_constraints.is_constrained, copy=True
+            )
+            is_soft = qd_to_torch(
+                self.vertex_constraints.is_soft_constraint, copy=True
+            )
+            constraint_stiffness = qd_to_torch(
+                self.vertex_constraints.stiffness, copy=True
+            )
+
+        h = float(self.substep_dt)
+        damping_alpha_factor = 1.0 + self._damping_alpha * h
+        damping_beta_factor = 1.0 + self._damping_beta / h
+        matrix_size = self.n_vertices * 3
+        factors = []
+        matrices = []
+        velocity_rhs_device = []
+        velocity_updates_device = []
+
+        assembly_start = time.perf_counter()
+        for i_b in range(self._B):
+            mapping = static["mapping"]
+            if self._enable_vertex_constraints:
+                hard_constrained = is_constrained[:, i_b] & ~is_soft[:, i_b]
+                mapping = mapping * (~hard_constrained[static["tetrahedra"]])[:, :, None]
+            element_hessian = hessian[i_b].movedim(2, 0)
+            element_matrix = torch.einsum(
+                "eki,eijab,elj->ekalb",
+                mapping,
+                element_hessian,
+                mapping,
+            )
+            element_matrix *= (
+                static["volume"] * damping_beta_factor
+            )[:, None, None, None, None]
+
+            if not self._direct_velocity_cudss_factors:
+                factor = CudssSpdFactor(self._direct_gpu_template)
+                self._direct_velocity_cudss_factors.append(factor)
+                self._direct_velocity_cudss_ages.append(0)
+            else:
+                factor = self._direct_velocity_cudss_factors[i_b]
+            lower_values = torch.zeros(
+                factor._values.size, dtype=torch.float64, device=device
+            )
+            lower_values.index_add_(
+                0,
+                static["contribution_indices"],
+                element_matrix.reshape(-1)[static["contribution_mask"]],
+            )
+            vertex_diagonal = mass_over_dt2 * damping_alpha_factor
+            if self._enable_vertex_constraints:
+                vertex_diagonal = vertex_diagonal + torch.where(
+                    is_constrained[:, i_b] & is_soft[:, i_b],
+                    constraint_stiffness[:, i_b],
+                    0.0,
+                )
+            lower_values[static["diagonal_indices"]] += vertex_diagonal.repeat_interleave(3)
+            lower_values *= h * h
+            factor.refactor_lower_values(lower_values)
+
+            base_velocity = (
+                positions[f + 1, :, i_b] - positions[f, :, i_b]
+            ).reshape(-1) / h
+            force_rhs = h * force[i_b].reshape(-1)
+            velocity_rhs_device.append(factor.matvec_gpu(base_velocity) + force_rhs)
+            velocity_updates_device.append(factor.solve_gpu(force_rhs[:, None])[:, 0])
+            factors.append(factor)
+            matrices.append(CudssSpdMatrix(factor))
+        torch.cuda.synchronize(device)
+        self._direct_assembly_time_s += time.perf_counter() - assembly_start
+        self._direct_cudss_factorizations += len(factors)
+
+        transfer_start = time.perf_counter()
+        pcg_x = qd_to_torch(self.pcg_state_v.x, copy=False)
+        for i_b, update in enumerate(velocity_updates_device):
+            pcg_x[i_b].copy_((h * update).reshape(self.n_vertices, 3))
+        torch.cuda.synchronize(device)
+        self._direct_transfer_time_s += time.perf_counter() - transfer_start
+
+        force_flat = force.reshape(self._B, -1)
+        residuals = torch.stack(
+            [
+                force_flat[i_b] - factors[i_b].matvec_gpu(velocity_updates_device[i_b]) / h
+                for i_b in range(self._B)
+            ]
+        )
+        initial_rtr = torch.sum(force_flat * force_flat, dim=1).cpu().numpy()
+        final_rtr = torch.sum(residuals * residuals, dim=1).cpu().numpy()
+        self.pcg_state.rTr_initial.from_numpy(initial_rtr)
+        self.pcg_state.rTr.from_numpy(final_rtr)
+        self.pcg_state.rTz.from_numpy(final_rtr)
+        self.pcg_state.termination_threshold.from_numpy(
+            np.maximum(self._pcg_threshold, initial_rtr * self._pcg_rtol * self._pcg_rtol)
+        )
+        self.batch_pcg_active.fill(False)
+        self.batch_pcg_iterations.fill(0)
+
+        self._direct_velocity_matrices = tuple(matrices)
+        self._direct_velocity_matrix = matrices[0] if self._B == 1 else None
+        self._direct_velocity_factors = tuple(factors)
+        self._direct_velocity_gpu_factors.clear()
+        self._direct_velocity_rhs = np.stack(
+            [rhs.cpu().numpy() for rhs in velocity_rhs_device]
+        )
 
     def _finalize_sparse_direct_velocity_system(self, f: qd.i32):
         transfer_start = time.perf_counter()
@@ -2200,13 +2479,16 @@ class FEMSolver(Solver):
         if rhs_torch.ndim != 2 or rhs_torch.shape[0] != 3 * self.n_vertices:
             raise ValueError(f"GPU sparse-direct FEM RHS must have shape ({3 * self.n_vertices}, K)")
 
+        factor = self._direct_velocity_factors[i_b]
+        if self._sparse_direct_backend == "cudss":
+            return factor.solve_gpu(rhs_torch)
+
         with torch.cuda.device(device_index):
             stream = torch.cuda.current_stream(device_index)
             if rhs_torch.shape[1] == 0:
                 return torch.empty_like(rhs_torch)
             with cp.cuda.Device(device_index), cp.cuda.ExternalStream(stream.cuda_stream, device_id=device_index):
                 rhs_device = cp.from_dlpack(rhs_torch)
-                factor = self._direct_velocity_factors[i_b]
                 key = (i_b, device_index)
                 cached = self._direct_velocity_gpu_factors.get(key)
                 if cached is None or cached[0] is not factor:
